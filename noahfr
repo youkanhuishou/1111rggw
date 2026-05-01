@@ -2596,7 +2596,40 @@ local function dropUnknownOpArtifacts(lines)
 	local out = {}
 	for _, line in ipairs(lines) do
 		if line:match("^%s*%-%-%s+ROBLOX_OP_%d+%s+") then
+			-- skip
 		else
+			out[#out+1] = line
+		end
+	end
+	return out
+end
+
+local function dropUnusedGetAttributesLocals(lines)
+	local out = {}
+	for i, line in ipairs(lines) do
+		local ind, name = line:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*.+:GetAttributes%(%s*%)%s*$")
+		local drop = false
+		if ind and name then
+			local usePat = "%f[%a_]" .. luaPE(name) .. "%f[^%a_%d]"
+			local indentLen = #ind
+			local used = false
+			for j = i + 1, #lines do
+				local text = lines[j]:match("^%s*(.-)%s*$")
+				local curInd = lines[j]:match("^(%s*)") or ""
+				if #curInd < indentLen then
+					break
+				end
+				if #curInd == indentLen and (text == "end" or text == "else" or text:match("^elseif%s+") or text:match("^until%s+")) then
+					break
+				end
+				if lines[j]:find(usePat) then
+					used = true
+					break
+				end
+			end
+			drop = not used
+		end
+		if not drop then
 			out[#out+1] = line
 		end
 	end
@@ -3270,7 +3303,12 @@ local function inlineTrivialConditionLocals(lines)
 					for j = i + 2, endIdx - 1 do
 						if lines[j]:find(usePat) then usedInside = true; break end
 					end
-					if not usedInside then
+					local usedAfter = false
+					for j = endIdx + 1, #lines do
+						if lines[j]:find("^%s*local%s+" .. luaPE(ln2) .. "%f[^%a_%d]") then break end
+						if lines[j]:find(usePat) then usedAfter = true; break end
+					end
+					if not usedInside and not usedAfter then
 						local negStr = neg or ""
 						out[#out+1] = ii .. "if " .. negStr .. lrhs .. " then"
 						i = i + 2
@@ -3460,6 +3498,72 @@ local function fixOrDefaultAssignments(lines)
 		end
 	end
 	return out
+end
+
+local function simplifyEmptyTableDefaults(lines)
+	local function trim(s)
+		return s:match("^%s*(.-)%s*$")
+	end
+	local function matchSimpleIfNot(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local name = text:match("^if%s+not%s+%(([%a_][%w_]*)%)%s+then$")
+		if not name then name = text:match("^if%s+not%s+([%a_][%w_]*)%s+then$") end
+		if name then return ind, name end
+		return nil, nil
+	end
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local folded = false
+		if i + 3 <= #lines then
+			local ifInd, targetName = matchSimpleIfNot(lines[i])
+			local tmpInd, tmpName = lines[i + 1]:match("^(%s*)(_r%d+[_%d]*)%s*=%s*%{%}%s*$")
+			local endInd = matchEnd(lines[i + 2])
+			local assignInd, assignTarget, assignTmp = lines[i + 3]:match("^(%s*)([%a_][%w_]*)%s*=%s*(_r%d+[_%d]*)%s*$")
+			if ifInd and targetName and tmpInd and tmpName and endInd and assignInd and assignTarget and assignTmp
+				and endInd == ifInd
+				and assignInd == ifInd
+				and tmpInd:sub(1, #ifInd) == ifInd
+				and #tmpInd > #ifInd
+				and assignTarget == targetName
+				and assignTmp == tmpName
+			then
+				out[#out+1] = ifInd .. assignTarget .. " = (" .. assignTarget .. " or {})"
+				i = i + 4
+				folded = true
+			end
+		end
+		if not folded then
+			out[#out+1] = lines[i]
+			i = i + 1
+		end
+	end
+	local cleaned = {}
+	for idx, line in ipairs(out) do
+		local _, name = line:match("^(%s*)local%s+(_r%d+[_%d]*)%s*=%s*%{%}%s*$")
+		if not name then
+			_, name = line:match("^(%s*)local%s+(_r%d+[_%d]*)%s*$")
+		end
+		local drop = false
+		if name then
+			local usePat = "%f[%a_]" .. luaPE(name) .. "%f[^%a_%d]"
+			local used = false
+			for j = idx + 1, #out do
+				local text = trim(out[j])
+				if out[j]:find("^%s*local%s+" .. luaPE(name) .. "%f[^%a_%d]") then break end
+				if not text:match("^%-%-") and out[j]:find(usePat) then
+					used = true
+					break
+				end
+			end
+			drop = not used
+		end
+		if not drop then
+			cleaned[#cleaned+1] = line
+		end
+	end
+	return cleaned
 end
 
 local function fixRefreshPreviousUserIdPattern(lines)
@@ -5564,6 +5668,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = dropLoadbArtifacts(lines)
+	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
 	lines = removeUnreachableAfterReturn(lines)
 
@@ -5576,6 +5681,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = renameTempFindFirstChildDynamic(lines)
 	lines = renameLocalTableByAssignment(lines)
 	lines = fixOrDefaultAssignments(lines)
+	lines = simplifyEmptyTableDefaults(lines)
 	lines = fixRefreshPreviousUserIdPattern(lines)
 	lines = renameFallbackIndexUpvalues(lines)
 	lines = hoistRepeatedLocals(lines)
@@ -5590,12 +5696,14 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = dropLoadbArtifacts(lines)
+	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
 	lines = removeUnreachableAfterReturn(lines)
 	lines = balanceLuaBlocksByIndent(lines)
 	lines = dropUnmatchedEndLines(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
 	lines = dropUnknownOpArtifacts(lines)
+	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
 	for _ = 1, 16 do
 		local changed
@@ -5660,8 +5768,13 @@ local function decompileProto(p, bc, protoIdx)
 		if #pendingClosureCaps > 0 then
 			local capDescs = {}
 			local hasLocalCapture = false
-			for _, cap in ipairs(pendingClosureCaps) do
-				push(capDescs, cap.expr)
+			for capIdx, cap in ipairs(pendingClosureCaps) do
+				local childUpvalue = childProto and childProto.upvalues[capIdx] or nil
+				if type(childUpvalue) == "string" and childUpvalue ~= "" and not isFallbackUpvalueName(childUpvalue) then
+					push(capDescs, childUpvalue)
+				else
+					push(capDescs, cap.expr)
+				end
 				if cap.kind == "VAL" or cap.kind == "REF" then
 					hasLocalCapture = true
 				end
