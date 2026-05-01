@@ -1253,6 +1253,10 @@ local function propagateUpvalueNames(protoIdx, bc, visited)
 			else
 				return
 			end
+		elseif rawExpr:match("^_%d+$") then
+			hint = semanticHint or "index"
+		elseif semanticHint == "index" and rawExpr:match("^%-?%d+(%.%d+)?$") then
+			hint = "index"
 		elseif semanticHint and isFallbackUpvalueName(rawExpr) then
 			hint = semanticHint
 		else
@@ -1868,7 +1872,64 @@ local function luaPE(s)
 	return (s:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
 end
 
--- Check if string s matches label pattern  ^(\s*)::(pc\d+)::\s*$
+local function identPat(name)
+	return "%f[%w_]" .. luaPE(name) .. "%f[^%w_]"
+end
+
+local function renameIdentOutsideStrings(line, oldName, newName)
+	if not line:find(oldName, 1, true) then return line end
+	local pat = identPat(oldName)
+	local out = {}
+	local i = 1
+	local n = #line
+	while i <= n do
+		local nextPos = n + 1
+		for _, ch in ipairs({ "\"", "'", "[", "-" }) do
+			local pos = line:find(ch, i, true)
+			if pos and pos < nextPos then nextPos = pos end
+		end
+		if nextPos > i then
+			out[#out+1] = (line:sub(i, nextPos - 1):gsub(pat, newName))
+			i = nextPos
+		else
+			local ch = line:sub(i, i)
+			if ch == "-" and line:sub(i, i + 1) == "--" then
+				out[#out+1] = line:sub(i)
+				break
+			elseif ch == "\"" or ch == "'" then
+				local quote = ch
+				local j = i + 1
+				while j <= n do
+					local cj = line:sub(j, j)
+					if cj == "\\" and j < n then
+						j = j + 2
+					elseif cj == quote then
+						j = j + 1
+						break
+					else
+						j = j + 1
+					end
+				end
+				out[#out+1] = line:sub(i, math.min(j - 1, n))
+				i = j
+			elseif ch == "[" and line:sub(i, i + 1) == "[[" then
+				local closePos = line:find("]]", i + 2, true)
+				if closePos then
+					out[#out+1] = line:sub(i, closePos + 1)
+					i = closePos + 2
+				else
+					out[#out+1] = line:sub(i)
+					break
+				end
+			else
+				out[#out+1] = ch
+				i = i + 1
+			end
+		end
+	end
+	return table.concat(out)
+end
+
 local function matchLbl(s)
 	return s:match("^(%s*)::([Pp][Cc]%d+)::%s*$")
 end
@@ -2520,6 +2581,28 @@ local function dropEmptyIfBlocks(lines)
 	return out
 end
 
+local function dropLoadbArtifacts(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		if line:match("^%s*%-%-%s+LOADB%s+R%d+%s+=") then
+		else
+			out[#out+1] = line
+		end
+	end
+	return out
+end
+
+local function dropUnknownOpArtifacts(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		if line:match("^%s*%-%-%s+ROBLOX_OP_%d+%s+") then
+		else
+			out[#out+1] = line
+		end
+	end
+	return out
+end
+
 local function recoverEmptyFieldGuards(lines)
 	local remove = {}
 	local replace = {}
@@ -3014,10 +3097,56 @@ local function dropUnmatchedEndLines(lines)
 	return out
 end
 
--- Simple AST re-render (replaces _render_lua_ast_lines)
+-- Conservative AST-like final renderer: validate block structure, then normalize.
 local function renderLuaAstLines(lines, indentUnit)
-	-- We just use normalizeLuaIndentation as it achieves the same goal
-	return normalizeLuaIndentation(lines, indentUnit)
+	local stack = {}
+	local function trim(s)
+		return s:match("^%s*(.-)%s*$")
+	end
+	local function isSingleLineBlock(text)
+		return text:match("^if%s+.+%s+then%s+.+%s+end$") ~= nil
+			or text:match("^for%s+.+%s+do%s+.+%s+end$") ~= nil
+			or text:match("^while%s+.+%s+do%s+.+%s+end$") ~= nil
+	end
+	local function opensBlock(text)
+		if isSingleLineBlock(text) then return nil end
+		if text:match("^if%s+.+%s+then$") then return "if" end
+		if text:match("^for%s+.+%s+do$") or text:match("^while%s+.+%s+do$") or text == "do" then return "block" end
+		if text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]") then
+			if not text:match("end%s*$") then return "block" end
+		end
+		if text == "repeat" then return "repeat" end
+		return nil
+	end
+	for _, line in ipairs(lines) do
+		local text = trim(line)
+		if text ~= "" and text:sub(1, 2) ~= "--" then
+			if text == "else" or text:match("^elseif%s+.+%s+then$") then
+				if #stack == 0 or stack[#stack] ~= "if" then
+					return lines
+				end
+			elseif text == "end" then
+				if #stack == 0 or stack[#stack] == "repeat" then
+					return lines
+				end
+				table.remove(stack)
+			elseif text:match("^until%s+") then
+				if #stack == 0 or stack[#stack] ~= "repeat" then
+					return lines
+				end
+				table.remove(stack)
+			else
+				local kind = opensBlock(text)
+				if kind then stack[#stack+1] = kind end
+			end
+		end
+	end
+	if #stack ~= 0 then return lines end
+	local rendered = normalizeLuaIndentation(lines, indentUnit)
+	rendered = dropLoadbArtifacts(rendered)
+	rendered = dropUnknownOpArtifacts(rendered)
+	rendered = dropEmptyIfBlocks(rendered)
+	return normalizeLuaIndentation(rendered, indentUnit)
 end
 
 -- Split register lifetimes for _rN names with multiple declarations
@@ -3418,6 +3547,310 @@ local function fixRefreshPreviousUserIdPattern(lines)
 		end
 	end
 	return out
+end
+
+local function renameFallbackIndexUpvalues(lines)
+	if #lines == 0 then return lines end
+	local prefix, upvalueText = lines[1]:match("^(.-%-%-%s+upvalues:%s+)(.+)$")
+	if not prefix or not upvalueText then return lines end
+	local upvalues = {}
+	for name in upvalueText:gmatch("[^,%s]+") do
+		upvalues[#upvalues+1] = name
+	end
+	if #upvalues == 0 then return lines end
+	local used = {}
+	for _, name in ipairs(upvalues) do used[name] = true end
+	local params = lines[1]:match("%((.-)%)")
+	if params then
+		for name in params:gmatch("[A-Za-z_][A-Za-z0-9_]*") do used[name] = true end
+	end
+	for _, line in ipairs(lines) do
+		if not line:match("^%s*local%s+function%f[^%w_]") then
+			local decl = line:match("^%s*local%s+([^=]+)")
+			if decl then
+				for name in decl:gmatch("[A-Za-z_][A-Za-z0-9_]*") do used[name] = true end
+			end
+		end
+	end
+	local renames = {}
+	for _, name in ipairs(upvalues) do
+		if name:match("^_%d+$") then
+			local isIndex = false
+			local bracketPat = "%[%s*" .. luaPE(name) .. "%s*%]"
+			for i = 2, #lines do
+				if lines[i]:find(bracketPat) then
+					isIndex = true
+					break
+				end
+			end
+			if isIndex then
+				local candidate = "index"
+				local suffix = 2
+				while used[candidate] and candidate ~= name do
+					candidate = "index_" .. tostring(suffix)
+					suffix = suffix + 1
+				end
+				used[candidate] = true
+				renames[name] = candidate
+			end
+		end
+	end
+	if next(renames) == nil then return lines end
+	local out = {}
+	for i, line in ipairs(lines) do
+		local newLine = line
+		if i == 1 then
+			local rewritten = {}
+			for _, name in ipairs(upvalues) do rewritten[#rewritten+1] = renames[name] or name end
+			newLine = prefix .. table.concat(rewritten, ", ")
+		else
+			for oldName, newName in pairs(renames) do
+				if newLine:match("^%s*%-%-.*captures:") then
+					newLine = newLine:gsub(identPat(oldName), newName)
+				else
+					newLine = renameIdentOutsideStrings(newLine, oldName, newName)
+				end
+			end
+		end
+		out[#out+1] = newLine
+	end
+	return out
+end
+
+local function hoistRepeatedLocals(lines)
+	if #lines == 0 then return lines end
+	local bodyStart = 1
+	for i, line in ipairs(lines) do
+		if line:match("%S") then
+			local text = line:match("^%s*(.-)%s*$")
+			if text:match("^(local%s+)?function%f[^%w_]") then
+				bodyStart = i + 1
+			elseif text:match("^%-%-%s+main%s+chunk") then
+				bodyStart = i + 1
+			else
+				bodyStart = i
+			end
+			break
+		end
+	end
+	local bodyEnd = #lines
+	while bodyEnd >= bodyStart do
+		local text = lines[bodyEnd]:match("^%s*(.-)%s*$")
+		if text == "" then
+			bodyEnd = bodyEnd - 1
+		elseif text == "end" then
+			bodyEnd = bodyEnd - 1
+			break
+		else
+			break
+		end
+	end
+	if bodyEnd < bodyStart then return lines end
+	local declarations = {}
+	local order = {}
+	for i = bodyStart, bodyEnd do
+		local ind, name, expr = lines[i]:match("^(%s*)local%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)%s*$")
+		if ind and name and not lines[i]:match("^%s*local%s+function%f[^%w_]") then
+			if not declarations[name] then
+				declarations[name] = {}
+				order[#order+1] = name
+			end
+			declarations[name][#declarations[name]+1] = { idx = i, indent = ind, expr = expr }
+		end
+	end
+	local toHoist = {}
+	for name, items in pairs(declarations) do
+		if #items > 1 then
+			toHoist[name] = true
+		end
+	end
+	for name, items in pairs(declarations) do
+		if not toHoist[name] and #items == 1 then
+			local decl = items[1]
+			local declIndent = #decl.indent
+			local blockEnd = bodyEnd + 1
+			for j = decl.idx + 1, bodyEnd do
+				if lines[j]:match("%S") then
+					local ind = lines[j]:match("^(%s*)") or ""
+					if #ind < declIndent then
+						blockEnd = j
+						break
+					end
+				end
+			end
+			if blockEnd <= bodyEnd then
+				local pat = identPat(name)
+				for j = blockEnd, bodyEnd do
+					if lines[j]:find(pat) then
+						toHoist[name] = true
+						break
+					end
+				end
+			end
+		end
+	end
+	if next(toHoist) == nil then return lines end
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	for name, items in pairs(declarations) do
+		if toHoist[name] then
+			for _, decl in ipairs(items) do
+				out[decl.idx] = decl.indent .. name .. " = " .. decl.expr
+			end
+		end
+	end
+	local bodyIndent = ""
+	for i = bodyStart, bodyEnd do
+		if out[i]:match("%S") then
+			bodyIndent = out[i]:match("^(%s*)") or ""
+			break
+		end
+	end
+	local declLines = {}
+	for _, name in ipairs(order) do
+		if toHoist[name] then declLines[#declLines+1] = bodyIndent .. "local " .. name end
+	end
+	for i = #declLines, 1, -1 do
+		table.insert(out, bodyStart, declLines[i])
+	end
+	return out
+end
+
+local function coalesceAlternativeFinds(lines)
+	if #lines == 0 then return lines end
+	local function findBodySpan(lns)
+		local bodyStart = 1
+		for i, line in ipairs(lns) do
+			if line:match("%S") then
+				local text = line:match("^%s*(.-)%s*$")
+				if text:match("^(local%s+)?function%f[^%w_]") then
+					bodyStart = i + 1
+				elseif text:match("^%-%-%s+main%s+chunk") then
+					bodyStart = i + 1
+				else
+					bodyStart = i
+				end
+				break
+			end
+		end
+		local bodyEnd = #lns
+		while bodyEnd >= bodyStart do
+			local text = lns[bodyEnd]:match("^%s*(.-)%s*$")
+			if text == "" then
+				bodyEnd = bodyEnd - 1
+			elseif text == "end" then
+				bodyEnd = bodyEnd - 1
+				break
+			else
+				break
+			end
+		end
+		return bodyStart, bodyEnd
+	end
+	local function findIfAssignBlock(lns, startIdx, endIdx, varName)
+		local j = startIdx
+		while j <= endIdx and not lns[j]:match("%S") do j = j + 1 end
+		if j > endIdx then return nil end
+		local inlineInd, cond, target = lns[j]:match("^(%s*)if%s+(.+)%s+then%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*.+%s+end%s*$")
+		if inlineInd and target == varName then
+			return { startIdx = j, endIdx = j, cond = cond }
+		end
+		local ifInd, openCond = lns[j]:match("^(%s*)if%s+(.+)%s+then%s*$")
+		if not ifInd then return nil end
+		local j2 = j + 1
+		while j2 <= endIdx and not lns[j2]:match("%S") do j2 = j2 + 1 end
+		if j2 > endIdx then return nil end
+		local _assignInd, assignTarget = lns[j2]:match("^(%s*)([A-Za-z_][A-Za-z0-9_]*)%s*=%s*.+%s*$")
+		if assignTarget ~= varName then return nil end
+		local j3 = j2 + 1
+		while j3 <= endIdx and not lns[j3]:match("%S") do j3 = j3 + 1 end
+		if j3 > endIdx then return nil end
+		local endInd = lns[j3]:match("^(%s*)end%s*$")
+		if endInd ~= ifInd then return nil end
+		return { startIdx = j, endIdx = j3, cond = openCond }
+	end
+	local function tryCoalesce(lns)
+		local bodyStart, bodyEnd = findBodySpan(lns)
+		if bodyEnd < bodyStart then return nil end
+		local decls = {}
+		local k = bodyStart
+		while k <= bodyEnd do
+			if not lns[k]:match("%S") then
+				k = k + 1
+			else
+				local _ind, name = lns[k]:match("^(%s*)local%s+([A-Za-z_][A-Za-z0-9_]*)%s*$")
+				if not name then break end
+				decls[#decls+1] = { idx = k, name = name }
+				k = k + 1
+			end
+		end
+		if #decls < 2 then return nil end
+		for di = 1, #decls - 1 do
+			local nameA = decls[di].name
+			local nameB = decls[di + 1].name
+			local assignA = nil
+			for j = k, bodyEnd do
+				local cand = findIfAssignBlock(lns, j, bodyEnd, nameA)
+				if cand and cand.startIdx == j then
+					assignA = cand
+					break
+				end
+			end
+			if assignA then
+				local j2 = assignA.endIdx + 1
+				while j2 <= bodyEnd and not lns[j2]:match("%S") do j2 = j2 + 1 end
+				local assignB = findIfAssignBlock(lns, j2, bodyEnd, nameB)
+				if assignB then
+					local cond = assignB.cond:match("^%s*(.-)%s*$")
+					if cond:match("^not%s*%(%s*" .. luaPE(nameA) .. "%s*%)%s*$") or cond:match("^not%s+" .. luaPE(nameA) .. "%s*$") then
+						local otherAssign = false
+						local assignPat = "^%s*" .. luaPE(nameB) .. "%s*="
+						for r = bodyStart, bodyEnd do
+							if r ~= decls[di + 1].idx and not (assignB.startIdx <= r and r <= assignB.endIdx) then
+								if lns[r]:find(assignPat) then
+									otherAssign = true
+									break
+								end
+							end
+						end
+						if not otherAssign then
+							local newLines = {}
+							for i, line in ipairs(lns) do newLines[i] = line end
+							newLines[decls[di + 1].idx] = ""
+							for r = bodyStart, bodyEnd do
+								if r ~= decls[di + 1].idx then
+									newLines[r] = renameIdentOutsideStrings(newLines[r], nameB, nameA)
+								end
+							end
+							local collapsed = {}
+							local prevBlank = false
+							for _, line in ipairs(newLines) do
+								if line == "" then
+								elseif not line:match("%S") then
+									if not prevBlank then
+										collapsed[#collapsed+1] = line
+										prevBlank = true
+									end
+								else
+									collapsed[#collapsed+1] = line
+									prevBlank = false
+								end
+							end
+							return collapsed
+						end
+					end
+				end
+			end
+		end
+		return nil
+	end
+	local cur = lines
+	for _ = 1, 8 do
+		local nxt = tryCoalesce(cur)
+		if not nxt then return cur end
+		cur = nxt
+	end
+	return cur
 end
 
 local function renameTempFindFirstChildDynamic(lines)
@@ -5117,14 +5550,21 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = gotosToBreak(lines)
 	lines = dropOrphanLabels(lines)
 	lines = foldTableArrayInitializers(lines)
+	lines = dropLoadbArtifacts(lines)
+	lines = dropUnknownOpArtifacts(lines)
+	lines = dropEmptyIfBlocks(lines)
 	lines = fixFindBasePartFallbackReturns(lines)
 	lines = fixInvertedIsaGuard(lines)
+	lines = hoistRepeatedLocals(lines)
+	lines = coalesceAlternativeFinds(lines)
 	lines = fixBareMethodReferences(lines)
 	lines = fixLiteralMethodReceivers(lines)
 	lines = fixLiteralFieldReceivers(lines)
 	lines = repairInvalidElseClauses(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
+	lines = dropLoadbArtifacts(lines)
+	lines = dropEmptyIfBlocks(lines)
 	lines = removeUnreachableAfterReturn(lines)
 
 	-- Pass 11: indentation normalization
@@ -5137,6 +5577,9 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = renameLocalTableByAssignment(lines)
 	lines = fixOrDefaultAssignments(lines)
 	lines = fixRefreshPreviousUserIdPattern(lines)
+	lines = renameFallbackIndexUpvalues(lines)
+	lines = hoistRepeatedLocals(lines)
+	lines = coalesceAlternativeFinds(lines)
 	lines = gotosToContinue(lines)
 	lines = gotosToBreak(lines)
 	lines = dropOrphanLabels(lines)
@@ -5146,10 +5589,14 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = repairInvalidElseClauses(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
+	lines = dropLoadbArtifacts(lines)
+	lines = dropEmptyIfBlocks(lines)
 	lines = removeUnreachableAfterReturn(lines)
 	lines = balanceLuaBlocksByIndent(lines)
 	lines = dropUnmatchedEndLines(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
+	lines = dropUnknownOpArtifacts(lines)
+	lines = dropEmptyIfBlocks(lines)
 	for _ = 1, 16 do
 		local changed
 		lines, changed = wrapOrphanIfGotosAsGuards(lines, indentUnit)
@@ -5305,6 +5752,15 @@ end
 
 local function identifyHoistTargets(bc)
 	local result = {}
+	local function addTarget(parentId, childId, already)
+		if type(childId) ~= "number" then return end
+		if childId < 0 or childId >= #bc.protos then return end
+		if childId == parentId then return end
+		if already[childId] then return end
+		if not result[parentId] then result[parentId] = {} end
+		push(result[parentId], childId)
+		already[childId] = true
+	end
 	for parentId = 0, #bc.protos - 1 do
 		if parentId ~= bc.main_id then
 			local p = protoAt(bc, parentId)
@@ -5318,9 +5774,7 @@ local function identifyHoistTargets(bc)
 				local opName = OPCODES[op] or ""
 				if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
 					if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
-						if not result[parentId] then result[parentId] = {} end
-						push(result[parentId], pendingChild)
-						already[pendingChild] = true
+						addTarget(parentId, pendingChild, already)
 					end
 					local d = decodeSignedD(insn)
 					if opName == "NEWCLOSURE" then
@@ -5338,9 +5792,7 @@ local function identifyHoistTargets(bc)
 					end
 				elseif opName ~= "CAPTURE" then
 					if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
-						if not result[parentId] then result[parentId] = {} end
-						push(result[parentId], pendingChild)
-						already[pendingChild] = true
+						addTarget(parentId, pendingChild, already)
 					end
 					pendingChild = nil
 					hasLocalCap = false
@@ -5348,8 +5800,7 @@ local function identifyHoistTargets(bc)
 				pc = pc + (opName ~= "" and getOpLength(opName) or 1)
 			end
 			if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
-				if not result[parentId] then result[parentId] = {} end
-				push(result[parentId], pendingChild)
+				addTarget(parentId, pendingChild, already)
 			end
 		end
 	end
@@ -5357,6 +5808,12 @@ local function identifyHoistTargets(bc)
 end
 
 local function spliceHoistedChild(parentBody, childName, childBody)
+	if type(parentBody) ~= "string" or type(childBody) ~= "string" then
+		return parentBody, false
+	end
+	if childBody:match("^%s*$") then
+		return parentBody, false
+	end
 	local parentLines = {}
 	for ln in (parentBody .. "\n"):gmatch("([^\n]*)\n") do parentLines[#parentLines+1] = ln end
 	local childLines = {}
@@ -5364,6 +5821,11 @@ local function spliceHoistedChild(parentBody, childName, childBody)
 	local out = {}
 	local spliced = false
 	local namePat = luaPE(childName)
+	for _, ln in ipairs(parentLines) do
+		if ln:match("^%s*local%s+function%s+" .. namePat .. "%f[^%w_]") then
+			return parentBody, false
+		end
+	end
 	for _, ln in ipairs(parentLines) do
 		if not spliced then
 			local indent = ln:match("^(%s*)%-%-%s+" .. namePat .. "%s+captures:.*%[parent%-local capture%]%s*$")
@@ -5433,6 +5895,7 @@ local function renderSource(bc)
 	for line in (source .. "\n"):gmatch("(.-)\n") do
 		lines[#lines+1] = line
 	end
+	lines = renderLuaAstLines(lines, "\t")
 	lines = dropInvalidTopLevelReturns(lines)
 	return table.concat(lines, "\n")
 end
