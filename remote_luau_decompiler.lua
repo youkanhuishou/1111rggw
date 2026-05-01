@@ -1,13 +1,5 @@
 --!nocheck
--- Loadstring-friendly Luau port of luau_decompiler.py.
---
--- Usage:
--- local mod = loadstring(game:HttpGet(rawUrl, true))()
--- local text = mod.decompile(bytecode, {
---     mode = "source", -- "source" | "asm" | "both"
---     filename = "SomeScript.bytecode",
--- })
-
+-- ddd
 local bit32_band = bit32.band
 local bit32_rshift = bit32.rshift
 
@@ -727,7 +719,7 @@ end
 local function locvarAt(p, reg, pc)
 	local best = nil
 	for _, lv in ipairs(p.locvars) do
-		if lv.reg == reg and lv.startpc <= pc and pc <= lv.endpc then
+		if lv.reg == reg and isValidIdent(lv.name) and lv.startpc <= pc and pc <= lv.endpc then
 			if best == nil or lv.startpc >= best.startpc then
 				best = lv
 			end
@@ -743,8 +735,26 @@ end
 
 local function regRepr(regs, p, reg, pc)
 	local lv = locvarAt(p, reg, pc)
-	if lv and lv.startpc ~= pc then
-		return lv.name
+	if lv then
+		local tracked = regs[reg]
+		if lv.startpc ~= pc
+			and lv.name:match("^_r%d+_?%d*$")
+			and tracked
+			and tracked ~= lv.name
+			and not tracked:match("^R%d+$")
+			and not tracked:match("^%-?%d+%.?%d*$")
+			and not tracked:match("^%-?%.%d+$")
+			and tracked ~= "true"
+			and tracked ~= "false"
+			and tracked ~= "nil"
+			and tracked:sub(1, 1) ~= '"'
+			and tracked:sub(1, 1) ~= "'"
+		then
+			return tracked
+		end
+		if lv.startpc ~= pc then
+			return lv.name
+		end
 	end
 	return regs[reg] or ("R" .. tostring(reg))
 end
@@ -1352,6 +1362,9 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			local iterExpr = regs[a] or ("R" .. tostring(a))
 			iterNote = " iter=ipairs(" .. iterExpr .. ")"
 		end
+		regs[a + 3] = "R" .. tostring(a + 3)
+		regs[a + 4] = "R" .. tostring(a + 4)
+		regs[a + 5] = "R" .. tostring(a + 5)
 		return indent .. "-- " .. opName .. " R" .. tostring(a) .. iterNote .. " -> pc" .. tostring(pc + d + 1), 0
 	end
 
@@ -1757,7 +1770,8 @@ local function removeUnreachableAfterReturn(lines)
 		if skipIndent ~= nil then
 			local stripped = ln:match("^%s*(.-)%s*$")
 			if stripped and stripped ~= "" then
-				local ind = #ln - #ln:match("^(%s*)")
+				local lead = ln:match("^(%s*)") or ""
+				local ind = #lead
 				local isTerminator = (
 					ind <= skipIndent and (
 						ind < skipIndent
@@ -1775,7 +1789,7 @@ local function removeUnreachableAfterReturn(lines)
 			if ind and rest then
 				skipIndent = #ind
 			elseif ln:match("^%s*continue%s*$") then
-				skipIndent = #ln - #ln:match("^(%s*)")
+				skipIndent = #(ln:match("^(%s*)") or "")
 			end
 			out[#out+1] = ln
 		end
@@ -1976,6 +1990,176 @@ local function dropEmptyIfBlocks(lines)
 	return out
 end
 
+local function recoverEmptyFieldGuards(lines)
+	local remove = {}
+	local replace = {}
+	local function trim(s)
+		return s:match("^%s*(.-)%s*$")
+	end
+	local function matchBaseIf(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local base = text:match("^if%s+([%a_][%w_]*)%s+then$")
+		if not base then base = text:match("^if%s+%(([%a_][%w_]*)%)%s+then$") end
+		if base then return ind, base end
+		return nil, nil
+	end
+	local function matchFieldIf(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local field = text:match("^if%s+([%a_][%w_]*(%.[%a_][%w_]*)+)%s+then$")
+		if not field then field = text:match("^if%s+%(([%a_][%w_]*(%.[%a_][%w_]*)+)%)%s+then$") end
+		if field then return ind, field end
+		return nil, nil
+	end
+	local function matchGuardInline(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local field, _, ret = text:match("^if%s+not%s+([%a_][%w_]*(%.[%a_][%w_]*)+)%s+then%s+return(.-)%s+end$")
+		if not field then field, _, ret = text:match("^if%s+not%s+%(([%a_][%w_]*(%.[%a_][%w_]*)+)%)%s+then%s+return(.-)%s+end$") end
+		if field then return ind, field, ret or "" end
+		return nil, nil, nil
+	end
+	local function matchGuardOpen(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local field = text:match("^if%s+not%s+([%a_][%w_]*(%.[%a_][%w_]*)+)%s+then$")
+		if not field then field = text:match("^if%s+not%s+%(([%a_][%w_]*(%.[%a_][%w_]*)+)%)%s+then$") end
+		if field then return ind, field end
+		return nil, nil
+	end
+	for i, line in ipairs(lines) do
+		local guardIndent, fieldExpr, retSuffix = matchGuardInline(line)
+		local guardEnd = i
+		if not guardIndent then
+			local gi, gf = matchGuardOpen(line)
+			if gi and i + 2 <= #lines then
+				local ret = trim(lines[i + 1]):match("^return(.*)$")
+				local endInd = matchEnd(lines[i + 2])
+				if ret and endInd == gi then
+					guardIndent, fieldExpr, retSuffix = gi, gf, ret
+					guardEnd = i + 2
+				end
+			end
+		end
+		if guardIndent and fieldExpr then
+			local base = fieldExpr:match("^([%a_][%w_]*)%.")
+			local emptyStart, emptyEnd = nil, nil
+			for k = math.max(1, i - 24), i - 1 do
+				local baseInd, baseName = matchBaseIf(lines[k])
+				if baseName == base and k + 3 < i then
+					local _, fieldName = matchFieldIf(lines[k + 1])
+					if fieldName == fieldExpr then
+						local end2 = matchEnd(lines[k + 2])
+						local end3 = matchEnd(lines[k + 3])
+						if end2 and end3 == baseInd then
+							emptyStart, emptyEnd = k, k + 3
+							break
+						end
+						local elseInd = lines[k + 2]:match("^(%s*)else%s*$")
+						local end4 = k + 4 < i and matchEnd(lines[k + 4]) or nil
+						if elseInd and end3 and end4 == baseInd then
+							emptyStart, emptyEnd = k, k + 4
+							break
+						end
+					end
+				end
+			end
+			if emptyStart and emptyEnd then
+				local clear = true
+				for mid = emptyEnd + 1, i - 1 do
+					if trim(lines[mid]) ~= "" and not matchEnd(lines[mid]) then clear = false break end
+				end
+				if clear then
+					for idx = emptyStart, emptyEnd do remove[idx] = true end
+					replace[i] = {
+						endIdx = guardEnd,
+						lines = {
+							guardIndent .. "if not " .. base .. " then return" .. retSuffix .. " end",
+							guardIndent .. "if not " .. fieldExpr .. " then return" .. retSuffix .. " end",
+						},
+					}
+				end
+			end
+		end
+	end
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		if replace[i] then
+			for _, ln in ipairs(replace[i].lines) do out[#out+1] = ln end
+			i = replace[i].endIdx + 1
+		else
+			if not remove[i] then out[#out+1] = lines[i] end
+			i = i + 1
+		end
+	end
+	return out
+end
+
+local function fixInvertedIsaGuard(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		if i + 4 > #lines then
+			out[#out+1] = lines[i]
+			i = i + 1
+		else
+			local findInd, name = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*.+:FindFirstChild%(.+%)%s*$")
+			local ifInd, ifName = lines[i + 1]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
+			local isaInd, checkName, isaName, isaArg = lines[i + 2]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*):IsA%((.+)%)%s*$")
+			if not (findInd and ifInd and isaInd and name and ifName and checkName and isaName and isaArg)
+				or ifInd ~= findInd
+				or ifName ~= name
+				or isaName ~= name
+				or isaInd:sub(1, #findInd) ~= findInd
+				or isaInd == findInd
+			then
+				out[#out+1] = lines[i]
+				i = i + 1
+			else
+				local endIdx = nil
+				local maxJ = math.min(#lines, i + 11)
+				for j = i + 3, maxJ do
+					local endInd = matchEnd(lines[j])
+					if endInd == findInd then
+						endIdx = j
+						break
+					end
+				end
+				if not endIdx then
+					out[#out+1] = lines[i]
+					i = i + 1
+				else
+					local hasReturn = false
+					for j = i + 3, endIdx - 1 do
+						local text = lines[j]:match("^%s*(.-)%s*$")
+						if text == "return" or text:sub(1, 7) == "return " then
+							hasReturn = true
+							break
+						end
+					end
+					if not hasReturn then
+						out[#out+1] = lines[i]
+						i = i + 1
+					else
+						out[#out+1] = lines[i]
+						out[#out+1] = findInd .. "if not " .. name .. " then"
+						for j = i + 3, endIdx - 1 do out[#out+1] = lines[j] end
+						out[#out+1] = findInd .. "end"
+						out[#out+1] = findInd .. "local " .. checkName .. " = " .. name .. ":IsA(" .. isaArg .. ")"
+						out[#out+1] = findInd .. "if not " .. checkName .. " then"
+						for j = i + 3, endIdx - 1 do out[#out+1] = lines[j] end
+						out[#out+1] = findInd .. "end"
+						i = endIdx + 1
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
 -- Rewrite goto -> return when label points at a return
 local function rewriteGotoToReturn(lines)
 	local labelToReturn = {}
@@ -2060,6 +2244,27 @@ local function foldConstantConditionBlocks(lines, indentUnit)
 						folded[#folded+1] = ln
 					end
 					handled = true
+				end
+			end
+			if not handled then
+				local inlineInd, inlineCond, inlineBody = ln:match("^(%s*)if%s+(.+)%s+then%s+(.+)%s+end%s*$")
+				if inlineInd then
+					local cn = inlineCond:match("^%s*(.-)%s*$")
+					while cn:sub(1,1) == "(" and cn:sub(-1) == ")" do
+						local d2, bal = 0, true
+						for ci = 1, #cn-1 do
+							local ch = cn:sub(ci,ci)
+							if ch == "(" then d2 = d2+1 elseif ch == ")" then d2 = d2-1; if d2==0 then bal=false; break end end
+						end
+						if not bal then break end
+						cn = cn:sub(2,-2):match("^%s*(.-)%s*$")
+					end
+					if cn == "false" or cn == "not true" or cn == "not (true)" then
+						handled = true
+					elseif cn == "true" or cn == "not false" or cn == "not (false)" then
+						folded[#folded+1] = inlineInd .. inlineBody
+						handled = true
+					end
 				end
 			end
 			if not handled then
@@ -2237,7 +2442,8 @@ local function balanceLuaBlocksByIndent(lines)
 			out[#out+1] = line
 		else
 			out[#out+1] = line
-			if text:match("^if%s") then stack[#stack+1] = {"if", indent}
+			if text:match("^if%s") then
+				if not text:match("%f[%a]end%s*$") then stack[#stack+1] = {"if", indent} end
 			elseif text == "repeat" then stack[#stack+1] = {"repeat", indent}
 			elseif text:match("^for%s.+%sdo$") or text:match("^while%s.+%sdo$") or text == "do"
 				or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]") then
@@ -2258,7 +2464,8 @@ local function dropUnmatchedEndLines(lines)
 	for _, line in ipairs(lines) do
 		local text = line:match("^%s*(.-)%s*$")
 		if text:match("^if%s") then
-			stack[#stack+1] = "if"; out[#out+1] = line
+			if not text:match("%f[%a]end%s*$") then stack[#stack+1] = "if" end
+			out[#out+1] = line
 		elseif text == "repeat" then
 			stack[#stack+1] = "repeat"; out[#out+1] = line
 		elseif text:match("^for%s.+%sdo$") or text:match("^while%s.+%sdo$") or text == "do"
@@ -2421,6 +2628,311 @@ local function inlineTrivialConditionLocals(lines)
 	return out
 end
 
+local function inlineTrivialCompareGuardLocals(lines)
+	local out = {}
+	local i = 1
+	local ops = {"~=", "<=", ">=", "==", "<", ">"}
+	while i <= #lines do
+		local inlined = false
+		if i + 1 <= #lines then
+			local li, name, rhs = lines[i]:match("^(%s*)local%s+(_r%d+[_%d]*)%s*=%s*(.+)%s*$")
+			if li and name and rhs then
+				for _, op in ipairs(ops) do
+					local ii, in2, cmp, ret = lines[i + 1]:match("^(%s*)if%s+(_r%d+[_%d]*)%s*" .. luaPE(op) .. "%s*(.-)%s+then%s+return(.-)%s+end%s*$")
+					if ii and li == ii and name == in2 then
+						local usePat = "%f[%a_]" .. luaPE(name) .. "%f[^%a_%d]"
+						local usedLater = false
+						for j = i + 2, #lines do
+							if lines[j]:find(usePat) then usedLater = true break end
+						end
+						if not usedLater then
+							out[#out+1] = ii .. "if " .. rhs .. " " .. op .. " " .. cmp .. " then return" .. (ret or "") .. " end"
+							i = i + 2
+							inlined = true
+						end
+						break
+					end
+				end
+			end
+		end
+		if not inlined then
+			out[#out+1] = lines[i]
+			i = i + 1
+		end
+	end
+	return out
+end
+
+local function fixOrDefaultAssignments(lines)
+	local work = {}
+	for _, ln in ipairs(lines) do work[#work+1] = ln end
+	local function trim(s)
+		return s:match("^%s*(.-)%s*$")
+	end
+	local function startsWith(s, prefix)
+		return s:sub(1, #prefix) == prefix
+	end
+	local function matchDeclEmpty(ln)
+		return ln:match("^(%s*)local%s+(_r%d+[_%d]*)%s*$")
+	end
+	local function matchIfNot(ln)
+		local ind = ln:match("^(%s*)") or ""
+		local text = trim(ln)
+		local cond = text:match("^if%s+not%s+%((.-)%)%s+then$")
+		if not cond then cond = text:match("^if%s+not%s+(.+)%s+then$") end
+		if cond then return ind, cond end
+		return nil, nil
+	end
+	local function matchAssignTmp(ln)
+		return ln:match("^(%s*)(_r%d+[_%d]*)%s*=%s*(.+)%s*$")
+	end
+	local function matchAssignTarget(ln)
+		local ind, target, tmp = ln:match("^(%s*)([%a_][%w_]*%b[])%s*=%s*(_r%d+[_%d]*)%s*$")
+		if ind then return ind, target, tmp end
+		ind, target, tmp = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*(_r%d+[_%d]*)%s*$")
+		if ind then return ind, target, tmp end
+		return nil, nil, nil
+	end
+	local function matchLocalValue(ln)
+		return ln:match("^(%s*)local%s+(_r%d+[_%d]*)%s*=%s*(.+)%s*$")
+	end
+	for i = 1, #work - 3 do
+		local ifInd, cond = matchIfNot(work[i])
+		local tmpInd, tmp, rhs = matchAssignTmp(work[i + 1])
+		local endInd = matchEnd(work[i + 2])
+		local targetInd, target, targetTmp = matchAssignTarget(work[i + 3])
+		if ifInd and tmpInd and tmp and rhs and endInd and targetInd and target and targetTmp
+			and endInd == ifInd
+			and targetInd == ifInd
+			and startsWith(tmpInd, ifInd)
+			and targetTmp == tmp
+		then
+			local declIdx = nil
+			for j = i - 1, 1, -1 do
+				local text = trim(work[j])
+				local jind = work[j]:match("^(%s*)") or ""
+				if (text:sub(1, 15) == "local function " or text:sub(1, 9) == "function ") and #jind <= #ifInd then
+					break
+				end
+				local declInd, declTmp = matchDeclEmpty(work[j])
+				if declInd == ifInd and declTmp == tmp then
+					declIdx = j
+					break
+				end
+			end
+			if declIdx then
+				local usePat = "%f[%a_]" .. luaPE(tmp) .. "%f[^%a_%d]"
+				local usedBefore = false
+				for j = declIdx + 1, i - 1 do
+					if work[j]:find(usePat) then usedBefore = true break end
+				end
+				if not usedBefore then
+					work[declIdx] = ""
+					work[i] = ifInd .. target .. " = (" .. cond .. " or " .. rhs .. ")"
+					work[i + 1] = ""
+					work[i + 2] = ""
+					work[i + 3] = ""
+				end
+			end
+		end
+	end
+	local out = {}
+	local i = 1
+	while i <= #work do
+		if work[i] == "" then
+			i = i + 1
+		else
+			local handled = false
+			if i + 4 <= #work then
+				local declInd, declTmp = matchDeclEmpty(work[i])
+				local ifInd, cond = matchIfNot(work[i + 1])
+				local tmpInd, tmp, rhs = matchAssignTmp(work[i + 2])
+				local endInd = matchEnd(work[i + 3])
+				local targetInd, target, targetTmp = matchAssignTarget(work[i + 4])
+				if declInd and ifInd and tmpInd and tmp and rhs and endInd and targetInd and target and targetTmp
+					and declInd == ifInd and ifInd == endInd and endInd == targetInd
+					and startsWith(tmpInd, declInd)
+					and declTmp == tmp and tmp == targetTmp
+				then
+					out[#out+1] = targetInd .. target .. " = (" .. cond .. " or " .. rhs .. ")"
+					i = i + 5
+					handled = true
+				end
+			end
+			if not handled and i + 1 <= #work then
+				local localInd, localTmp, value = matchLocalValue(work[i])
+				local targetInd, target, targetTmp = matchAssignTarget(work[i + 1])
+				if localInd and localTmp and value and targetInd and target and targetTmp
+					and localInd == targetInd
+					and localTmp == targetTmp
+				then
+					out[#out+1] = targetInd .. target .. " = " .. value
+					i = i + 2
+					handled = true
+				end
+			end
+			if not handled then
+				out[#out+1] = work[i]
+				i = i + 1
+			end
+		end
+	end
+	return out
+end
+
+local function renameTempFindFirstChildDynamic(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+	local existing = {}
+	for _, ln in ipairs(out) do
+		local name = ln:match("%f[%a_]local%s+([%a_][%w_]*)%f[^%a_%d]")
+		if name then existing[name] = true end
+	end
+	for i, line in ipairs(lines) do
+		local old, arg = line:match("^%s*local%s+(_r%d+[_%d]*)%s*=%s*.+:FindFirstChild%((.+)%)%s*$")
+		if old and arg then
+			arg = arg:match("^%s*(.-)%s*$")
+			local hint = arg:match("%.([%a_][%w_]*)$")
+			if not hint and isValidIdent(arg) then hint = arg end
+			hint = hint and cleanIdent(hint) or nil
+			if hint and isValidIdent(hint) then
+				local newName = hint
+				if existing[newName] and newName ~= old then
+					local suffix = 2
+					while existing[newName .. "_" .. tostring(suffix)] do suffix = suffix + 1 end
+					newName = newName .. "_" .. tostring(suffix)
+				end
+				existing[newName] = true
+				local usePat = "%f[%a_]" .. luaPE(old) .. "%f[^%a_%d]"
+				local endIdx = math.min(#out, i + 11)
+				for j = i, endIdx do
+					if j > i and out[j]:find("%f[%a_]local%s+" .. luaPE(old) .. "%f[^%a_%d]") then break end
+					if out[j]:find(usePat) then
+						out[j] = out[j]:gsub(usePat, newName)
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function renameTempByCommonAssignedField(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+	local preferred = {
+		Visible = "visible",
+		Enabled = "enabled",
+		Transparency = "transparency",
+		Size = "size",
+		Position = "position",
+		CFrame = "cframe",
+		Color = "color",
+		Text = "text",
+	}
+	local existing = {}
+	for _, ln in ipairs(lines) do
+		local name = ln:match("%f[%a_]local%s+([%a_][%w_]*)%f[^%a_%d]")
+		if name then existing[name] = true end
+	end
+	for i, line in ipairs(lines) do
+		local old = line:match("^%s*local%s+(_r%d+[_%d]*)%s*=%s*.+%s*$")
+		if old then
+			local fields = {}
+			local lastUse = i
+			local valid = true
+			for j = i + 1, math.min(#lines, i + 7) do
+				if lines[j]:find("%f[%a_]local%s+" .. luaPE(old) .. "%f[^%a_%d]") then break end
+				local usePat = "%f[%a_]" .. luaPE(old) .. "%f[^%a_%d]"
+				if lines[j]:find(usePat) then
+					local field, rhs = lines[j]:match("^%s*[%a_][%w_%.:%[%]\"']*%.([%a_][%w_]*)%s*=%s*(_r%d+[_%d]*)%s*$")
+					if not field or rhs ~= old then
+						valid = false
+						break
+					end
+					fields[#fields+1] = field
+					lastUse = j
+				elseif #fields > 0 then
+					break
+				end
+			end
+			if valid and #fields > 0 then
+				local same = true
+				for j = 2, #fields do
+					if fields[j] ~= fields[1] then same = false break end
+				end
+				if same then
+					local newName = preferred[fields[1]] or cleanIdent(fields[1])
+					if newName and isValidIdent(newName) then
+						if existing[newName] and newName ~= old then
+							local suffix = 2
+							while existing[newName .. "_" .. tostring(suffix)] do suffix = suffix + 1 end
+							newName = newName .. "_" .. tostring(suffix)
+						end
+						existing[newName] = true
+						local usePat = "%f[%a_]" .. luaPE(old) .. "%f[^%a_%d]"
+						for j = i, lastUse do
+							out[j] = out[j]:gsub(usePat, newName)
+						end
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function renameLocalTableByAssignment(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+	local existing = {}
+	for _, ln in ipairs(lines) do
+		local name = ln:match("%f[%a_]local%s+([%a_][%w_]*)%f[^%a_%d]")
+		if name then existing[name] = true end
+	end
+	for i, line in ipairs(lines) do
+		local ind, old, tableExpr = line:match("^(%s*)local%s+(_r%d+[_%d]*)%s*=%s*(%{.+%})%s*$")
+		local hasSignalField = false
+		if tableExpr then
+			for _, field in ipairs({"Weld", "OriginalC0", "SpinRate", "IsFiring", "CurrentPosition", "TargetPosition", "Model", "Animator"}) do
+				if tableExpr:find("%f[%a_]" .. field .. "%f[^%a_%d]%s*=") then
+					hasSignalField = true
+					break
+				end
+			end
+		end
+		if ind and old and tableExpr and hasSignalField then
+			local assignIdx = nil
+			for j = i + 1, math.min(#lines, i + 11) do
+				local rhs = lines[j]:match("^%s*[%a_][%w_]*%b[]%s*=%s*(_r%d+[_%d]*)%s*$")
+				if rhs == old then
+					assignIdx = j
+					break
+				end
+				local rhs2 = lines[j]:match("^%s*[%a_][%w_]*%s*=%s*(_r%d+[_%d]*)%s*$")
+				if rhs2 == old then
+					assignIdx = j
+					break
+				end
+			end
+			if assignIdx then
+				local newName = "data"
+				if existing[newName] then
+					local suffix = 2
+					while existing[newName .. "_" .. tostring(suffix)] do suffix = suffix + 1 end
+					newName = newName .. "_" .. tostring(suffix)
+				end
+				existing[newName] = true
+				local usePat = "%f[%a_]" .. luaPE(old) .. "%f[^%a_%d]"
+				for j = i, assignIdx do
+					out[j] = out[j]:gsub(usePat, newName)
+				end
+			end
+		end
+	end
+	return out
+end
+
 -- Fold table array initializers: `local t = {}; t[1],t[2]=a,b` -> `local t = {a,b}`
 local function foldTableArrayInitializers(lines)
 	local out = {}
@@ -2483,6 +2995,318 @@ local function foldTableArrayInitializers(lines)
 	return out
 end
 
+local function fixBareMethodReferences(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		if matchLbl(line) then
+			out[#out+1] = line
+			continue
+		end
+		local res = {}
+		local quote = nil
+		local i = 1
+		while i <= #line do
+			local ch = line:sub(i, i)
+			if quote then
+				res[#res+1] = ch
+				if ch == "\\" and i + 1 <= #line then
+					res[#res+1] = line:sub(i + 1, i + 1)
+					i = i + 2
+				else
+					if ch == quote then quote = nil end
+					i = i + 1
+				end
+			elseif ch == '"' or ch == "'" then
+				quote = ch
+				res[#res+1] = ch
+				i = i + 1
+			elseif ch == "-" and line:sub(i + 1, i + 1) == "-" then
+				res[#res+1] = line:sub(i)
+				break
+			elseif ch == ":" and line:sub(i - 1, i - 1) ~= ":" and line:sub(i + 1, i + 1):match("[%a_]") then
+				local j = i + 2
+				while j <= #line and line:sub(j, j):match("[%a_%d]") do
+					j = j + 1
+				end
+				local k = j
+				while k <= #line and line:sub(k, k):match("%s") do
+					k = k + 1
+				end
+				if k <= #line and line:sub(k, k) == "(" then
+					res[#res+1] = ":"
+				else
+					res[#res+1] = "."
+				end
+				i = i + 1
+			else
+				res[#res+1] = ch
+				i = i + 1
+			end
+		end
+		out[#out+1] = table.concat(res)
+	end
+	return out
+end
+
+local function fixLiteralMethodReceivers(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		local ln = line
+		ln = ln:gsub("([^%w_])nil:([%a_][%a_%d]*%s*%()", "%1(nil):%2")
+		ln = ln:gsub("([^%w_])true:([%a_][%a_%d]*%s*%()", "%1(true):%2")
+		ln = ln:gsub("([^%w_])false:([%a_][%a_%d]*%s*%()", "%1(false):%2")
+		ln = ln:gsub("^nil:([%a_][%a_%d]*%s*%()", "(nil):%1")
+		ln = ln:gsub("^true:([%a_][%a_%d]*%s*%()", "(true):%1")
+		ln = ln:gsub("^false:([%a_][%a_%d]*%s*%()", "(false):%1")
+		out[#out+1] = ln
+	end
+	return out
+end
+
+local function fixLiteralFieldReceivers(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		local res = {}
+		local quote = nil
+		local i = 1
+		while i <= #line do
+			local ch = line:sub(i, i)
+			if quote then
+				res[#res+1] = ch
+				if ch == "\\" and i + 1 <= #line then
+					res[#res+1] = line:sub(i + 1, i + 1)
+					i = i + 2
+				else
+					if ch == quote then quote = nil end
+					i = i + 1
+				end
+			elseif ch == '"' or ch == "'" then
+				quote = ch
+				res[#res+1] = ch
+				i = i + 1
+			elseif ch == "-" and line:sub(i + 1, i + 1) == "-" then
+				res[#res+1] = line:sub(i)
+				break
+			else
+				local replaced = false
+				for _, lit in ipairs({"false", "true", "nil"}) do
+					local before = i > 1 and line:sub(i - 1, i - 1) or ""
+					local after = line:sub(i + #lit, i + #lit)
+					if line:sub(i, i + #lit - 1) == lit
+						and after == "."
+						and not before:match("[%w_]")
+					then
+						res[#res+1] = "(" .. lit .. ")"
+						i = i + #lit
+						replaced = true
+						break
+					end
+				end
+				if not replaced then
+					res[#res+1] = ch
+					i = i + 1
+				end
+			end
+		end
+		out[#out+1] = table.concat(res)
+	end
+	return out
+end
+
+local function astIfOpenText(text)
+	return text:match("^if%s+(.+)%s+then$")
+end
+
+local function astBlockOpenText(text)
+	if text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]") then return true end
+	if text:match("^for%s.+%sdo$") or text:match("^while%s.+%sdo$") or text == "do" then return true end
+	return false
+end
+
+local function repairInvalidElseClauses(lines)
+	local out = {}
+	local stack = {}
+	for _, line in ipairs(lines) do
+		local text = line:match("^%s*(.-)%s*$")
+		local indent = line:match("^(%s*)") or ""
+		while #stack > 0 and stack[#stack].indent > #indent do
+			table.remove(stack)
+		end
+		if text:sub(1, 7) == "elseif " then
+			if #stack > 0 and stack[#stack].kind == "if" and stack[#stack].indent == #indent and not stack[#stack].seen_else then
+				out[#out+1] = line
+			else
+				local newLine = indent .. "if " .. text:sub(8)
+				out[#out+1] = newLine
+				stack[#stack+1] = {kind = "if", indent = #indent, seen_else = false}
+			end
+		elseif text == "else" then
+			if #stack > 0 and stack[#stack].kind == "if" and stack[#stack].indent == #indent and not stack[#stack].seen_else then
+				stack[#stack].seen_else = true
+				out[#out+1] = line
+			else
+				local newLine = indent .. "if true then"
+				out[#out+1] = newLine
+				stack[#stack+1] = {kind = "if", indent = #indent, seen_else = false}
+			end
+		elseif text == "end" then
+			if #stack > 0 and stack[#stack].indent == #indent then
+				table.remove(stack)
+			end
+			out[#out+1] = line
+		else
+			out[#out+1] = line
+			if astIfOpenText(text) then
+				stack[#stack+1] = {kind = "if", indent = #indent, seen_else = false}
+			elseif text == "repeat" then
+				stack[#stack+1] = {kind = "repeat", indent = #indent}
+			elseif astBlockOpenText(text) then
+				stack[#stack+1] = {kind = "block", indent = #indent}
+			end
+		end
+	end
+	return out
+end
+
+local function dropGotoToImmediatePostIfLabel(lines)
+	local i = 1
+	while i <= #lines do
+		local gi, target = matchGoto(lines[i])
+		if not gi then
+			i = i + 1
+		else
+			local labelIdx = nil
+			for k = i + 1, #lines do
+				local _, lbl = matchLbl(lines[k])
+				if lbl == target then
+					labelIdx = k
+					break
+				end
+			end
+			local li = labelIdx and (lines[labelIdx]:match("^(%s*)") or "") or nil
+			local nextIdx = i + 1
+			while nextIdx <= #lines and not lines[nextIdx]:match("%S") do nextIdx = nextIdx + 1 end
+			local nextText = nextIdx <= #lines and (lines[nextIdx]:match("^%s*(.-)%s*$") or "") or ""
+			local nextInd = nextIdx <= #lines and (lines[nextIdx]:match("^(%s*)") or "") or ""
+			local prevEnd = labelIdx and matchEnd(lines[labelIdx - 1] or "") or nil
+			local branchTail = (
+				labelIdx
+				and li
+				and prevEnd == li
+				and #nextInd < #gi
+				and (nextText == "else" or nextText == "end" or nextText:sub(1, 7) == "elseif ")
+			)
+			if branchTail then
+				local result = {}
+				for k = 1, i - 1 do result[#result+1] = lines[k] end
+				for k = i + 1, labelIdx - 1 do result[#result+1] = lines[k] end
+				for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
+				return result, true
+			end
+			local j = i + 1
+			local ok = true
+			while j <= #lines do
+				local text = lines[j]:match("^%s*(.-)%s*$")
+				local ind = lines[j]:match("^(%s*)") or ""
+				if text == "" then
+					j = j + 1
+				elseif #ind < #gi then
+					ok = false
+					break
+				elseif #ind == #gi and (text == "else" or text:sub(1, 7) == "elseif " or text == "end") then
+					j = j + 1
+				else
+					break
+				end
+			end
+			local li2, lbl = j <= #lines and matchLbl(lines[j]) or nil
+			if ok and lbl == target and li2 and #li2 <= #gi then
+				local result = {}
+				for k = 1, i - 1 do result[#result+1] = lines[k] end
+				for k = i + 1, j - 1 do result[#result+1] = lines[k] end
+				for k = j + 1, #lines do result[#result+1] = lines[k] end
+				return result, true
+			end
+			i = i + 1
+		end
+	end
+	return lines, false
+end
+
+local function wrapOrphanIfGotosAsGuards(lines, indentUnit)
+	local labels = {}
+	for _, ln in ipairs(lines) do
+		local _, lbl = matchLbl(ln)
+		if lbl then labels[lbl] = true end
+	end
+	local i = 1
+	while i <= #lines do
+		local ind, cond, target = matchIfGoto(lines[i])
+		if ind and not labels[target] then
+			local j = i + 1
+			while j <= #lines do
+				local text = lines[j]:match("^%s*(.-)%s*$")
+				local curInd = lines[j]:match("^(%s*)") or ""
+				if text == "" then
+					j = j + 1
+				elseif #curInd < #ind then
+					break
+				elseif #curInd == #ind and (text == "end" or text == "else" or text:sub(1, 7) == "elseif ") then
+					break
+				else
+					j = j + 1
+				end
+			end
+			if j > i + 1 then
+				local result = {}
+				for k = 1, i - 1 do result[#result+1] = lines[k] end
+				result[#result+1] = ind .. "if " .. negateCond(cond) .. " then"
+				for k = i + 1, j - 1 do
+					local bl = lines[k]
+					if bl:match("%S") then result[#result+1] = indentUnit .. bl else result[#result+1] = bl end
+				end
+				result[#result+1] = ind .. "end"
+				for k = j, #lines do result[#result+1] = lines[k] end
+				return result, true
+			end
+		end
+		i = i + 1
+	end
+	return lines, false
+end
+
+local function dropInvalidTopLevelReturns(lines)
+	local out = {}
+	for i, ln in ipairs(lines) do
+		local ind = ln:match("^(%s*)") or ""
+		local text = ln:match("^%s*(.-)%s*$")
+		local drop = false
+		if ind == "" and (text == "return" or text:sub(1, 7) == "return ") then
+			local j = i + 1
+			while j <= #lines and not lines[j]:match("%S") do j = j + 1 end
+			local nextText = j <= #lines and (lines[j]:match("^%s*(.-)%s*$") or "") or ""
+			if nextText:sub(1, 15) == "local function " or nextText:sub(1, 9) == "function " then
+				drop = true
+			end
+		end
+		if not drop then out[#out+1] = ln end
+	end
+	return out
+end
+
+local function fixInvalidGenericForHeaders(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do
+		local ind, vars, reg = ln:match("^(%s*)for%s+(.+)%s+in%s+%-%-%s*iter%s+(R%d+)%s+do%s*$")
+		if ind then
+			out[#out+1] = ind .. "for " .. vars .. " in " .. reg .. " do"
+		else
+			out[#out+1] = ln
+		end
+	end
+	return out
+end
+
 -- Find label index in lines starting from `startI` (1-based)
 local function findLabelIndex(lines, target, startI)
 	local pat = "^%s*::" .. luaPE(target) .. "::%s*$"
@@ -2498,6 +3322,157 @@ local function lastNonblankIndex(lines)
 		if lines[i]:match("%S") then return i end
 	end
 	return nil
+end
+
+local function inlineLocalIntoIfGoto(lines, indentUnit)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+
+	local function trim(s)
+		return (s or ""):match("^%s*(.-)%s*$")
+	end
+
+	local function stripOuterParens(s)
+		s = trim(s)
+		while s:sub(1, 1) == "(" and s:sub(-1) == ")" do
+			local depth = 0
+			local balanced = true
+			for i = 1, #s do
+				local ch = s:sub(i, i)
+				if ch == "(" then
+					depth = depth + 1
+				elseif ch == ")" then
+					depth = depth - 1
+					if depth == 0 and i < #s then
+						balanced = false
+						break
+					end
+				end
+			end
+			if not balanced then break end
+			s = trim(s:sub(2, -2))
+		end
+		return s
+	end
+
+	local function matchDecl(line)
+		local ind, var, rhs = line:match("^(%s*)local%s+([%a_][%a_%d]*)%s*=%s*(.+)%s*$")
+		if var then return ind, true, var, rhs end
+		ind, var, rhs = line:match("^(%s*)([%a_][%a_%d]*)%s*=%s*(.+)%s*$")
+		if var then return ind, false, var, rhs end
+		return nil
+	end
+
+	local function validFieldSuffix(s)
+		if s == "" then return true end
+		local consumed = 0
+		for seg in s:gmatch("%.([%a_][%a_%d]*)") do
+			consumed = consumed + #seg + 1
+		end
+		return consumed == #s and consumed > 0
+	end
+
+	local function simpleIdentChain(s)
+		local first, nextPos = s:match("^([%a_][%a_%d]*)()")
+		if not first then return false end
+		while nextPos <= #s do
+			if s:sub(nextPos, nextPos) ~= "." then return false end
+			local seg, afterSeg = s:match("^%.([%a_][%a_%d]*)()", nextPos)
+			if not seg then return false end
+			nextPos = afterSeg
+		end
+		return true
+	end
+
+	local function parseTest(line, var)
+		local ind, cond, target = matchIfGoto(line)
+		if not ind then return nil end
+		local neg = ""
+		cond = trim(cond)
+		if cond:sub(1, 4) == "not " then
+			neg = "not "
+			cond = trim(cond:sub(5))
+		end
+		cond = stripOuterParens(cond)
+		if cond == var then
+			return ind, neg, "", target
+		end
+		if cond:sub(1, #var) == var then
+			local suffix = cond:sub(#var + 1)
+			if validFieldSuffix(suffix) then
+				return ind, neg, suffix, target
+			end
+		end
+		return nil
+	end
+
+	local function usesVar(line, var)
+		return line:find("%f[%a_]" .. luaPE(var) .. "%f[^%a_%d]") ~= nil
+	end
+
+	local changed = false
+	local i = 1
+	while i + 1 <= #out do
+		local ind, isLocal, var, rhs = matchDecl(out[i])
+		if not ind then
+			i = i + 1
+		else
+			local testInd, neg, suffix, target = parseTest(out[i + 1], var)
+			if not testInd or testInd ~= ind then
+				i = i + 1
+			else
+				local targetIdx = findLabelIndex(out, target, i + 2)
+				if not targetIdx then
+					i = i + 1
+				else
+					local unsafe = false
+					for j = i + 2, targetIdx - 1 do
+						if usesVar(out[j], var) then
+							local ai, arhs = out[j]:match("^(%s*)local%s+" .. luaPE(var) .. "%s*=%s*(.+)%s*$")
+							if not ai then
+								ai, arhs = out[j]:match("^(%s*)" .. luaPE(var) .. "%s*=%s*(.+)%s*$")
+							end
+							if ai and not usesVar(arhs, var) then
+								break
+							end
+							unsafe = true
+							break
+						end
+					end
+					if unsafe then
+						i = i + 1
+					else
+						if not isLocal then
+							local tailUsed = false
+							for j = targetIdx, #out do
+								if usesVar(out[j], var) then tailUsed = true break end
+							end
+							if tailUsed then
+								i = i + 1
+							else
+								local expr = trim(rhs)
+								local needsParens = expr:find(" or ", 1, true) ~= nil or expr:find(" and ", 1, true) ~= nil or (suffix ~= "" and not simpleIdentChain(expr))
+								if needsParens then expr = "(" .. expr .. ")" end
+								out[i] = ind .. "if " .. neg .. expr .. suffix .. " then goto " .. target .. " end"
+								table.remove(out, i + 1)
+								changed = true
+								i = i + 1
+							end
+						else
+							local expr = trim(rhs)
+							local needsParens = expr:find(" or ", 1, true) ~= nil or expr:find(" and ", 1, true) ~= nil or (suffix ~= "" and not simpleIdentChain(expr))
+							if needsParens then expr = "(" .. expr .. ")" end
+							out[i] = ind .. "if " .. neg .. expr .. suffix .. " then goto " .. target .. " end"
+							table.remove(out, i + 1)
+							changed = true
+							i = i + 1
+						end
+					end
+				end
+			end
+		end
+	end
+	return out, changed
 end
 
 -- Lift `if g1 goto T end; if g2 goto T end; THEN_BODY; goto J; ::T:: ELSE_BODY; ::J::` -> `if not g1 and not g2 then...else...end`
@@ -2584,6 +3559,282 @@ local function liftGuardChainElse(lines, indentUnit)
 	return lines, false
 end
 
+-- Lift `if COND then goto T end; BODY; ::T::` -> `if not COND then BODY end`
+-- where T is only referenced by this one goto, BODY has no labels and no ref to T
+local function liftGuardToSkipLabel(lines, indentUnit)
+	local changed = false
+	local i = 1
+	while i <= #lines do
+		local rebuilt = false
+		local ind, cond, tgt = matchIfGoto(lines[i])
+		if ind then
+			local labelIdx = nil
+			local labelInd = nil
+			for j = i + 1, #lines do
+				local li, lbl = matchLbl(lines[j])
+				if lbl == tgt then
+					labelIdx = j
+					labelInd = li
+					break
+				end
+			end
+			if labelIdx and labelInd == ind and labelIdx > i + 1 then
+				-- the label must be referenced only once (by our goto) so we
+				-- can safely drop it after re-structuring.
+				local refs = labelRefs(lines, tgt)
+				if #refs == 1 and refs[1] == i then
+					local bodyOk = true
+					-- disallow inner labels and disallow nested blocks that
+					-- span past the label.
+					local depth = 0
+					for k = i + 1, labelIdx - 1 do
+						local _, innerLbl = matchLbl(lines[k])
+						if innerLbl then bodyOk = false; break end
+						local ki = lines[k]:match("^(%s*)") or ""
+						if #ki < #ind then bodyOk = false; break end
+						if matchLoopOpen(lines[k]) or matchIfOpen(lines[k]) then
+							depth = depth + 1
+						elseif matchEnd(lines[k]) then
+							if depth == 0 then bodyOk = false; break end
+							depth = depth - 1
+						end
+					end
+					if bodyOk and depth == 0 then
+						local body = {}
+						for k = i + 1, labelIdx - 1 do body[#body+1] = lines[k] end
+						local negCond = negateCond(cond)
+						local newBlock = {ind .. "if " .. negCond .. " then"}
+						for _, bl in ipairs(body) do
+							if bl:match("%S") then
+								newBlock[#newBlock+1] = indentUnit .. bl
+							else
+								newBlock[#newBlock+1] = bl
+							end
+						end
+						newBlock[#newBlock+1] = ind .. "end"
+						local result = {}
+						for k = 1, i - 1 do result[#result+1] = lines[k] end
+						for _, bl in ipairs(newBlock) do result[#result+1] = bl end
+						for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
+						lines = result
+						changed = true
+						rebuilt = true
+					end
+				end
+			end
+		end
+		if not rebuilt then i = i + 1 end
+	end
+	return lines, changed
+end
+
+local function liftIfGotoBody(lines, indentUnit)
+	local i = 1
+	while i <= #lines do
+		local ind, cond, target = matchIfGoto(lines[i])
+		if not ind then
+			i = i + 1
+		else
+			local labelIdx = findLabelIndex(lines, target, i + 1)
+			if not labelIdx then
+				i = i + 1
+			else
+				local body = {}
+				for k = i + 1, labelIdx - 1 do body[#body+1] = lines[k] end
+				local bodyHasGoto = false
+				for _, bl in ipairs(body) do
+					if bl:find("%f[%a_]goto%s+" .. luaPE(target) .. "%f[^%a_%d]") then
+						bodyHasGoto = true
+						break
+					end
+				end
+				local outsideRefs = {}
+				for _, r in ipairs(labelRefs(lines, target)) do
+					if r < i or r > labelIdx then outsideRefs[#outsideRefs+1] = r end
+				end
+
+				local elseBlock = nil
+				local elseTarget = nil
+				local elseLabelIdx = nil
+				local lastIdx = lastNonblankIndex(body)
+				if lastIdx and not bodyHasGoto then
+					local _, candTarget = matchGoto(body[lastIdx])
+					if candTarget then
+						local candLabelIdx = findLabelIndex(lines, candTarget, labelIdx + 1)
+						if candLabelIdx then
+							local between = {}
+							for k = labelIdx + 1, candLabelIdx - 1 do between[#between+1] = lines[k] end
+							local bodyInner = {}
+							for k = 1, lastIdx - 1 do bodyInner[#bodyInner+1] = body[k] end
+							local escapes = false
+							for _, bl in ipairs(bodyInner) do
+								if bl:find("%f[%a_]goto%s+" .. luaPE(target) .. "%f[^%a_%d]")
+									or bl:find("%f[%a_]goto%s+" .. luaPE(candTarget) .. "%f[^%a_%d]")
+								then
+									escapes = true
+									break
+								end
+							end
+							if not escapes then
+								for _, bl in ipairs(between) do
+									if bl:find("%f[%a_]goto%s+" .. luaPE(target) .. "%f[^%a_%d]")
+										or bl:find("%f[%a_]goto%s+" .. luaPE(candTarget) .. "%f[^%a_%d]")
+									then
+										escapes = true
+										break
+									end
+								end
+							end
+							if not escapes then
+								elseBlock = between
+								elseTarget = candTarget
+								elseLabelIdx = candLabelIdx
+								body = bodyInner
+							end
+						end
+					end
+				end
+
+				local newBlock = {ind .. "if " .. negateCond(cond) .. " then"}
+				for _, bl in ipairs(body) do
+					if bl:match("%S") then
+						newBlock[#newBlock+1] = indentUnit .. bl
+					else
+						newBlock[#newBlock+1] = bl
+					end
+				end
+				if elseBlock then
+					newBlock[#newBlock+1] = ind .. "else"
+					for _, bl in ipairs(elseBlock) do
+						if bl:match("%S") then
+							newBlock[#newBlock+1] = indentUnit .. bl
+						else
+							newBlock[#newBlock+1] = bl
+						end
+					end
+				end
+				newBlock[#newBlock+1] = ind .. "end"
+
+				local result = {}
+				for k = 1, i - 1 do result[#result+1] = lines[k] end
+				for _, bl in ipairs(newBlock) do result[#result+1] = bl end
+				if elseBlock then
+					if #outsideRefs > 0 or bodyHasGoto then result[#result+1] = lines[labelIdx] end
+					local otherElseRefs = false
+					for _, r in ipairs(labelRefs(lines, elseTarget)) do
+						if r < i or r > elseLabelIdx then
+							otherElseRefs = true
+							break
+						end
+					end
+					if otherElseRefs then result[#result+1] = lines[elseLabelIdx] end
+					for k = elseLabelIdx + 1, #lines do result[#result+1] = lines[k] end
+				else
+					if #outsideRefs > 0 or bodyHasGoto then result[#result+1] = lines[labelIdx] end
+					for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
+				end
+				return result, true
+			end
+		end
+	end
+	return lines, false
+end
+
+local function liftSimpleGuardChains(lines, indentUnit)
+	local i = 1
+	while i <= #lines do
+		local ind, cond, target = matchIfGoto(lines[i])
+		if not ind then
+			i = i + 1
+		else
+			local guards = {}
+			local cur = i
+			while cur <= #lines do
+				local gi, gc, gt = matchIfGoto(lines[cur])
+				if not gi or gi ~= ind or gt ~= target then break end
+				guards[#guards+1] = gc
+				cur = cur + 1
+			end
+			local labelIdx = findLabelIndex(lines, target, cur)
+			if labelIdx and #guards > 0 then
+				local refsOk = true
+				for _, r in ipairs(labelRefs(lines, target)) do
+					if r < i or r >= cur then refsOk = false break end
+				end
+				local bodyOk = refsOk and labelIdx > cur
+				if bodyOk then
+					for k = cur, labelIdx - 1 do
+						local bi = lines[k]:match("^(%s*)") or ""
+						local _, lbl = matchLbl(lines[k])
+						if (lines[k]:match("%S") and #bi < #ind) or lbl or matchGoto(lines[k]) or matchIfGoto(lines[k]) then bodyOk = false break end
+					end
+				end
+				if bodyOk then
+					local conds = {}
+					for _, g in ipairs(guards) do conds[#conds+1] = negateCond(g) end
+					local newBlock = {ind .. "if " .. table.concat(conds, " and ") .. " then"}
+					for k = cur, labelIdx - 1 do
+						local bl = lines[k]
+						if bl:match("%S") then newBlock[#newBlock+1] = indentUnit .. bl else newBlock[#newBlock+1] = bl end
+					end
+					newBlock[#newBlock+1] = ind .. "end"
+					local result = {}
+					for k = 1, i - 1 do result[#result+1] = lines[k] end
+					for _, bl in ipairs(newBlock) do result[#result+1] = bl end
+					for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
+					return result, true
+				end
+			end
+			i = i + 1
+		end
+	end
+	return lines, false
+end
+
+local function liftParentClosingGuards(lines, indentUnit)
+	local i = 1
+	while i <= #lines do
+		local ind, cond, target = matchIfGoto(lines[i])
+		if not ind then
+			i = i + 1
+		else
+			local labelIdx = findLabelIndex(lines, target, i + 1)
+			if labelIdx and labelIdx > i + 2 then
+				local labelInd = lines[labelIdx]:match("^(%s*)") or ""
+				local endIdx = labelIdx - 1
+				local endInd = matchEnd(lines[endIdx])
+				if endInd and #endInd == #labelInd and #labelInd < #ind then
+					local refs = labelRefs(lines, target)
+					local bodyOk = #refs == 1 and refs[1] == i
+					if bodyOk then
+						for k = i + 1, endIdx - 1 do
+							local bi = lines[k]:match("^(%s*)") or ""
+							local _, lbl = matchLbl(lines[k])
+							if #bi < #ind or lbl or matchGoto(lines[k]) or matchIfGoto(lines[k]) then bodyOk = false break end
+						end
+					end
+					if bodyOk then
+						local newBlock = {ind .. "if " .. negateCond(cond) .. " then"}
+						for k = i + 1, endIdx - 1 do
+							local bl = lines[k]
+							if bl:match("%S") then newBlock[#newBlock+1] = indentUnit .. bl else newBlock[#newBlock+1] = bl end
+						end
+						newBlock[#newBlock+1] = ind .. "end"
+						local result = {}
+						for k = 1, i - 1 do result[#result+1] = lines[k] end
+						for _, bl in ipairs(newBlock) do result[#result+1] = bl end
+						result[#result+1] = lines[endIdx]
+						for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
+						return result, true
+					end
+				end
+			end
+			i = i + 1
+		end
+	end
+	return lines, false
+end
+
 -- Lift multiline `if X then BODY goto T end ELSE_BODY ::T::` -> `if X then BODY else ELSE_BODY end`
 local function liftMultilineIfGotoElse(lines, indentUnit)
 	local i = 1
@@ -2642,7 +3893,7 @@ local function liftMultilineIfGotoElse(lines, indentUnit)
 								local minInd = nil
 								for _, bl in ipairs(elseBody) do
 									if bl:match("%S") then
-										local li2 = #bl - #bl:match("^(%s*)")
+										local li2 = #(bl:match("^(%s*)") or "")
 										if not minInd or li2 < minInd then minInd = li2 end
 									end
 								end
@@ -2713,10 +3964,11 @@ local function gotosToContinue(lines)
 	for _, ln in ipairs(lines) do newLines[#newLines+1] = ln end
 	local labelsToDrop = {}
 	for i, ln in ipairs(newLines) do
-		local gi, gind, gtgt = ln:match("^((%s*)goto%s+(pc%d+)%s*$)")
-		if gi then
-			local indent2 = gind
-			local target = gtgt
+		local gind, gtgt = matchGoto(ln)
+		local inlineInd, inlineCond, inlineTarget = matchIfGoto(ln)
+		if gind or inlineInd then
+			local indent2 = gind or inlineInd
+			local target = gtgt or inlineTarget
 			local openIdx, closeIdx, _ = enclosingLoop(newLines, i)
 			if openIdx then
 				local tgtIdxs = labelIdx[target] or {}
@@ -2739,7 +3991,11 @@ local function gotosToContinue(lines)
 					end
 				end
 				if convert then
-					newLines[i] = indent2 .. "continue"
+					if inlineInd then
+						newLines[i] = indent2 .. "if " .. inlineCond .. " then continue end"
+					else
+						newLines[i] = indent2 .. "continue"
+					end
 				end
 			end
 		end
@@ -2769,18 +4025,41 @@ local function gotosToBreak(lines)
 	for _, ln in ipairs(lines) do newLines[#newLines+1] = ln end
 	local convertedTargets = {}
 	for i, ln in ipairs(newLines) do
-		local gi, gind, gtgt = ln:match("^((%s*)goto%s+(pc%d+)%s*$)")
-		if gi then
+		local gind, gtgt = matchGoto(ln)
+		local inlineInd, inlineCond, inlineTarget = matchIfGoto(ln)
+		if gind or inlineInd then
+			local indent2 = gind or inlineInd
+			local target = gtgt or inlineTarget
+			local converted = false
 			local openIdx, closeIdx, _ = enclosingLoop(newLines, i)
 			if openIdx then
 				local j = closeIdx + 1
 				while j <= #newLines and not newLines[j]:match("%S") do j = j + 1 end
-				local tgtIdxs = labelIdx[gtgt] or {}
+				local tgtIdxs = labelIdx[target] or {}
 				local found = false
 				for _, li in ipairs(tgtIdxs) do if li == j then found = true break end end
 				if found then
-					newLines[i] = gind .. "break"
-					convertedTargets[gtgt] = true
+					newLines[i] = inlineInd and (indent2 .. "if " .. inlineCond .. " then break end") or (indent2 .. "break")
+					convertedTargets[target] = true
+					converted = true
+				end
+			end
+			if not converted then
+				local j = i + 1
+				while j <= #newLines and not newLines[j]:match("%S") do j = j + 1 end
+				local closeInd = j <= #newLines and matchEnd(newLines[j]) or nil
+				if closeInd and #closeInd < #indent2 then
+					local k = j + 1
+					while k <= #newLines and not newLines[k]:match("%S") do k = k + 1 end
+					local lbl = nil
+					if k <= #newLines then
+						local _li
+						_li, lbl = matchLbl(newLines[k])
+					end
+					if lbl == target then
+						newLines[i] = inlineInd and (indent2 .. "if " .. inlineCond .. " then break end") or (indent2 .. "break")
+						convertedTargets[target] = true
+					end
 				end
 			end
 		end
@@ -2788,8 +4067,10 @@ local function gotosToBreak(lines)
 	if next(convertedTargets) then
 		local stillUsed = {}
 		for _, ln in ipairs(newLines) do
-			local _, _, gtgt = ln:match("^((%s*)goto%s+(pc%d+)%s*$)")
+			local _, gtgt = matchGoto(ln)
 			if gtgt then stillUsed[gtgt] = true end
+			local _, _, inlineTarget = matchIfGoto(ln)
+			if inlineTarget then stillUsed[inlineTarget] = true end
 		end
 		local filtered = {}
 		for _, ln in ipairs(newLines) do
@@ -3042,15 +4323,75 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	end
 	indentUnit = indentUnit or "\t"
 
+	local function sameLines(a, b)
+		if #a ~= #b then return false end
+		for i = 1, #a do
+			if a[i] ~= b[i] then return false end
+		end
+		return true
+	end
+
 	-- Pass 1: basic single-line structural passes
+	lines = rewriteGotoToReturn(lines)
 	lines = collapseTrivialIf(lines)
-	lines = dropOrphanLabels(lines)
+	lines = rewriteGotoToReturn(lines)
 	lines = normalizeNegativeAddk(lines)
 	lines = removeUnreachableAfterReturn(lines)
+	lines = dropOrphanLabels(lines)
+
+	for _ = 1, 400 do
+		local changed = false
+		lines = collapseTrivialIf(lines)
+		local newLines, changedGuard = liftGuardChainElse(lines, indentUnit)
+		if changedGuard then
+			lines = newLines
+			changed = true
+		else
+			local changedFallback = false
+			newLines, changedFallback = liftConditionalFallback(lines, indentUnit)
+			if changedFallback then
+				lines = newLines
+				changed = true
+			else
+				local changedInline = false
+				newLines, changedInline = inlineLocalIntoIfGoto(lines, indentUnit)
+				if changedInline then
+					lines = newLines
+					changed = true
+				else
+					local changedMixed = false
+					newLines, changedMixed = liftMixedGuardOrPair(lines, indentUnit)
+					if changedMixed then
+						lines = newLines
+						changed = true
+					else
+						local changedCase = false
+						newLines, changedCase = liftIfGotoCaseChains(lines, indentUnit)
+						if changedCase then
+							lines = newLines
+							changed = true
+						else
+							local changedMlif = false
+							newLines, changedMlif = liftMultilineIfGotoElse(lines, indentUnit)
+							if changedMlif then
+								lines = newLines
+								changed = true
+							end
+						end
+					end
+				end
+			end
+		end
+		if not changed then break end
+	end
 
 	-- Pass 2: for loop reconstruction
-	lines = liftNumericFor(lines, indentUnit)
-	lines = liftGenericFor(lines, indentUnit)
+	for _ = 1, 8 do
+		local prev = lines
+		lines = liftNumericFor(lines, indentUnit)
+		lines = liftGenericFor(lines, indentUnit)
+		if sameLines(lines, prev) then break end
+	end
 
 	-- Pass 3: while-true reconstruction
 	lines = liftWhileTrueFromJumpback(lines, loopHeaderPcs)
@@ -3060,18 +4401,31 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = gotosToBreak(lines)
 
 	-- Pass 5: if/else reconstruction (multi-pass)
-	for _ = 1, 16 do
+	for _ = 1, 128 do
 		local prev = lines
+		lines = collapseTrivialIf(lines)
+		lines = rewriteGotoToReturn(lines)
+		local changedInline = false
+		lines, changedInline = inlineLocalIntoIfGoto(lines, indentUnit)
 		local changed1 = false
-		lines, changed1 = liftMultilineIfGotoElse(lines, indentUnit)
+		lines, changed1 = liftGuardChainElse(lines, indentUnit)
 		local changed2 = false
-		lines, changed2 = liftGuardChainElse(lines, indentUnit)
+		lines, changed2 = liftMultilineIfGotoElse(lines, indentUnit)
 		lines = liftElseifPatterns(lines)
 		lines = collapseSingleIfChain(lines)
+		lines = recoverEmptyFieldGuards(lines)
 		lines = dropEmptyIfBlocks(lines)
 		local changed3 = false
 		lines, changed3 = liftIfGotoCaseChains(lines, indentUnit)
-		local same = (not changed1) and (not changed2) and (not changed3)
+		local changed5 = false
+		lines, changed5 = liftSimpleGuardChains(lines, indentUnit)
+		local changed6 = false
+		lines, changed6 = dropGotoToImmediatePostIfLabel(lines)
+		local changed4 = false
+		lines, changed4 = liftIfGotoBody(lines, indentUnit)
+		local changed0 = false
+		lines, changed0 = liftGuardToSkipLabel(lines, indentUnit)
+		local same = (not changedInline) and (not changed0) and (not changed1) and (not changed2) and (not changed3) and (not changed4) and (not changed5) and (not changed6)
 		if same then
 			local eq = #lines == #prev
 			if eq then for k = 1, #lines do if lines[k] ~= prev[k] then eq = false; break end end end
@@ -3090,13 +4444,24 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	-- Pass 7: return/local inlining
 	lines = inlineTrivialReturnLocals(lines)
 	lines = inlineTrivialConditionLocals(lines)
+	lines = inlineTrivialCompareGuardLocals(lines)
+	lines = fixOrDefaultAssignments(lines)
 	lines = rewriteGotoToReturn(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 
 	-- Pass 8: structural cleanup
+	for _ = 1, 8 do
+		local prev = lines
+		lines = liftNumericFor(lines, indentUnit)
+		lines = liftGenericFor(lines, indentUnit)
+		if sameLines(lines, prev) then break end
+	end
+	lines = gotosToContinue(lines)
+	lines = gotosToBreak(lines)
 	lines = dropEmptyGotoForLoops(lines)
 	lines = liftElseifPatterns(lines)
 	lines = collapseSingleIfChain(lines)
+	lines = recoverEmptyFieldGuards(lines)
 	lines = dropEmptyIfBlocks(lines)
 
 	-- Pass 9: register temp cleanup
@@ -3106,11 +4471,48 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	-- Pass 10: trailing cleanup
 	lines = removeUnreachableAfterReturn(lines)
 	lines = dropTrailingReturn(lines)
+	lines = gotosToContinue(lines)
+	lines = gotosToBreak(lines)
 	lines = dropOrphanLabels(lines)
 	lines = foldTableArrayInitializers(lines)
+	lines = fixInvertedIsaGuard(lines)
+	lines = fixBareMethodReferences(lines)
+	lines = fixLiteralMethodReceivers(lines)
+	lines = fixLiteralFieldReceivers(lines)
+	lines = repairInvalidElseClauses(lines)
+	lines = foldConstantConditionBlocks(lines, indentUnit)
+	lines = removeUnreachableAfterReturn(lines)
 
 	-- Pass 11: indentation normalization
 	lines = normalizeLuaIndentation(lines, indentUnit)
+	lines = fixInvertedIsaGuard(lines)
+	lines = inlineTrivialConditionLocals(lines)
+	lines = inlineTrivialCompareGuardLocals(lines)
+	lines = renameTempByCommonAssignedField(lines)
+	lines = renameTempFindFirstChildDynamic(lines)
+	lines = renameLocalTableByAssignment(lines)
+	lines = fixOrDefaultAssignments(lines)
+	lines = gotosToContinue(lines)
+	lines = gotosToBreak(lines)
+	lines = dropOrphanLabels(lines)
+	lines = fixBareMethodReferences(lines)
+	lines = fixLiteralMethodReceivers(lines)
+	lines = fixLiteralFieldReceivers(lines)
+	lines = repairInvalidElseClauses(lines)
+	lines = foldConstantConditionBlocks(lines, indentUnit)
+	lines = removeUnreachableAfterReturn(lines)
+	lines = balanceLuaBlocksByIndent(lines)
+	lines = dropUnmatchedEndLines(lines)
+	lines = normalizeLuaIndentation(lines, indentUnit)
+	for _ = 1, 16 do
+		local changed
+		lines, changed = wrapOrphanIfGotosAsGuards(lines, indentUnit)
+		if not changed then break end
+	end
+	lines = dropInvalidTopLevelReturns(lines)
+	lines = fixInvalidGenericForHeaders(lines)
+	lines = normalizeLuaIndentation(lines, indentUnit)
+	lines = dropInvalidTopLevelReturns(lines)
 
 	return table.concat(lines, "\n")
 end
@@ -3261,7 +4663,13 @@ local function renderSource(bc)
 		push(out, decompileProto(protoAt(bc, bc.main_id), bc, bc.main_id))
 		push(out, "")
 	end
-	return table.concat(out, "\n")
+	local source = table.concat(out, "\n")
+	local lines = {}
+	for line in (source .. "\n"):gmatch("(.-)\n") do
+		lines[#lines+1] = line
+	end
+	lines = dropInvalidTopLevelReturns(lines)
+	return table.concat(lines, "\n")
 end
 
 local function normalizeOptions(options)
