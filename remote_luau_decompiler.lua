@@ -211,7 +211,10 @@ local function cleanIdent(s)
 	if type(s) ~= "string" or s == "" then
 		return nil
 	end
-	local cleaned = s:gsub("[^A-Za-z0-9_]", "_")
+	if isValidIdent(s) then
+		return s
+	end
+	local cleaned = s:gsub("[^A-Za-z0-9_]+", "_"):gsub("_+", "_")
 	if cleaned == "" then
 		return nil
 	end
@@ -222,6 +225,153 @@ local function cleanIdent(s)
 		cleaned = "_" .. cleaned
 	end
 	return cleaned
+end
+
+local function cleanGeneratedIdent(s)
+	if type(s) ~= "string" or s == "" then
+		return nil
+	end
+	local cleaned = s:gsub("[^A-Za-z0-9_]+", "_"):gsub("_+", "_")
+	if cleaned == "" then
+		return nil
+	end
+	if cleaned:match("^%d") then
+		cleaned = "_" .. cleaned
+	end
+	if #cleaned > 48 then
+		cleaned = cleaned:sub(1, 48):gsub("_$", "")
+	end
+	if LUA_KEYWORDS[cleaned] then
+		cleaned = cleaned .. "_value"
+	end
+	if not isValidIdent(cleaned) then
+		return nil
+	end
+	return cleaned
+end
+
+local function deriveNameHint(expr, functionName)
+	if type(expr) ~= "string" or expr == "" then
+		return nil
+	end
+	local e = expr:match("^%s*(.-)%s*$")
+	if e == "{}" then
+		return "state"
+	end
+	if e:match("^%{.*%}$") and e:find("%f[%a_][A-Z][A-Z0-9_]*%f[^%a_%d]%s*=") then
+		return "config"
+	end
+	if e:match("^setmetatable%s*%(") then
+		return functionName == "new" and "self" or "object"
+	end
+	if e:match("^x?pcall%s*%(") then
+		return "pcall_result"
+	end
+	if e:match("^select%s*%(") then
+		return "select_result"
+	end
+	local classHint = nil
+	for cls in e:gmatch(":FindFirstChildOfClass%s*%(%s*[\"']([^\"']+)[\"']") do
+		classHint = cls
+	end
+	if classHint then
+		local cleaned = cleanGeneratedIdent(classHint)
+		if cleaned then return "class_" .. cleaned end
+	end
+	local childHint = nil
+	for _, methodName in ipairs({"WaitForChild", "FindFirstChild", "GetChild"}) do
+		for h in e:gmatch(":" .. methodName .. "%s*%(%s*[\"']([^\"']+)[\"']") do
+			childHint = h
+		end
+	end
+	if childHint then return cleanGeneratedIdent(childHint) end
+	local serviceHint = nil
+	for h in e:gmatch(":GetService%s*%(%s*[\"']([^\"']+)[\"']") do
+		serviceHint = h
+	end
+	if serviceHint then return cleanGeneratedIdent(serviceHint) end
+	local attrHint = nil
+	for h in e:gmatch(":GetAttribute%s*%(%s*[\"']([^\"']+)[\"']") do
+		attrHint = h
+	end
+	if attrHint then return cleanGeneratedIdent(attrHint) end
+	local instanceHint = nil
+	for h in e:gmatch("Instance%.new%s*%(%s*[\"']([^\"']+)[\"']") do
+		instanceHint = h
+	end
+	if instanceHint then return cleanGeneratedIdent(instanceHint) end
+	local requirePath = nil
+	for h in e:gmatch("require%s*%(([^%)]+)%)") do
+		requirePath = h
+	end
+	if requirePath then
+		local last = requirePath:match("([%a_][%w_]*)%s*$")
+		if last and isValidIdent(last) then return last end
+	end
+	if isValidIdent(e) then
+		return e
+	end
+	if not e:find("%(") and not e:find("%[") and (e:find("%.") or e:find(":")) then
+		local last = e:match("([%a_][%w_]*)%s*$")
+		if last and isValidIdent(last) then return last end
+	end
+	local method = nil
+	for h in e:gmatch("[:%.]([%a_][%w_]*)%s*%(") do
+		method = h
+	end
+	if method and not ({
+		GetService = true,
+		WaitForChild = true,
+		FindFirstChild = true,
+		FindFirstChildOfClass = true,
+		GetChild = true,
+		GetAttribute = true,
+		IsA = true,
+		Wait = true,
+		wait = true,
+		lower = true,
+		upper = true,
+		sub = true,
+		find = true,
+		gsub = true,
+		split = true,
+		len = true,
+		type = true,
+	})[method] then
+		return cleanGeneratedIdent(method .. "_result")
+	end
+	local idxBase = e:match("^([%a_][%w_]*)%s*%[")
+	if idxBase and isValidIdent(idxBase) then
+		return idxBase .. "_entry"
+	end
+	return nil
+end
+
+local function makeGeneratedNameAllocator(p, params, functionName)
+	local used = {}
+	local function mark(name)
+		if type(name) == "string" and isValidIdent(name) then
+			used[name] = true
+		end
+	end
+	mark(functionName)
+	for _, name in ipairs(params or {}) do mark(name) end
+	for _, name in ipairs(p.upvalues or {}) do mark(name) end
+	for _, lv in ipairs(p.locvars or {}) do mark(lv.name) end
+	return function(hint, fallback)
+		local base = cleanGeneratedIdent(hint) or cleanGeneratedIdent(fallback) or "result"
+		if not used[base] then
+			used[base] = true
+			return base
+		end
+		local suffix = 2
+		while used[base .. "_" .. tostring(suffix)] do
+			suffix = suffix + 1
+		end
+		local name = base .. "_" .. tostring(suffix)
+		used[name] = true
+		return name
+	end
 end
 
 local function luaIndexSuffix(key)
@@ -957,7 +1107,298 @@ local function scanJumpTargets(p)
 	return targets
 end
 
-local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, indent)
+local function isFallbackUpvalueName(name)
+	return type(name) ~= "string"
+		or name == ""
+		or name:match("^U%d+$") ~= nil
+		or name:match("^_%d+$") ~= nil
+		or name:match("^_r%d") ~= nil
+end
+
+local function deriveUpvalueSemanticName(bc, childId, upvalueIdx, seen)
+	seen = seen or {}
+	local key = tostring(childId) .. ":" .. tostring(upvalueIdx)
+	if seen[key] then return nil end
+	seen[key] = true
+	local child = protoAt(bc, childId)
+	if not child or upvalueIdx < 0 or upvalueIdx >= (child.nups or 0) then return nil end
+	local holders = {}
+	local writeKinds = {}
+	local hasDisconnect = false
+	local hasTableOp = false
+	local hasLength = false
+	local hasBooleanTest = false
+	local usedAsIndex = false
+	local pc = 0
+	while pc < #child.code do
+		local insn = codeWordAt(child, pc)
+		local op = bit32_band(insn, 0xFF)
+		local opName = OPCODES[op] or ""
+		local a = bit32_band(bit32_rshift(insn, 8), 0xFF)
+		local b = bit32_band(bit32_rshift(insn, 16), 0xFF)
+		local c = bit32_band(bit32_rshift(insn, 24), 0xFF)
+		local d = decodeSignedD(insn)
+		local aux = nil
+		if OPS_WITH_AUX[opName] and pc + 1 < #child.code then
+			aux = codeWordAt(child, pc + 1)
+		end
+		if opName == "GETUPVAL" and b == upvalueIdx then
+			holders[a] = true
+		elseif opName == "SETUPVAL" and b == upvalueIdx then
+			for back = pc - 1, math.max(0, pc - 5), -1 do
+				local bi = codeWordAt(child, back)
+				local bop = OPCODES[bit32_band(bi, 0xFF)] or ""
+				local ba = bit32_band(bit32_rshift(bi, 8), 0xFF)
+				if ba == a then
+					writeKinds[bop] = true
+					break
+				end
+			end
+		elseif opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+			local grandchildId = nil
+			if opName == "NEWCLOSURE" then
+				grandchildId = childProtoIdAt(child, d)
+			else
+				local closureConst = constantAt(child, d)
+				grandchildId = closureConst and closureConst.kind == "closure" and closureConst.value or nil
+			end
+			if grandchildId ~= nil then
+				local capIdx = 0
+				local capPc = pc + getOpLength(opName)
+				while capPc < #child.code do
+					local capInsn = codeWordAt(child, capPc)
+					local capName = OPCODES[bit32_band(capInsn, 0xFF)] or ""
+					if capName ~= "CAPTURE" then break end
+					local capKindId = bit32_band(bit32_rshift(capInsn, 8), 0xFF)
+					local capB = bit32_band(bit32_rshift(capInsn, 16), 0xFF)
+					if CAPTURE_KINDS[capKindId] == "UPVAL" and capB == upvalueIdx then
+						local semantic = deriveUpvalueSemanticName(bc, grandchildId, capIdx, seen)
+						if semantic then return semantic end
+					end
+					capIdx = capIdx + 1
+					capPc = capPc + 1
+				end
+			end
+		end
+		if opName == "NAMECALL" and holders[b] then
+			local keyConst = aux ~= nil and constantAt(child, aux) or nil
+			if keyConst and keyConst.kind == "string" and keyConst.value == "Disconnect" then
+				hasDisconnect = true
+			end
+		elseif opName == "LENGTH" and holders[b] then
+			hasLength = true
+		elseif (opName == "GETTABLE" or opName == "GETTABLEN" or opName == "SETTABLE" or opName == "SETTABLEN") and holders[b] then
+			hasTableOp = true
+		end
+		if (opName == "JUMPIF" or opName == "JUMPIFNOT") and holders[a] then
+			hasBooleanTest = true
+		end
+		if (opName == "GETTABLE" or opName == "SETTABLE") and holders[c] then
+			usedAsIndex = true
+		end
+		if opName == "MOVE" and holders[b] then
+			holders[a] = true
+		end
+		if opName ~= "GETUPVAL" and opName ~= "MOVE" and holders[a] and (
+			opName == "LOADK" or opName == "LOADKX" or opName == "LOADKC" or opName == "LOADN" or opName == "LOADB"
+			or opName == "LOADNIL" or opName == "MOVE" or opName == "GETIMPORT" or opName == "GETGLOBAL"
+			or opName == "GETTABLEKS" or opName == "GETTABLE" or opName == "GETTABLEN" or opName == "NEWTABLE"
+			or opName == "DUPTABLE" or opName == "NEWCLOSURE" or opName == "DUPCLOSURE" or opName == "NAMECALL"
+			or opName == "CALL" or opName == "ADD" or opName == "SUB" or opName == "MUL" or opName == "DIV"
+			or opName == "MOD" or opName == "POW" or opName == "IDIV" or opName == "ADDK" or opName == "SUBK"
+			or opName == "MULK" or opName == "DIVK" or opName == "MODK" or opName == "POWK" or opName == "IDIVK"
+			or opName == "SUBRK" or opName == "DIVRK" or opName == "ORK" or opName == "ANDK" or opName == "OR"
+			or opName == "AND" or opName == "MINUS" or opName == "NOT" or opName == "LENGTH" or opName == "CONCAT"
+		) then
+			holders[a] = nil
+		end
+		pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+	end
+	if hasDisconnect then return "connection" end
+	if hasLength or writeKinds.NEWTABLE or writeKinds.DUPTABLE or hasTableOp then return "state" end
+	if writeKinds.LOADB or hasBooleanTest then return "flag" end
+	if writeKinds.LOADN or usedAsIndex then return "index" end
+	return nil
+end
+
+local function propagateUpvalueNames(protoIdx, bc, visited)
+	visited = visited or {}
+	if visited[protoIdx] then return end
+	visited[protoIdx] = true
+	local p = protoAt(bc, protoIdx)
+	if not p then return end
+	local function r(reg, regs)
+		return regs[reg] or ("R" .. tostring(reg))
+	end
+	local function setChildUpvalueName(childId, capIdx, expr, semanticHint)
+		local child = protoAt(bc, childId)
+		if not child then return end
+		if capIdx < 0 or capIdx >= (child.nups or 0) then return end
+		for i = 1, child.nups do
+			if child.upvalues[i] == nil or child.upvalues[i] == "" then
+				child.upvalues[i] = "U" .. tostring(i - 1)
+			end
+		end
+		if not isFallbackUpvalueName(child.upvalues[capIdx + 1]) then return end
+		local rawExpr = type(expr) == "string" and expr:match("^%s*(.-)%s*$") or ""
+		local childName = child.debugname ~= "" and cleanGeneratedIdent(child.debugname) or nil
+		local hint
+		if rawExpr == "nil" or rawExpr == "true" or rawExpr == "false" then
+			hint = semanticHint
+		elseif rawExpr == "{}" then
+			if childName == "new" then
+				hint = "module"
+			elseif semanticHint then
+				hint = semanticHint
+			else
+				return
+			end
+		elseif semanticHint and isFallbackUpvalueName(rawExpr) then
+			hint = semanticHint
+		else
+			hint = deriveNameHint(rawExpr) or cleanGeneratedIdent(rawExpr)
+		end
+		if not hint or not isValidIdent(hint) then return end
+		if hint:match("^R%d+$") or hint:match("^U%d+$") or hint:match("^_r%d") then return end
+		local used = {}
+		local childParams = {}
+		for i = 0, child.numparams - 1 do
+			local paramName = localAt(child, i, 0) or ("arg" .. tostring(i))
+			childParams[paramName] = true
+			used[paramName] = true
+		end
+		for i = 1, #child.upvalues do
+			if i ~= capIdx + 1 and child.upvalues[i] then
+				used[child.upvalues[i]] = true
+			end
+		end
+		if childParams[hint] then
+			if hint == "arg0" and not used.self then
+				hint = "self"
+			else
+				hint = hint .. "_upvalue"
+			end
+		end
+		local name = hint
+		if used[name] then
+			local suffix = 2
+			while used[name .. "_" .. tostring(suffix)] do suffix = suffix + 1 end
+			name = name .. "_" .. tostring(suffix)
+		end
+		child.upvalues[capIdx + 1] = name
+	end
+	local regs = {}
+	for i = 0, p.numparams - 1 do
+		regs[i] = localAt(p, i, 0) or ("arg" .. tostring(i))
+	end
+	local pc = 0
+	while pc < #p.code do
+		local insn = codeWordAt(p, pc)
+		local op = bit32_band(insn, 0xFF)
+		local opName = OPCODES[op] or ""
+		local a = bit32_band(bit32_rshift(insn, 8), 0xFF)
+		local b = bit32_band(bit32_rshift(insn, 16), 0xFF)
+		local c = bit32_band(bit32_rshift(insn, 24), 0xFF)
+		local d = decodeSignedD(insn)
+		local aux = nil
+		if OPS_WITH_AUX[opName] and pc + 1 < #p.code then
+			aux = codeWordAt(p, pc + 1)
+		end
+		if opName == "LOADNIL" then
+			regs[a] = "nil"
+		elseif opName == "LOADB" then
+			regs[a] = b ~= 0 and "true" or "false"
+		elseif opName == "LOADN" then
+			regs[a] = tostring(d)
+		elseif opName == "LOADK" or opName == "LOADKC" or opName == "LOADKX" then
+			local idx = opName == "LOADKC" and c or (opName == "LOADK" and d or aux)
+			regs[a] = kvalLua(p, idx)
+		elseif opName == "MOVE" then
+			regs[a] = r(b, regs)
+		elseif opName == "GETIMPORT" then
+			local parts = decodeImportId(aux or 0, p)
+			regs[a] = #parts > 0 and table.concat(parts, ".") or ("import(" .. tostring(d) .. ")")
+		elseif opName == "GETUPVAL" then
+			regs[a] = p.upvalues[b + 1] or ("U" .. tostring(b))
+		elseif opName == "GETTABLEKS" then
+			local idx = aux ~= nil and aux or d
+			local keyConst = constantAt(p, idx)
+			local key = keyConst and keyConst.kind == "string" and keyConst.value or ("K[" .. tostring(idx) .. "]")
+			regs[a] = r(b, regs) .. luaIndexSuffix(key)
+		elseif opName == "GETTABLE" then
+			regs[a] = r(b, regs) .. "[" .. r(c, regs) .. "]"
+		elseif opName == "GETTABLEN" then
+			regs[a] = r(b, regs) .. "[" .. tostring(c + 1) .. "]"
+		elseif opName == "NEWTABLE" then
+			regs[a] = "{}"
+		elseif opName == "DUPTABLE" then
+			regs[a] = kvalLua(p, d)
+		elseif opName == "NAMECALL" then
+			local keyConst = aux ~= nil and constantAt(p, aux) or nil
+			local key = keyConst and keyConst.kind == "string" and keyConst.value or ("K[" .. tostring(aux) .. "]")
+			regs[a] = r(b, regs) .. ":" .. tostring(key)
+			regs[a + 1] = r(b, regs)
+		elseif opName == "CALL" then
+			local callee = r(a, regs)
+			local isNamecall = string.find(callee:match("[^.]+$") or callee, ":", 1, true) ~= nil
+			local args
+			if b == 0 then
+				local prev = regs[a + 1]
+				args = prev and prev ~= ("R" .. tostring(a + 1)) and prev or "..."
+			else
+				local argParts = {}
+				for reg = a + 1, a + b - 1 do
+					push(argParts, r(reg, regs))
+				end
+				if isNamecall and #argParts > 0 then
+					table.remove(argParts, 1)
+				end
+				args = table.concat(argParts, ", ")
+			end
+			if c ~= 1 then
+				regs[a] = callee .. "(" .. args .. ")"
+			end
+		elseif opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+			local childId = nil
+			if opName == "NEWCLOSURE" then
+				childId = childProtoIdAt(p, d)
+			else
+				local closureConst = constantAt(p, d)
+				childId = closureConst and closureConst.kind == "closure" and closureConst.value or nil
+			end
+			regs[a] = childId and ("<closure proto[" .. tostring(childId) .. "]>") or ("<closure>")
+			if childId ~= nil then
+				local capPc = pc + getOpLength(opName)
+				local capIdx = 0
+				while capPc < #p.code do
+					local capInsn = codeWordAt(p, capPc)
+					local capOp = bit32_band(capInsn, 0xFF)
+					local capName = OPCODES[capOp] or ""
+					if capName ~= "CAPTURE" then break end
+					local capKindId = bit32_band(bit32_rshift(capInsn, 8), 0xFF)
+					local capB = bit32_band(bit32_rshift(capInsn, 16), 0xFF)
+					local capKind = CAPTURE_KINDS[capKindId] or ""
+					local expr = nil
+					if capKind == "VAL" or capKind == "REF" then
+						expr = r(capB, regs)
+					elseif capKind == "UPVAL" then
+						expr = p.upvalues[capB + 1] or ("U" .. tostring(capB))
+					end
+					if expr then
+						local semanticHint = deriveUpvalueSemanticName(bc, childId, capIdx, {})
+						setChildUpvalueName(childId, capIdx, expr, semanticHint)
+					end
+					capIdx = capIdx + 1
+					capPc = capPc + 1
+				end
+				propagateUpvalueNames(childId, bc, visited)
+			end
+		end
+		pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+	end
+end
+
+local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, indent, generatedNameFor, functionName)
 	local function rname(reg)
 		return regRepr(regs, p, reg, pc)
 	end
@@ -1146,8 +1587,16 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			return nil, 0
 		end
 		local names = {}
+		local hint = deriveNameHint(callExpr, functionName)
 		for k = 0, c - 2 do
-			local name = localAt(p, a + k, pc + 1) or ("_r" .. tostring(a + k))
+			local name = localAt(p, a + k, pc + 1)
+			if not name then
+				if generatedNameFor then
+					name = generatedNameFor(hint, "_r" .. tostring(a + k))
+				else
+					name = "_r" .. tostring(a + k)
+				end
+			end
 			push(names, name)
 			regs[a + k] = name
 		end
@@ -1477,10 +1926,8 @@ local function labelRefs(lines, target)
 	return result
 end
 
--- Negate a Lua condition string
 local function negateCond(cond)
 	cond = cond:match("^%s*(.-)%s*$")
-	-- strip balanced outer parens
 	while cond:sub(1,1) == "(" and cond:sub(-1) == ")" do
 		local depth = 0
 		local balanced = true
@@ -1505,10 +1952,10 @@ local function negateCond(cond)
 	}
 	for _, pair in ipairs(ops) do
 		local op, neg = pair[1], pair[2]
-		local idx = cond:find(luaPE(op), 1, true)
+		local idx = cond:find(op, 1, true)
 		if idx then
 			-- ensure only one occurrence
-			if not cond:find(luaPE(op), idx + 1, true) then
+			if not cond:find(op, idx + 1, true) then
 				return cond:sub(1, idx-1) .. neg .. cond:sub(idx + #op)
 			end
 		end
@@ -1594,6 +2041,89 @@ local function normalizeNegativeAddk(lines)
 			cur = cur:gsub("(%([^()]-) %+ %-(%d+%.?%d*)", "%1 - %2")
 		end
 		out[#out+1] = cur
+	end
+	return out
+end
+
+local function liftAngleNormalizationArtifacts(lines, indentUnit)
+	local function trim(s)
+		return s:match("^%s*(.-)%s*$")
+	end
+	local function stripOuterParens(expr)
+		expr = trim(expr)
+		while expr:sub(1, 1) == "(" and expr:sub(-1) == ")" do
+			local depth = 0
+			local ok = true
+			for i = 1, #expr do
+				local ch = expr:sub(i, i)
+				if ch == "(" then
+					depth = depth + 1
+				elseif ch == ")" then
+					depth = depth - 1
+					if depth == 0 and i < #expr then
+						ok = false
+						break
+					end
+				end
+			end
+			if not ok then break end
+			expr = trim(expr:sub(2, -2))
+		end
+		return expr
+	end
+	local function replacePlain(s, old, new)
+		return (s:gsub(luaPE(old), (new:gsub("%%", "%%%%"))))
+	end
+	local out = {}
+	local i = 1
+	local counter = 0
+	while i <= #lines do
+		if i + 5 <= #lines then
+			local ind1, expr1 = lines[i]:match("^(%s*)if%s+3%.1415926535897931?%s*<%s*(.-)%s+then%s*$")
+			local comment1 = lines[i + 1]:match("^%s*%-%-%s+ROBLOX_OP_72")
+			local end1 = ind1 and lines[i + 2]:match("^" .. luaPE(ind1) .. "end%s*$")
+			local ind2, expr2 = lines[i + 3]:match("^(%s*)if%s+%((.-)%s*%-%s*6%.2831853071795862?%)%s*<%s*%-3%.1415926535897931?%s+then%s*$")
+			local comment2 = lines[i + 4]:match("^%s*%-%-%s+ROBLOX_OP_72")
+			local end2 = ind1 and lines[i + 5]:match("^" .. luaPE(ind1) .. "end%s*$")
+			if ind1 and ind2 == ind1 and comment1 and end1 and comment2 and end2 and stripOuterParens(expr1) == stripOuterParens(expr2) then
+				counter = counter + 1
+				local var = counter == 1 and "_angle_delta" or ("_angle_delta_" .. tostring(counter))
+				local expr = stripOuterParens(expr1)
+				out[#out+1] = ind1 .. "local " .. var .. " = " .. expr
+				out[#out+1] = ind1 .. "while 3.1415926535897931 < " .. var .. " do"
+				out[#out+1] = ind1 .. indentUnit .. var .. " = (" .. var .. " - 6.2831853071795862)"
+				out[#out+1] = ind1 .. "end"
+				out[#out+1] = ind1 .. "while " .. var .. " < -3.1415926535897931 do"
+				out[#out+1] = ind1 .. indentUnit .. var .. " = (" .. var .. " + 6.2831853071795862)"
+				out[#out+1] = ind1 .. "end"
+				local artifacts = {
+					"(((" .. expr .. ") - 6.2831853071795862) + 6.2831853071795862)",
+					"((" .. expr .. " - 6.2831853071795862) + 6.2831853071795862)",
+					"(((" .. expr1 .. ") - 6.2831853071795862) + 6.2831853071795862)",
+				}
+				i = i + 6
+				local lookahead = 0
+				while i <= #lines and lookahead < 20 do
+					local ln = lines[i]
+					local curInd = ln:match("^(%s*)") or ""
+					if ln:match("%S") and #curInd < #ind1 then break end
+					if ln:find("math.abs", 1, true) or ln:find("math.sign", 1, true) or ln:find("CurrentYaw", 1, true) or ln:find("CurrentRotation", 1, true) then
+						for _, artifact in ipairs(artifacts) do
+							ln = replacePlain(ln, artifact, var)
+						end
+					end
+					out[#out+1] = ln
+					i = i + 1
+					lookahead = lookahead + 1
+				end
+			else
+				out[#out+1] = lines[i]
+				i = i + 1
+			end
+		else
+			out[#out+1] = lines[i]
+			i = i + 1
+		end
 	end
 	return out
 end
@@ -2628,6 +3158,29 @@ local function inlineTrivialConditionLocals(lines)
 	return out
 end
 
+local function fixFindBasePartFallbackReturns(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+	for i = 1, math.max(0, #out - 4) do
+		local findInd, partName, findExpr = out[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+:FindFirstChild%(.+%))%s*$")
+		if findInd and partName and findExpr then
+			local nilName = out[i + 1]:match("^%s*if%s+not%s+([%a_][%w_]*)%s+then%s+return%s+nil%s+end%s*$")
+			local isaInd, checkName, isaName = out[i + 2]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*):IsA%(\"BasePart\"%)%s*$")
+			local nilCheckName = out[i + 3]:match("^%s*if%s+not%s+([%a_][%w_]*)%s+then%s+return%s+nil%s+end%s*$")
+			local retInd, retName = out[i + 4]:match("^(%s*)return%s+([%a_][%w_]*)%s*$")
+			if nilName == partName
+				and isaInd and checkName and isaName == partName
+				and nilCheckName == checkName
+				and retInd and retName == checkName
+			then
+				out[i + 2] = isaInd .. "local " .. checkName .. " = " .. partName .. ":IsA(\"BasePart\")"
+				out[i + 4] = retInd .. "return " .. partName
+			end
+		end
+	end
+	return out
+end
+
 local function inlineTrivialCompareGuardLocals(lines)
 	local out = {}
 	local i = 1
@@ -2775,6 +3328,93 @@ local function fixOrDefaultAssignments(lines)
 				out[#out+1] = work[i]
 				i = i + 1
 			end
+		end
+	end
+	return out
+end
+
+local function fixRefreshPreviousUserIdPattern(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do out[#out+1] = ln end
+	local current = "currentUserId"
+	local i = 1
+	while i <= #out - 3 do
+		local assignInd, stateName = out[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*%([^()]+%s+or%s+%{%}%)%s*$")
+		local ifInd, ifState, indexName
+		if out[i + 1] then
+			ifInd, ifState, indexName = out[i + 1]:match("^(%s*)if%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
+		end
+		local valueName, forState
+		if out[i + 2] then
+			local _forInd, _keyName
+			_forInd, _keyName, valueName, forState = out[i + 2]:match("^(%s*)for%s+([%a_][%w_]*),%s*([%a_][%w_]*)%s+in%s+ipairs%(([%a_][%w_]*)%)%s+do%s*$")
+		end
+		local cmpInd, cmpValue, cmpState, cmpIndex
+		if out[i + 3] then
+			cmpInd, cmpValue, cmpState, cmpIndex = out[i + 3]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+~=%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
+		end
+		if assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == cmpValue and stateName == cmpState and indexName == cmpIndex then
+			local replacement = {
+				assignInd .. "local " .. current .. " = nil",
+				assignInd .. "if " .. stateName .. "[" .. indexName .. "] then",
+				assignInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
+				assignInd .. "end",
+				out[i],
+				assignInd .. "if " .. current .. " then",
+				out[i + 2],
+				cmpInd .. "if " .. valueName .. ".UserId == " .. current .. " then",
+			}
+			for _ = 1, 4 do table.remove(out, i) end
+			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
+			i = i + #replacement
+		else
+			i = i + 1
+		end
+	end
+	i = 1
+	while i <= #out - 6 do
+		local ifInd, sourceExpr = out[i]:match("^(%s*)if%s+not%s+%(([%a_][%w_]*)%)%s+then%s*$")
+		if not ifInd then
+			ifInd, sourceExpr = out[i]:match("^(%s*)if%s+not%s+([%a_][%w_]*)%s+then%s*$")
+		end
+		local tmpName = out[i + 1] and out[i + 1]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*%{%}%s*$")
+		local endLine = out[i + 2] and out[i + 2]:match("^%s*end%s*$")
+		local assignInd, stateName, assignTmp
+		if out[i + 3] then
+			assignInd, stateName, assignTmp = out[i + 3]:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+		end
+		local oldIfInd, oldState, indexName
+		if out[i + 4] then
+			oldIfInd, oldState, indexName = out[i + 4]:match("^(%s*)if%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
+		end
+		local valueName, forState
+		if out[i + 5] then
+			local _forInd, _keyName
+			_forInd, _keyName, valueName, forState = out[i + 5]:match("^(%s*)for%s+([%a_][%w_]*),%s*([%a_][%w_]*)%s+in%s+ipairs%(([%a_][%w_]*)%)%s+do%s*$")
+		end
+		local skipInd, skipValue, skipState, skipIndex
+		if out[i + 6] then
+			skipInd, skipValue, skipState, skipIndex = out[i + 6]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+==%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s+continue%s+end%s*$")
+		end
+		if ifInd and sourceExpr and tmpName and endLine and assignInd == ifInd and assignTmp == tmpName
+			and oldIfInd == ifInd and oldState == stateName
+			and forState == stateName and skipValue == valueName and skipState == stateName and skipIndex == indexName
+		then
+			local replacement = {
+				ifInd .. "local " .. current .. " = nil",
+				ifInd .. "if " .. stateName .. "[" .. indexName .. "] then",
+				ifInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
+				ifInd .. "end",
+				ifInd .. stateName .. " = (" .. sourceExpr .. " or {})",
+				ifInd .. "if " .. current .. " then",
+				out[i + 5],
+				skipInd .. "if " .. valueName .. ".UserId ~= " .. current .. " then continue end",
+			}
+			for _ = 1, 7 do table.remove(out, i) end
+			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
+			i = i + #replacement
+		else
+			i = i + 1
 		end
 	end
 	return out
@@ -4336,6 +4976,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = collapseTrivialIf(lines)
 	lines = rewriteGotoToReturn(lines)
 	lines = normalizeNegativeAddk(lines)
+	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = removeUnreachableAfterReturn(lines)
 	lines = dropOrphanLabels(lines)
 
@@ -4446,6 +5087,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = inlineTrivialConditionLocals(lines)
 	lines = inlineTrivialCompareGuardLocals(lines)
 	lines = fixOrDefaultAssignments(lines)
+	lines = fixRefreshPreviousUserIdPattern(lines)
 	lines = rewriteGotoToReturn(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
 
@@ -4475,12 +5117,14 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = gotosToBreak(lines)
 	lines = dropOrphanLabels(lines)
 	lines = foldTableArrayInitializers(lines)
+	lines = fixFindBasePartFallbackReturns(lines)
 	lines = fixInvertedIsaGuard(lines)
 	lines = fixBareMethodReferences(lines)
 	lines = fixLiteralMethodReceivers(lines)
 	lines = fixLiteralFieldReceivers(lines)
 	lines = repairInvalidElseClauses(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
+	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = removeUnreachableAfterReturn(lines)
 
 	-- Pass 11: indentation normalization
@@ -4492,6 +5136,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = renameTempFindFirstChildDynamic(lines)
 	lines = renameLocalTableByAssignment(lines)
 	lines = fixOrDefaultAssignments(lines)
+	lines = fixRefreshPreviousUserIdPattern(lines)
 	lines = gotosToContinue(lines)
 	lines = gotosToBreak(lines)
 	lines = dropOrphanLabels(lines)
@@ -4500,6 +5145,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = fixLiteralFieldReceivers(lines)
 	lines = repairInvalidElseClauses(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
+	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = removeUnreachableAfterReturn(lines)
 	lines = balanceLuaBlocksByIndent(lines)
 	lines = dropUnmatchedEndLines(lines)
@@ -4545,6 +5191,7 @@ local function decompileProto(p, bc, protoIdx)
 			regs[i - 1] = paramName
 		end
 	end
+	local generatedNameFor = makeGeneratedNameAllocator(p, params, name)
 
 	local targets = scanJumpTargets(p)
 	local pendingClosureTarget = nil
@@ -4565,10 +5212,15 @@ local function decompileProto(p, bc, protoIdx)
 		regs[pendingClosureTarget] = closureName
 		if #pendingClosureCaps > 0 then
 			local capDescs = {}
+			local hasLocalCapture = false
 			for _, cap in ipairs(pendingClosureCaps) do
 				push(capDescs, cap.expr)
+				if cap.kind == "VAL" or cap.kind == "REF" then
+					hasLocalCapture = true
+				end
 			end
-			push(out, bodyIndent .. "-- " .. closureName .. " captures: " .. table.concat(capDescs, ", "))
+			local tag = hasLocalCapture and " [parent-local capture]" or ""
+			push(out, bodyIndent .. "-- " .. closureName .. " captures: " .. table.concat(capDescs, ", ") .. tag)
 		end
 		pendingClosureTarget = nil
 		pendingClosureProtoId = nil
@@ -4614,7 +5266,7 @@ local function decompileProto(p, bc, protoIdx)
 		end
 
 		if not handledCapture then
-			local line, advanceExtra = emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, bodyIndent)
+			local line, advanceExtra = emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, bodyIndent, generatedNameFor, name)
 			if opName == "NEWCLOSURE" then
 				pendingClosureTarget = a
 				pendingClosureProtoId = childProtoIdAt(p, d)
@@ -4651,16 +5303,129 @@ local function renderDisassembly(bc)
 	return table.concat(out, "\n")
 end
 
+local function identifyHoistTargets(bc)
+	local result = {}
+	for parentId = 0, #bc.protos - 1 do
+		if parentId ~= bc.main_id then
+			local p = protoAt(bc, parentId)
+			local pc = 0
+			local pendingChild = nil
+			local hasLocalCap = false
+			local already = {}
+			while p and pc < #p.code do
+				local insn = codeWordAt(p, pc)
+				local op = bit32_band(insn, 0xFF)
+				local opName = OPCODES[op] or ""
+				if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+					if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
+						if not result[parentId] then result[parentId] = {} end
+						push(result[parentId], pendingChild)
+						already[pendingChild] = true
+					end
+					local d = decodeSignedD(insn)
+					if opName == "NEWCLOSURE" then
+						pendingChild = childProtoIdAt(p, d)
+					else
+						local closureConst = constantAt(p, d)
+						pendingChild = closureConst and closureConst.kind == "closure" and closureConst.value or nil
+					end
+					hasLocalCap = false
+				elseif opName == "CAPTURE" and pendingChild ~= nil then
+					local kindId = bit32_band(bit32_rshift(insn, 8), 0xFF)
+					local kind = CAPTURE_KINDS[kindId] or ""
+					if kind == "VAL" or kind == "REF" then
+						hasLocalCap = true
+					end
+				elseif opName ~= "CAPTURE" then
+					if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
+						if not result[parentId] then result[parentId] = {} end
+						push(result[parentId], pendingChild)
+						already[pendingChild] = true
+					end
+					pendingChild = nil
+					hasLocalCap = false
+				end
+				pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+			end
+			if pendingChild ~= nil and hasLocalCap and not already[pendingChild] then
+				if not result[parentId] then result[parentId] = {} end
+				push(result[parentId], pendingChild)
+			end
+		end
+	end
+	return result
+end
+
+local function spliceHoistedChild(parentBody, childName, childBody)
+	local parentLines = {}
+	for ln in (parentBody .. "\n"):gmatch("([^\n]*)\n") do parentLines[#parentLines+1] = ln end
+	local childLines = {}
+	for ln in (childBody .. "\n"):gmatch("([^\n]*)\n") do childLines[#childLines+1] = ln end
+	local out = {}
+	local spliced = false
+	local namePat = luaPE(childName)
+	for _, ln in ipairs(parentLines) do
+		if not spliced then
+			local indent = ln:match("^(%s*)%-%-%s+" .. namePat .. "%s+captures:.*%[parent%-local capture%]%s*$")
+			if indent then
+				for _, cl in ipairs(childLines) do
+					out[#out+1] = cl ~= "" and (indent .. cl) or cl
+				end
+				spliced = true
+			else
+				out[#out+1] = ln
+			end
+		else
+			out[#out+1] = ln
+		end
+	end
+	return table.concat(out, "\n"), spliced
+end
+
+local function stripParentLocalCaptureTags(body)
+	return (body:gsub("%s*%[parent%-local capture%]", ""))
+end
+
 local function renderSource(bc)
 	local out = { "-- ============== SOURCE ==============" }
+	if bc.main_id >= 0 and bc.main_id < #bc.protos then
+		propagateUpvalueNames(bc.main_id, bc, {})
+	end
+	local hoistMap = identifyHoistTargets(bc)
+	local rendered = {}
 	for protoIdx = 0, #bc.protos - 1 do
-		if protoIdx ~= bc.main_id then
-			push(out, decompileProto(protoAt(bc, protoIdx), bc, protoIdx))
+		rendered[protoIdx] = decompileProto(protoAt(bc, protoIdx), bc, protoIdx)
+	end
+	local hoistedChildren = {}
+	for _ = 1, 40 do
+		local changed = false
+		for parentId, childIds in pairs(hoistMap) do
+			for _, childId in ipairs(childIds) do
+				if rendered[parentId] and rendered[childId] then
+					local childProto = protoAt(bc, childId)
+					local childName = childProto and cleanIdent(childProto.debugname) or nil
+					if not childName or childName == "" then
+						childName = "anon" .. tostring(childId)
+					end
+					local newBody, spliced = spliceHoistedChild(rendered[parentId], childName, rendered[childId])
+					if spliced and newBody ~= rendered[parentId] then
+						rendered[parentId] = newBody
+						hoistedChildren[childId] = true
+						changed = true
+					end
+				end
+			end
+		end
+		if not changed then break end
+	end
+	for protoIdx = 0, #bc.protos - 1 do
+		if protoIdx ~= bc.main_id and not hoistedChildren[protoIdx] then
+			push(out, stripParentLocalCaptureTags(rendered[protoIdx]))
 			push(out, "")
 		end
 	end
 	if bc.main_id >= 0 and bc.main_id < #bc.protos then
-		push(out, decompileProto(protoAt(bc, bc.main_id), bc, bc.main_id))
+		push(out, stripParentLocalCaptureTags(rendered[bc.main_id]))
 		push(out, "")
 	end
 	local source = table.concat(out, "\n")
