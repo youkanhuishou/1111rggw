@@ -1127,6 +1127,906 @@ local function scanJumpTargets(p)
 	return targets
 end
 
+local function decodedInsnAt(p, pc)
+	local insn = codeWordAt(p, pc)
+	local op = bit32_band(insn, 0xFF)
+	local opName = OPCODES[op] or ""
+	local aux = nil
+	if OPS_WITH_AUX[opName] and pc + 1 < #p.code then
+		aux = codeWordAt(p, pc + 1)
+	end
+	return {
+		pc = pc,
+		insn = insn,
+		opName = opName,
+		a = bit32_band(bit32_rshift(insn, 8), 0xFF),
+		b = bit32_band(bit32_rshift(insn, 16), 0xFF),
+		c = bit32_band(bit32_rshift(insn, 24), 0xFF),
+		d = decodeSignedD(insn),
+		e = decodeSignedE(insn),
+		aux = aux,
+		len = opName ~= "" and getOpLength(opName) or 1,
+	}
+end
+
+local function jumpTargetForInsn(info)
+	local opName = info.opName
+	if opName == "JUMPIF" or opName == "JUMPIFNOT" then
+		return info.pc + info.b + 1
+	end
+	if opName == "JUMP"
+		or opName == "JUMPBACK"
+		or opName == "JUMPIFEQ"
+		or opName == "JUMPIFLE"
+		or opName == "JUMPIFLT"
+		or opName == "JUMPIFNOTEQ"
+		or opName == "JUMPIFNOTLE"
+		or opName == "JUMPIFNOTLT"
+		or opName == "JUMPXLEKN"
+		or opName == "JUMPXEQKNIL"
+		or opName == "JUMPXEQKB"
+		or opName == "JUMPXEQKN"
+		or opName == "JUMPXEQKS"
+		or opName == "FORNPREP"
+		or opName == "FORNLOOP"
+		or opName == "FORGPREP"
+		or opName == "FORGPREP_INEXT"
+		or opName == "FORGPREP_NEXT"
+		or opName == "FORGLOOP"
+	then
+		return info.pc + info.d + 1
+	end
+	if opName == "JUMPX" then
+		return info.pc + info.e + 1
+	end
+	if opName == "LOADB" and info.c ~= 0 then
+		return info.pc + info.c + 1
+	end
+	if opName == "FASTCALL"
+		or opName == "FASTCALL1"
+		or opName == "FASTCALL2"
+		or opName == "FASTCALL2K"
+		or opName == "FASTCALL3"
+	then
+		if info.c ~= 0 then
+			return info.pc + info.c + 1
+		end
+	end
+	return nil
+end
+
+local function isConditionalBranch(opName)
+	return opName == "JUMPIF"
+		or opName == "JUMPIFNOT"
+		or opName == "JUMPIFEQ"
+		or opName == "JUMPIFLE"
+		or opName == "JUMPIFLT"
+		or opName == "JUMPIFNOTEQ"
+		or opName == "JUMPIFNOTLE"
+		or opName == "JUMPIFNOTLT"
+		or opName == "JUMPXLEKN"
+		or opName == "JUMPXEQKNIL"
+		or opName == "JUMPXEQKB"
+		or opName == "JUMPXEQKN"
+		or opName == "JUMPXEQKS"
+end
+
+local function isUnconditionalBranch(opName)
+	return opName == "JUMP" or opName == "JUMPBACK" or opName == "JUMPX"
+end
+
+local function isReturnInsn(opName)
+	return opName == "RETURN"
+end
+
+local function setHasAny(s)
+	for _ in pairs(s or {}) do return true end
+	return false
+end
+
+local function setEquals(a, b)
+	for k in pairs(a or {}) do
+		if not b or not b[k] then return false end
+	end
+	for k in pairs(b or {}) do
+		if not a or not a[k] then return false end
+	end
+	return true
+end
+
+local function copySet(s)
+	local out = {}
+	for k in pairs(s or {}) do out[k] = true end
+	return out
+end
+
+local function intersectSets(a, b)
+	local out = {}
+	for k in pairs(a or {}) do
+		if b and b[k] then out[k] = true end
+	end
+	return out
+end
+
+local function allBlockSet(blocks)
+	local out = {}
+	for _, block in ipairs(blocks or {}) do
+		out[block.id] = true
+	end
+	return out
+end
+
+local function reachableBlockSet(blocks, starts, edgeField)
+	local out = {}
+	local work = {}
+	for _, id in ipairs(starts or {}) do
+		if blocks[id] then work[#work+1] = id end
+	end
+	while #work > 0 do
+		local id = table.remove(work)
+		if not out[id] then
+			out[id] = true
+			local block = blocks[id]
+			for _, nextId in ipairs(block and block[edgeField] or {}) do
+				if not out[nextId] then work[#work+1] = nextId end
+			end
+		end
+	end
+	return out
+end
+
+local function computeDominators(blocks, entryId, reachable)
+	local allReachable = copySet(reachable)
+	local dom = {}
+	for _, block in ipairs(blocks or {}) do
+		dom[block.id] = reachable[block.id] and copySet(allReachable) or {}
+	end
+	if blocks[entryId] then
+		dom[entryId] = { [entryId] = true }
+	end
+	local changed = true
+	while changed do
+		changed = false
+		for _, block in ipairs(blocks or {}) do
+			local id = block.id
+			if reachable[id] and id ~= entryId then
+				local newSet = copySet(allReachable)
+				local sawPred = false
+				for _, predId in ipairs(block.predecessors or {}) do
+					if reachable[predId] then
+						newSet = sawPred and intersectSets(newSet, dom[predId]) or copySet(dom[predId])
+						sawPred = true
+					end
+				end
+				if not sawPred then newSet = {} end
+				newSet[id] = true
+				if not setEquals(newSet, dom[id]) then
+					dom[id] = newSet
+					changed = true
+				end
+			end
+		end
+	end
+	return dom
+end
+
+local function computePostdominators(blocks, reachable)
+	local allReachable = copySet(reachable)
+	local postdom = {}
+	for _, block in ipairs(blocks or {}) do
+		postdom[block.id] = reachable[block.id] and copySet(allReachable) or {}
+	end
+	local changed = true
+	while changed do
+		changed = false
+		for _, block in ipairs(blocks or {}) do
+			local id = block.id
+			if reachable[id] then
+				local newSet = nil
+				local sawSucc = false
+				for _, succId in ipairs(block.successors or {}) do
+					if reachable[succId] then
+						newSet = sawSucc and intersectSets(newSet, postdom[succId]) or copySet(postdom[succId])
+						sawSucc = true
+					end
+				end
+				if not sawSucc then newSet = {} end
+				newSet[id] = true
+				if not setEquals(newSet, postdom[id]) then
+					postdom[id] = newSet
+					changed = true
+				end
+			end
+		end
+	end
+	return postdom
+end
+
+local function findBackEdges(blocks, dominators)
+	local edges = {}
+	for _, block in ipairs(blocks or {}) do
+		for _, succId in ipairs(block.successors or {}) do
+			if dominators[block.id] and dominators[block.id][succId] then
+				edges[#edges+1] = { from = block.id, to = succId }
+			end
+		end
+	end
+	return edges
+end
+
+local function buildCFG(p)
+	local leaders = { [0] = true }
+	local instructions = {}
+	local pc = 0
+	while pc < #p.code do
+		local info = decodedInsnAt(p, pc)
+		instructions[pc] = info
+		local nextPc = pc + info.len
+		local target = jumpTargetForInsn(info)
+		if target and target >= 0 and target < #p.code then
+			leaders[target] = true
+		end
+		if nextPc < #p.code and (target or isReturnInsn(info.opName)) then
+			leaders[nextPc] = true
+		end
+		pc = nextPc
+	end
+	local starts = {}
+	for start in pairs(leaders) do
+		if start >= 0 and start < #p.code then
+			starts[#starts+1] = start
+		end
+	end
+	table.sort(starts)
+	local blocks = {}
+	local pcToBlock = {}
+	for idx, start in ipairs(starts) do
+		local nextStart = starts[idx + 1] or #p.code
+		local lastPc = start
+		local cursor = start
+		while cursor < nextStart do
+			lastPc = cursor
+			local info = instructions[cursor] or decodedInsnAt(p, cursor)
+			cursor = cursor + info.len
+		end
+		local block = { id = idx, startPc = start, endPc = nextStart, lastPc = lastPc, successors = {}, predecessors = {} }
+		blocks[#blocks+1] = block
+		local mapPc = start
+		while mapPc < nextStart do
+			pcToBlock[mapPc] = block
+			local info = instructions[mapPc] or decodedInsnAt(p, mapPc)
+			mapPc = mapPc + info.len
+		end
+	end
+	local function addEdge(fromBlock, toPc)
+		local toBlock = pcToBlock[toPc]
+		if not fromBlock or not toBlock then return end
+		for _, existing in ipairs(fromBlock.successors) do
+			if existing == toBlock.id then return end
+		end
+		fromBlock.successors[#fromBlock.successors+1] = toBlock.id
+		toBlock.predecessors[#toBlock.predecessors+1] = fromBlock.id
+	end
+	for _, block in ipairs(blocks) do
+		local info = instructions[block.lastPc] or decodedInsnAt(p, block.lastPc)
+		local nextPc = block.endPc
+		local target = jumpTargetForInsn(info)
+		if target then
+			addEdge(block, target)
+		end
+		if nextPc < #p.code and not isUnconditionalBranch(info.opName) and not isReturnInsn(info.opName) then
+			addEdge(block, nextPc)
+		end
+	end
+	local cfg = {
+		blocks = blocks,
+		pcToBlock = pcToBlock,
+		instructions = instructions,
+	}
+	cfg.reachable = reachableBlockSet(blocks, { 1 }, "successors")
+	cfg.dominators = computeDominators(blocks, 1, cfg.reachable)
+	cfg.postdominators = computePostdominators(blocks, cfg.reachable)
+	cfg.backEdges = findBackEdges(blocks, cfg.dominators)
+	return cfg
+end
+
+local function instrReadsReg(info, reg)
+	local opName = info.opName
+	local a, b, c = info.a, info.b, info.c
+	if opName == "MOVE" then return b == reg end
+	if opName == "GETTABLE" then return b == reg or c == reg end
+	if opName == "SETTABLE" then return a == reg or b == reg or c == reg end
+	if opName == "GETTABLEKS" or opName == "GETTABLEN" or opName == "NAMECALL" then return b == reg end
+	if opName == "SETTABLEKS" or opName == "SETTABLEN" then return a == reg or b == reg end
+	if opName == "CALL" then
+		if a == reg then return true end
+		local argEnd = b == 0 and (a + 8) or (a + b - 1)
+		return reg >= a + 1 and reg <= argEnd
+	end
+	if opName == "RETURN" then
+		if b == 0 then return reg >= a end
+		return reg >= a and reg <= a + b - 2
+	end
+	if opName == "JUMPIF" or opName == "JUMPIFNOT" then return a == reg end
+	if isConditionalBranch(opName) then return a == reg or b == reg end
+	if opName == "ADD" or opName == "SUB" or opName == "MUL" or opName == "DIV" or opName == "MOD" or opName == "POW" or opName == "IDIV" then
+		return b == reg or c == reg
+	end
+	if opName == "ADDK" or opName == "SUBK" or opName == "MULK" or opName == "DIVK" or opName == "MODK" or opName == "POWK" or opName == "IDIVK" or opName == "ORK" or opName == "ANDK" then
+		return b == reg
+	end
+	if opName == "SUBRK" or opName == "DIVRK" then return b == reg end
+	if opName == "OR" or opName == "AND" then return b == reg or c == reg end
+	if opName == "MINUS" or opName == "NOT" or opName == "LENGTH" then return b == reg end
+	if opName == "CONCAT" then return reg >= b and reg <= c end
+	if opName == "SETUPVAL" or opName == "SETGLOBAL" then return a == reg end
+	if opName == "CAPTURE" then return b == reg end
+	return false
+end
+
+local function instrWritesReg(info, reg)
+	local opName = info.opName
+	local a = info.a
+	if opName == "CALL" then
+		if info.c == 1 then return false end
+		if info.c == 0 then return reg >= a end
+		return reg >= a and reg <= a + info.c - 2
+	end
+	if opName == "NAMECALL" then return reg == a or reg == a + 1 end
+	if opName == "LOADNIL" then return reg == a end
+	return reg == a and ({
+		LOADB = true,
+		LOADN = true,
+		LOADK = true,
+		LOADKC = true,
+		LOADKX = true,
+		MOVE = true,
+		GETIMPORT = true,
+		GETUPVAL = true,
+		GETGLOBAL = true,
+		GETTABLE = true,
+		GETTABLEKS = true,
+		GETTABLEN = true,
+		NEWTABLE = true,
+		DUPTABLE = true,
+		NEWCLOSURE = true,
+		DUPCLOSURE = true,
+		ADD = true,
+		SUB = true,
+		MUL = true,
+		DIV = true,
+		MOD = true,
+		POW = true,
+		IDIV = true,
+		ADDK = true,
+		SUBK = true,
+		MULK = true,
+		DIVK = true,
+		MODK = true,
+		POWK = true,
+		IDIVK = true,
+		SUBRK = true,
+		DIVRK = true,
+		ORK = true,
+		ANDK = true,
+		OR = true,
+		AND = true,
+		MINUS = true,
+		NOT = true,
+		LENGTH = true,
+		CONCAT = true,
+	})[opName] == true
+end
+
+local function regReadBeforeWrite(p, reg, startPc, maxPc)
+	local pc = startPc
+	while pc < #p.code and pc <= maxPc do
+		local info = decodedInsnAt(p, pc)
+		if instrReadsReg(info, reg) then
+			return true
+		end
+		if instrWritesReg(info, reg) then
+			return false
+		end
+		pc = pc + info.len
+	end
+	return false
+end
+
+local function analyzeProtoFlow(p, bc)
+	local cfg = buildCFG(p)
+	local analysis = {
+		cfg = cfg,
+		callResultHints = {},
+		moveAliasHints = {},
+		orDefaultHints = { jumps = {}, fallbacks = {}, uses = {} },
+		counterHints = { initializers = {}, increments = {} },
+		regVersionsByPc = {},
+		regWrites = {},
+		regWritesByBlock = {},
+		phiCandidates = {},
+		guardedCallCount = 0,
+		aliasHintCount = 0,
+		orDefaultHintCount = 0,
+		counterHintCount = 0,
+		branchMergeCount = 0,
+		phiCandidateCount = 0,
+		phiLocvarHintCount = 0,
+	}
+	local regs = {}
+	local regNames = {}
+	local regVersions = {}
+	local maxReg = math.max((p.maxstacksize or 0) - 1, p.numparams or 0)
+	local function noteRead(pc, reg)
+		local bucket = analysis.regVersionsByPc[pc]
+		if not bucket then
+			bucket = { reads = {}, writes = {} }
+			analysis.regVersionsByPc[pc] = bucket
+		end
+		bucket.reads[#bucket.reads+1] = {
+			reg = reg,
+			version = regVersions[reg] or 0,
+			expr = regs[reg],
+			name = regNames[reg],
+		}
+	end
+	local function noteInstructionReads(info)
+		for reg = 0, maxReg do
+			if instrReadsReg(info, reg) then
+				noteRead(info.pc, reg)
+			end
+		end
+	end
+	local function writeReg(pc, reg, expr, name, opName, sourceReg, sourceName)
+		regVersions[reg] = (regVersions[reg] or 0) + 1
+		regs[reg] = expr
+		regNames[reg] = name or (isValidIdent(expr) and expr or nil)
+		local entry = {
+			pc = pc,
+			reg = reg,
+			version = regVersions[reg],
+			ssa = "R" .. tostring(reg) .. "_" .. tostring(regVersions[reg]),
+			expr = expr,
+			name = regNames[reg],
+			opName = opName,
+			sourceReg = sourceReg,
+			sourceName = sourceName,
+		}
+		local block = cfg.pcToBlock and cfg.pcToBlock[pc] or nil
+		if block then
+			entry.blockId = block.id
+			analysis.regWritesByBlock[block.id] = analysis.regWritesByBlock[block.id] or {}
+			analysis.regWritesByBlock[block.id][#analysis.regWritesByBlock[block.id]+1] = entry
+		end
+		local bucket = analysis.regVersionsByPc[pc]
+		if not bucket then
+			bucket = { reads = {}, writes = {} }
+			analysis.regVersionsByPc[pc] = bucket
+		end
+		bucket.writes[#bucket.writes+1] = entry
+		analysis.regWrites[reg] = analysis.regWrites[reg] or {}
+		analysis.regWrites[reg][#analysis.regWrites[reg]+1] = entry
+		return entry
+	end
+	for i = 0, p.numparams - 1 do
+		regs[i] = localAt(p, i, 0) or ("arg" .. tostring(i))
+		regNames[i] = regs[i]
+		regVersions[i] = 0
+	end
+	local pc = 0
+	while pc < #p.code do
+		local info = decodedInsnAt(p, pc)
+		local opName = info.opName
+		local a, b, c, d, aux = info.a, info.b, info.c, info.d, info.aux
+		noteInstructionReads(info)
+		if opName == "MOVE" then
+			local srcExpr = regs[b] or ("R" .. tostring(b))
+			local srcName = regNames[b] or (isValidIdent(srcExpr) and srcExpr or nil)
+			writeReg(pc, a, srcExpr, srcName, opName, b, srcName)
+		elseif opName == "GETTABLEKS" then
+			local keyConst = constantAt(p, aux ~= nil and aux or d)
+			local key = keyConst and keyConst.kind == "string" and keyConst.value or nil
+			local expr = (regs[b] or ("R" .. tostring(b))) .. (key and luaIndexSuffix(key) or "")
+			writeReg(pc, a, expr, localAt(p, a, pc), opName)
+		elseif opName == "NAMECALL" then
+			local keyConst = aux ~= nil and constantAt(p, aux) or nil
+			local key = keyConst and keyConst.kind == "string" and keyConst.value or nil
+			local receiver = regs[b] or ("R" .. tostring(b))
+			writeReg(pc, a, receiver .. ":" .. tostring(key or "?"), nil, opName)
+			writeReg(pc, a + 1, receiver, regNames[b], opName, b, regNames[b])
+		elseif opName == "CALL" then
+			local callee = regs[a] or ("R" .. tostring(a))
+			local args = {}
+			if b ~= 0 then
+				for reg = a + 1, a + b - 1 do
+					args[#args+1] = regs[reg] or ("R" .. tostring(reg))
+				end
+				if callee:find(":", 1, true) and #args > 0 then
+					table.remove(args, 1)
+				end
+			end
+			local callExpr = callee .. "(" .. table.concat(args, ", ") .. ")"
+			if c ~= 1 then
+				local nextPc = pc + info.len
+				local nextInfo = nextPc < #p.code and decodedInsnAt(p, nextPc) or nil
+				local target = nextInfo and jumpTargetForInsn(nextInfo) or nil
+				if nextInfo and (nextInfo.opName == "JUMPIF" or nextInfo.opName == "JUMPIFNOT") and nextInfo.a == a and target then
+					local usedAfterGuard = regReadBeforeWrite(p, a, target, math.min(#p.code - 1, target + 80))
+					if usedAfterGuard then
+						local hint = deriveNameHint(callExpr)
+						local name = localAt(p, a, pc + 1) or cleanGeneratedIdent(hint)
+						if name and isValidIdent(name) then
+							analysis.callResultHints[pc] = name
+						else
+							analysis.callResultHints[pc] = true
+						end
+						analysis.guardedCallCount = analysis.guardedCallCount + 1
+					end
+				end
+				local primaryName = localAt(p, a, pc + 1) or cleanGeneratedIdent(deriveNameHint(callExpr)) or ("_r" .. tostring(a))
+				writeReg(pc, a, primaryName, isValidIdent(primaryName) and primaryName or nil, opName)
+				if c > 2 then
+					for reg = a + 1, a + c - 2 do
+						local name = localAt(p, reg, pc + 1) or ("_r" .. tostring(reg))
+						writeReg(pc, reg, name, isValidIdent(name) and name or nil, opName)
+					end
+				end
+			end
+		elseif opName == "LOADNIL" then
+			writeReg(pc, a, "nil", nil, opName)
+		elseif opName == "LOADB" then
+			writeReg(pc, a, b ~= 0 and "true" or "false", nil, opName)
+		elseif opName == "LOADN" then
+			writeReg(pc, a, tostring(d), nil, opName)
+		elseif opName == "LOADK" or opName == "LOADKC" or opName == "LOADKX" then
+			local idx = opName == "LOADKC" and c or (opName == "LOADK" and d or aux)
+			writeReg(pc, a, kvalLua(p, idx), localAt(p, a, pc), opName)
+		elseif opName == "GETIMPORT" then
+			local parts = decodeImportId(aux or 0, p)
+			local expr = #parts > 0 and table.concat(parts, ".") or nil
+			writeReg(pc, a, expr or ("R" .. tostring(a)), localAt(p, a, pc), opName)
+		elseif opName == "GETUPVAL" then
+			local expr = p.upvalues[b + 1] or ("U" .. tostring(b))
+			writeReg(pc, a, expr, isValidIdent(expr) and expr or localAt(p, a, pc), opName)
+		elseif opName == "GETGLOBAL" then
+			local keyConst = aux ~= nil and constantAt(p, aux) or nil
+			local expr = keyConst and keyConst.value or ("K[" .. tostring(aux) .. "]")
+			writeReg(pc, a, expr, isValidIdent(expr) and expr or localAt(p, a, pc), opName)
+		elseif opName == "NEWTABLE" then
+			writeReg(pc, a, "{}", localAt(p, a, pc), opName)
+		elseif opName == "DUPTABLE" then
+			writeReg(pc, a, kvalLua(p, d), localAt(p, a, pc), opName)
+		elseif opName == "ADDK" or opName == "SUBK" or opName == "MULK" or opName == "DIVK" or opName == "MODK" or opName == "POWK" or opName == "IDIVK" then
+			local symbols = {
+				ADDK = "+",
+				SUBK = "-",
+				MULK = "*",
+				DIVK = "/",
+				MODK = "%",
+				POWK = "^",
+				IDIVK = "//",
+			}
+			local constExpr = kvalLua(p, c)
+			local entry = writeReg(pc, a, "(" .. (regs[b] or ("R" .. tostring(b))) .. " " .. symbols[opName] .. " " .. constExpr .. ")", nil, opName, b, regNames[b])
+			entry.constExpr = constExpr
+		end
+		pc = pc + info.len
+	end
+	local function lastWriteBefore(reg, beforePc)
+		local writes = analysis.regWrites[reg] or {}
+		for i = #writes, 1, -1 do
+			if writes[i].pc < beforePc then
+				return writes[i]
+			end
+		end
+		return nil
+	end
+	local function firstWriteBetween(reg, startPc, endPc)
+		local writes = analysis.regWrites[reg] or {}
+		for _, write in ipairs(writes) do
+			if write.pc >= startPc and write.pc < endPc then
+				return write
+			end
+		end
+		return nil
+	end
+	local function firstWriteBefore(reg, beforePc, opName, expr)
+		local writes = analysis.regWrites[reg] or {}
+		for _, write in ipairs(writes) do
+			if write.pc < beforePc
+				and (not opName or write.opName == opName)
+				and (not expr or write.expr == expr)
+			then
+				return write
+			end
+		end
+		return nil
+	end
+	local function hasSelfIncrementBefore(reg, beforePc)
+		local writes = analysis.regWrites[reg] or {}
+		for _, write in ipairs(writes) do
+			if write.pc < beforePc
+				and write.opName == "ADDK"
+				and write.sourceReg == reg
+				and write.constExpr == "1"
+			then
+				return true
+			end
+		end
+		return false
+	end
+	local function cleanCounterLabel(label)
+		if type(label) ~= "string" then return nil end
+		local cleaned = label:gsub(":%s*$", "")
+		cleaned = cleaned:match(".*:%s*(.+)$") or cleaned
+		cleaned = cleanGeneratedIdent(cleaned)
+		if cleaned and isValidIdent(cleaned) then return cleaned end
+		return nil
+	end
+	local function firstReadBeforeWrite(reg, startPc, maxPc)
+		local scanPc = startPc
+		while scanPc < #p.code and scanPc <= maxPc do
+			local scanInfo = decodedInsnAt(p, scanPc)
+			if instrReadsReg(scanInfo, reg) then
+				return scanPc, scanInfo
+			end
+			if instrWritesReg(scanInfo, reg) then
+				return nil, nil
+			end
+			scanPc = scanPc + scanInfo.len
+		end
+		return nil, nil
+	end
+	local function onlyFallbackWriteBetween(startPc, endPc, fallbackPc)
+		local scanPc = startPc
+		local seenFallback = false
+		while scanPc < #p.code and scanPc < endPc do
+			local scanInfo = decodedInsnAt(p, scanPc)
+			if scanPc == fallbackPc then
+				seenFallback = true
+			else
+				return false
+			end
+			scanPc = scanPc + scanInfo.len
+		end
+		return seenFallback
+	end
+	for pcKey, info in pairs(cfg.instructions) do
+		if (info.opName == "JUMPIF" or info.opName == "JUMPIFNOT") then
+			local target = jumpTargetForInsn(info)
+			if target and target > info.pc then
+				local preWrite = lastWriteBefore(info.a, info.pc)
+				local fallbackWrite = firstWriteBetween(info.a, info.pc + info.len, target)
+				if preWrite
+					and fallbackWrite
+					and preWrite.opName == "MOVE"
+					and fallbackWrite.opName == "MOVE"
+					and preWrite.sourceName
+					and fallbackWrite.sourceName
+					and preWrite.sourceName ~= fallbackWrite.sourceName
+					and isValidIdent(preWrite.sourceName)
+					and isValidIdent(fallbackWrite.sourceName)
+					and regReadBeforeWrite(p, info.a, target, math.min(#p.code - 1, target + 80))
+				then
+					analysis.moveAliasHints[preWrite.pc] = {
+						targetName = fallbackWrite.sourceName,
+						sourceName = preWrite.sourceName,
+						guardPc = pcKey,
+					}
+					analysis.aliasHintCount = analysis.aliasHintCount + 1
+				end
+				if info.opName == "JUMPIF"
+					and preWrite
+					and fallbackWrite
+					and preWrite.opName == "MOVE"
+					and (fallbackWrite.opName == "NEWTABLE" or fallbackWrite.opName == "DUPTABLE")
+					and fallbackWrite.expr
+					and onlyFallbackWriteBetween(info.pc + info.len, target, fallbackWrite.pc)
+				then
+					local sourceExpr = preWrite.sourceName or preWrite.expr
+					if sourceExpr
+						and not tostring(sourceExpr):match("^R%d+$")
+						and regReadBeforeWrite(p, info.a, target, math.min(#p.code - 1, target + 20))
+					then
+						local usePc = firstReadBeforeWrite(info.a, target, math.min(#p.code - 1, target + 20))
+						if usePc then
+							local hint = {
+								reg = info.a,
+								sourceExpr = sourceExpr,
+								fallbackExpr = fallbackWrite.expr,
+								expr = "(" .. tostring(sourceExpr) .. " or " .. tostring(fallbackWrite.expr) .. ")",
+								jumpPc = info.pc,
+								fallbackPc = fallbackWrite.pc,
+								usePc = usePc,
+							}
+							analysis.orDefaultHints.jumps[info.pc] = hint
+							analysis.orDefaultHints.fallbacks[fallbackWrite.pc] = hint
+							analysis.orDefaultHints.uses[usePc] = hint
+							analysis.orDefaultHintCount = analysis.orDefaultHintCount + 1
+						end
+					end
+				end
+			end
+		end
+	end
+	for pcKey, info in pairs(cfg.instructions) do
+		if info.opName == "CALL" and info.b and info.b >= 4 then
+			local calleeRead = analysis.regVersionsByPc[pcKey] and analysis.regVersionsByPc[pcKey].reads and analysis.regVersionsByPc[pcKey].reads[1] or nil
+			local calleeExpr = calleeRead and calleeRead.expr or nil
+			if calleeExpr == "print" then
+				local reg = info.a + 1
+				while reg <= info.a + info.b - 2 do
+					local labelWrite = lastWriteBefore(reg, pcKey)
+					local valueReg = reg + 1
+					local valueWrite = lastWriteBefore(valueReg, pcKey)
+					local counterReg = valueWrite and valueWrite.opName == "MOVE" and valueWrite.sourceReg or valueReg
+					local label = labelWrite and labelWrite.opName == "LOADK" and labelWrite.expr or nil
+					local nameHint = cleanCounterLabel(label and label:match("^['\"](.*)['\"]$") or nil)
+					if nameHint and hasSelfIncrementBefore(counterReg, pcKey) then
+						local initWrite = firstWriteBefore(counterReg, pcKey, "LOADN", "0")
+						if initWrite then
+							analysis.counterHints.initializers[initWrite.pc] = nameHint
+							for _, write in ipairs(analysis.regWrites[counterReg] or {}) do
+								if write.pc < pcKey
+									and write.opName == "ADDK"
+									and write.sourceReg == counterReg
+									and write.constExpr == "1"
+								then
+									analysis.counterHints.increments[write.pc] = nameHint
+								end
+							end
+						end
+					end
+					reg = reg + 2
+				end
+			end
+		end
+	end
+	local counterSeen = {}
+	for pcKey in pairs(analysis.counterHints.initializers) do counterSeen["i:" .. tostring(pcKey)] = true end
+	for pcKey in pairs(analysis.counterHints.increments) do counterSeen["a:" .. tostring(pcKey)] = true end
+	for _ in pairs(counterSeen) do analysis.counterHintCount = analysis.counterHintCount + 1 end
+	local function nearestCommonPostdominator(leftId, rightId, afterPc)
+		local leftSet = cfg.postdominators and cfg.postdominators[leftId] or nil
+		local rightSet = cfg.postdominators and cfg.postdominators[rightId] or nil
+		if not leftSet or not rightSet then return nil end
+		local bestId = nil
+		local bestPc = nil
+		for id in pairs(leftSet) do
+			if rightSet[id] then
+				local block = cfg.blocks[id]
+				if block and block.startPc > afterPc then
+					if not bestPc or block.startPc < bestPc then
+						bestId = id
+						bestPc = block.startPc
+					end
+				end
+			end
+		end
+		return bestId
+	end
+	local function collectRegionWrites(startId, stopId, minPc)
+		local out = {}
+		local seen = {}
+		local work = { startId }
+		local stopBlock = cfg.blocks[stopId]
+		while #work > 0 do
+			local id = table.remove(work)
+			if id ~= stopId and not seen[id] then
+				seen[id] = true
+				local block = cfg.blocks[id]
+				if block and block.startPc > minPc and (not stopBlock or block.startPc < stopBlock.startPc) then
+					for _, write in ipairs(analysis.regWritesByBlock[id] or {}) do
+						out[write.reg] = out[write.reg] or {}
+						out[write.reg][#out[write.reg]+1] = write
+					end
+					for _, succId in ipairs(block.successors or {}) do
+						if succId ~= stopId and not seen[succId] then
+							local succ = cfg.blocks[succId]
+							if succ and (not stopBlock or succ.startPc <= stopBlock.startPc) then
+								work[#work+1] = succId
+							end
+						end
+					end
+				end
+			end
+		end
+		return out
+	end
+	local seenPhi = {}
+	for _, block in ipairs(cfg.blocks or {}) do
+		if cfg.reachable and cfg.reachable[block.id] and #block.successors >= 2 then
+			local succA = block.successors[1]
+			local succB = block.successors[2]
+			local mergeId = nearestCommonPostdominator(succA, succB, block.lastPc)
+			local mergeBlock = mergeId and cfg.blocks[mergeId] or nil
+			if mergeBlock then
+				analysis.branchMergeCount = analysis.branchMergeCount + 1
+				local leftWrites = collectRegionWrites(succA, mergeId, block.lastPc)
+				local rightWrites = collectRegionWrites(succB, mergeId, block.lastPc)
+				local regsSeen = {}
+				for reg in pairs(leftWrites) do regsSeen[reg] = true end
+				for reg in pairs(rightWrites) do regsSeen[reg] = true end
+				for reg in pairs(regsSeen) do
+					local sideCount = (leftWrites[reg] and 1 or 0) + (rightWrites[reg] and 1 or 0)
+					if sideCount >= 2 or regReadBeforeWrite(p, reg, mergeBlock.startPc, math.min(#p.code - 1, mergeBlock.startPc + 80)) then
+						local key = tostring(block.id) .. ":" .. tostring(mergeId) .. ":" .. tostring(reg)
+						if not seenPhi[key] then
+							seenPhi[key] = true
+							analysis.phiCandidates[#analysis.phiCandidates+1] = {
+								reg = reg,
+								branchBlock = block.id,
+								branchPc = block.lastPc,
+								mergeBlock = mergeId,
+								mergePc = mergeBlock.startPc,
+								startPc = math.min(
+									(leftWrites[reg] and leftWrites[reg][1] and leftWrites[reg][1].pc) or mergeBlock.startPc,
+									(rightWrites[reg] and rightWrites[reg][1] and rightWrites[reg][1].pc) or mergeBlock.startPc
+								),
+								sideCount = sideCount,
+							}
+							analysis.phiCandidateCount = analysis.phiCandidateCount + 1
+						end
+					end
+				end
+			end
+		end
+	end
+	return analysis
+end
+
+local function applyPhiLocvarHints(p, analysis, dryRun)
+	if type(analysis) ~= "table" or type(analysis.phiCandidates) ~= "table" then
+		return 0
+	end
+	local applied = 0
+	local seen = {}
+	for _, cand in ipairs(analysis.phiCandidates) do
+		local reg = cand.reg
+		local branchPc = cand.branchPc or 0
+		local mergePc = cand.mergePc or branchPc
+		if type(reg) == "number" and type(branchPc) == "number" and type(mergePc) == "number" and mergePc > branchPc then
+			local best = nil
+			for _, lv in ipairs(p.locvars or {}) do
+				if lv.reg == reg
+					and isValidIdent(lv.name)
+					and lv.startpc <= branchPc
+					and branchPc <= lv.endpc + 1
+				then
+					if not best or lv.startpc > best.startpc then
+						best = lv
+					end
+				end
+			end
+			if best and mergePc > best.endpc then
+				local conflict = false
+				for _, other in ipairs(p.locvars or {}) do
+					if other ~= best
+						and other.reg == reg
+						and other.name ~= best.name
+						and isValidIdent(other.name)
+						and other.startpc <= mergePc
+						and other.endpc >= best.startpc
+					then
+						conflict = true
+						break
+					end
+				end
+				local key = tostring(reg) .. ":" .. tostring(best.startpc) .. ":" .. tostring(mergePc)
+				if not conflict and not seen[key] then
+					seen[key] = true
+					applied = applied + 1
+					if not dryRun then
+						best.endpc = mergePc
+					end
+				end
+			end
+		end
+	end
+	analysis.phiLocvarHintCount = applied
+	return applied
+end
+
 local function isFallbackUpvalueName(name)
 	return type(name) ~= "string"
 		or name == ""
@@ -1644,7 +2544,7 @@ local function propagateUpvalueNames(protoIdx, bc, visited)
 	end
 end
 
-local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, indent, generatedNameFor, functionName, renameHints)
+local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, indent, generatedNameFor, functionName, renameHints, flowAnalysis)
 	local function rname(reg)
 		return regRepr(regs, p, reg, pc)
 	end
@@ -1690,6 +2590,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "LOADN" then
+		local counterName = flowAnalysis and flowAnalysis.counterHints and flowAnalysis.counterHints.initializers and flowAnalysis.counterHints.initializers[pc] or nil
+		if counterName and isValidIdent(counterName) then
+			regs[a] = counterName
+			return indent .. "local " .. counterName .. " = " .. tostring(d), 0
+		end
 		regs[a] = tostring(d)
 		return assignLocalOrExisting(a, tostring(d)), 0
 	end
@@ -1702,6 +2607,16 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "MOVE" then
 		local src = rname(b)
+		local aliasHint = flowAnalysis and flowAnalysis.moveAliasHints and flowAnalysis.moveAliasHints[pc] or nil
+		if aliasHint
+			and aliasHint.targetName
+			and aliasHint.sourceName
+			and isValidIdent(aliasHint.targetName)
+			and isValidIdent(aliasHint.sourceName)
+		then
+			regs[a] = aliasHint.targetName
+			return indent .. aliasHint.targetName .. " = " .. aliasHint.sourceName, 0
+		end
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
 			regs[a] = targetLocal
@@ -1743,6 +2658,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "SETUPVAL" then
 		local upvalueName = p.upvalues[b + 1] or ("U" .. tostring(b))
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.uses and flowAnalysis.orDefaultHints.uses[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return indent .. upvalueName .. " = " .. orHint.expr, 0
+		end
 		return indent .. upvalueName .. " = " .. rname(a), 0
 	end
 
@@ -1848,11 +2768,13 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		end
 		local names = {}
 		local hint = deriveNameHint(callExpr, functionName)
+		local flowNameHint = flowAnalysis and flowAnalysis.callResultHints and flowAnalysis.callResultHints[pc] or nil
 		for k = 0, c - 2 do
 			local name = localAt(p, a + k, pc + 1)
 			if not name then
+				local preferredHint = k == 0 and type(flowNameHint) == "string" and flowNameHint or hint
 				if generatedNameFor then
-					name = generatedNameFor(hint, "_r" .. tostring(a + k))
+					name = generatedNameFor(preferredHint, "_r" .. tostring(a + k))
 				else
 					name = "_r" .. tostring(a + k)
 				end
@@ -1889,12 +2811,22 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "NEWTABLE" then
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return nil, 0
+		end
 		local name = semanticLocalName(a, pc)
 		regs[a] = name
 		return indent .. "local " .. name .. " = {}", 0
 	end
 
 	if opName == "DUPTABLE" then
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return nil, 0
+		end
 		local name = semanticLocalName(a, pc)
 		regs[a] = name
 		return indent .. "local " .. name .. " = " .. kvalLua(p, d), 0
@@ -1945,6 +2877,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "ADDK" or opName == "SUBK" or opName == "MULK" or opName == "DIVK" or opName == "MODK" or opName == "POWK" or opName == "IDIVK" then
+		local counterName = flowAnalysis and flowAnalysis.counterHints and flowAnalysis.counterHints.increments and flowAnalysis.counterHints.increments[pc] or nil
+		if counterName and isValidIdent(counterName) and opName == "ADDK" and kvalLua(p, c) == "1" then
+			regs[a] = counterName
+			return indent .. counterName .. " = " .. counterName .. " + 1", 0
+		end
 		local symbols = {
 			ADDK = "+",
 			SUBK = "-",
@@ -1996,6 +2933,9 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "JUMPIF" or opName == "JUMPIFNOT" then
+		if flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.jumps and flowAnalysis.orDefaultHints.jumps[pc] then
+			return nil, 0
+		end
 		local cond = opName == "JUMPIF" and rname(a) or ("not " .. rname(a))
 		return indent .. "if " .. cond .. " then goto pc" .. tostring(pc + b + 1) .. " end", 0
 	end
@@ -3856,7 +4796,25 @@ local function fixRefreshPreviousUserIdPattern(lines)
 		if out[i + 3] then
 			cmpInd, cmpValue, cmpState, cmpIndex = out[i + 3]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+~=%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
 		end
-		if assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == cmpValue and stateName == cmpState and indexName == cmpIndex then
+		local skipInd, skipValue, skipState, skipIndex
+		if out[i + 3] then
+			skipInd, skipValue, skipState, skipIndex = out[i + 3]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+==%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s+continue%s+end%s*$")
+		end
+		if assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == skipValue and stateName == skipState and indexName == skipIndex then
+			local replacement = {
+				assignInd .. "local " .. current .. " = nil",
+				assignInd .. "if " .. stateName .. "[" .. indexName .. "] then",
+				assignInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
+				assignInd .. "end",
+				out[i],
+				assignInd .. "if " .. current .. " then",
+				out[i + 2],
+				skipInd .. "if " .. valueName .. ".UserId ~= " .. current .. " then continue end",
+			}
+			for _ = 1, 4 do table.remove(out, i) end
+			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
+			i = i + #replacement
+		elseif assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == cmpValue and stateName == cmpState and indexName == cmpIndex then
 			local replacement = {
 				assignInd .. "local " .. current .. " = nil",
 				assignInd .. "if " .. stateName .. "[" .. indexName .. "] then",
@@ -6247,6 +7205,12 @@ local function decompileProto(p, bc, protoIdx)
 	end
 	local generatedNameFor = makeGeneratedNameAllocator(p, params, name)
 	local renameHints = bc.upvalueRenameHints and bc.upvalueRenameHints[protoIdx] or nil
+	local flowAnalysis = nil
+	local okFlow, flowOrErr = pcall(analyzeProtoFlow, p, bc)
+	if okFlow and type(flowOrErr) == "table" then
+		flowAnalysis = flowOrErr
+		applyPhiLocvarHints(p, flowAnalysis, false)
+	end
 
 	local targets = scanJumpTargets(p)
 	local pendingClosureTarget = nil
@@ -6326,7 +7290,7 @@ local function decompileProto(p, bc, protoIdx)
 		end
 
 		if not handledCapture then
-			local line, advanceExtra = emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, bodyIndent, generatedNameFor, name, renameHints)
+			local line, advanceExtra = emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, bodyIndent, generatedNameFor, name, renameHints, flowAnalysis)
 			if opName == "NEWCLOSURE" then
 				pendingClosureTarget = a
 				pendingClosureProtoId = childProtoIdAt(p, d)
@@ -6597,6 +7561,652 @@ local function foldPcallRequireUpvalueWriters(lines)
 	return out
 end
 
+local function stripLineComment(line)
+	local quote = nil
+	local i = 1
+	while i <= #line do
+		local ch = line:sub(i, i)
+		if quote then
+			if ch == "\\" and i + 1 <= #line then
+				i = i + 2
+			else
+				if ch == quote then quote = nil end
+				i = i + 1
+			end
+		elseif ch == '"' or ch == "'" then
+			quote = ch
+			i = i + 1
+		elseif ch == "[" and line:sub(i, i + 1) == "[[" then
+			local closePos = line:find("]]", i + 2, true)
+			if closePos then
+				i = closePos + 2
+			else
+				return line
+			end
+		elseif ch == "-" and line:sub(i + 1, i + 1) == "-" then
+			return (line:sub(1, i - 1):gsub("%s+$", ""))
+		else
+			i = i + 1
+		end
+	end
+	return line
+end
+
+local function stripGeneratedComments(text)
+	local out = {}
+	for line in (text .. "\n"):gmatch("(.-)\n") do
+		local stripped = stripLineComment(line)
+		if stripped:find("%S") then
+			out[#out+1] = stripped
+		elseif not line:find("%-%-", 1, true) then
+			out[#out+1] = stripped
+		end
+	end
+	while #out > 0 and not out[1]:find("%S") do
+		table.remove(out, 1)
+	end
+	while #out > 0 and not out[#out]:find("%S") do
+		out[#out] = nil
+	end
+	return table.concat(out, "\n")
+end
+
+local function isSingleLineBlockText(text)
+	return text:match("^if%s+.+%s+then%s+.+%s+end$") ~= nil
+		or text:match("^for%s+.+%s+do%s+.+%s+end$") ~= nil
+		or text:match("^while%s+.+%s+do%s+.+%s+end$") ~= nil
+end
+
+local function opensBlockText(text)
+	if isSingleLineBlockText(text) then return nil end
+	if text:match("^if%s+.+%s+then$") then return "if" end
+	if text:match("^for%s+.+%s+do$") or text:match("^while%s+.+%s+do$") or text == "do" then return "block" end
+	if text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]") then
+		if not text:match("end%s*$") then return "block" end
+	end
+	if text == "repeat" then return "repeat" end
+	return nil
+end
+
+local function closeBlockText(text, stack)
+	if text == "end" then
+		if #stack > 0 and stack[#stack] ~= "repeat" then
+			table.remove(stack)
+		end
+		return
+	end
+	if text:match("^until%s+") then
+		if #stack > 0 and stack[#stack] == "repeat" then
+			table.remove(stack)
+		end
+	end
+end
+
+local function lineHasAnyIdent(line, names)
+	if type(line) ~= "string" or not names then return false end
+	local text = line
+	local commentPos = text:find("%-%-")
+	if commentPos then
+		text = text:sub(1, commentPos - 1)
+	end
+	for name in pairs(names) do
+		if text:find(identPat(name)) then
+			return true
+		end
+	end
+	return false
+end
+
+local function reattachLeakedFunctionTails(lines, indentUnit)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local line = lines[i]
+		local headerIndent, paramText = line:match("^(%s*)local%s+function%s+[%a_][%w_]*%s*%(([^)]*)%)")
+		if headerIndent == "" and paramText then
+			local params = {}
+			for name in paramText:gmatch("[%a_][%w_]*") do
+				if name ~= "..." then
+					params[name] = true
+				end
+			end
+			if next(params) ~= nil then
+				local stack = { "block" }
+				local endIdx = nil
+				local j = i + 1
+				while j <= #lines do
+					local text = lines[j]:match("^%s*(.-)%s*$")
+					if text ~= "" and text:sub(1, 2) ~= "--" then
+						if text == "end" or text:match("^until%s+") then
+							closeBlockText(text, stack)
+						elseif text ~= "else" and not text:match("^elseif%s+.+%s+then$") then
+							local kind = opensBlockText(text)
+							if kind then stack[#stack+1] = kind end
+						end
+					end
+					if #stack == 0 then
+						endIdx = j
+						break
+					end
+					j = j + 1
+				end
+				if endIdx and endIdx + 1 <= #lines then
+					local tailStart = endIdx + 1
+					while tailStart <= #lines and not lines[tailStart]:match("%S") do
+						tailStart = tailStart + 1
+					end
+					local firstTailText = tailStart <= #lines and lines[tailStart]:match("^%s*(.-)%s*$") or ""
+					if tailStart <= #lines
+						and (lines[tailStart]:match("^(%s*)") or "") == ""
+						and not firstTailText:match("^local%s+function%f[%W]")
+						and not firstTailText:match("^function%f[%W]")
+						and lineHasAnyIdent(lines[tailStart], params)
+					then
+						local tailStack = {}
+						local tailEnd = nil
+						local k = tailStart
+						while k <= #lines do
+							local tailLine = lines[k]
+							local text = tailLine:match("^%s*(.-)%s*$")
+							local ind = tailLine:match("^(%s*)") or ""
+							if text == "" then
+								local nextIdx = k + 1
+								while nextIdx <= #lines and not lines[nextIdx]:match("%S") do
+									nextIdx = nextIdx + 1
+								end
+								local nextText = nextIdx <= #lines and lines[nextIdx]:match("^%s*(.-)%s*$") or ""
+								local nextInd = nextIdx <= #lines and (lines[nextIdx]:match("^(%s*)") or "") or ""
+								if #tailStack == 0 and nextInd == "" and (nextText:match("^local%s+function%f[%W]") or nextText:match("^local%s+[%a_][%w_]*%s*$") or nextText:match("^%-%-%s+[%a_][%w_]*%s+captures:")) then
+									tailEnd = k - 1
+									break
+								end
+							elseif #tailStack == 0 and ind == "" and k > tailStart and (text:match("^local%s+function%f[%W]") or text:match("^local%s+[%a_][%w_]*%s*$") or text:match("^%-%-%s+[%a_][%w_]*%s+captures:")) then
+								tailEnd = k - 1
+								break
+							end
+							if text ~= "" and text:sub(1, 2) ~= "--" then
+								if text == "end" or text:match("^until%s+") then
+									closeBlockText(text, tailStack)
+								elseif text ~= "else" and not text:match("^elseif%s+.+%s+then$") then
+									local kind = opensBlockText(text)
+									if kind then tailStack[#tailStack+1] = kind end
+								end
+							end
+							k = k + 1
+						end
+						if not tailEnd then tailEnd = #lines end
+						if tailEnd >= tailStart and #tailStack == 0 then
+							for copyIdx = i, endIdx - 1 do
+								out[#out+1] = lines[copyIdx]
+							end
+							for copyIdx = tailStart, tailEnd do
+								if lines[copyIdx]:match("%S") then
+									out[#out+1] = indentUnit .. lines[copyIdx]
+								else
+									out[#out+1] = lines[copyIdx]
+								end
+							end
+							out[#out+1] = lines[endIdx]
+							i = tailEnd + 1
+							continue
+						end
+					end
+				end
+			end
+		end
+		out[#out+1] = line
+		i = i + 1
+	end
+	return out
+end
+
+local function fixSplitFallbackObjectAlias(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		if i + 4 <= #lines then
+			local ind, cond = lines[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+			if ind and cond then
+				local assignIdx = nil
+				local assignedName = nil
+				local endIdx = nil
+				local j = i + 1
+				while j <= #lines do
+					local text = lines[j]:match("^%s*(.-)%s*$")
+					local lineInd = lines[j]:match("^(%s*)") or ""
+					if text == "" then
+						j = j + 1
+					elseif lineInd == ind and text == "end" then
+						endIdx = j
+						break
+					elseif assignIdx == nil then
+						local aName = lines[j]:match("^%s*([%a_][%w_]*)%s*=%s*.+$")
+						if aName and not lines[j]:match("^%s*local%s+") then
+							assignIdx = j
+							assignedName = aName
+						end
+						j = j + 1
+					else
+						j = j + 1
+					end
+				end
+				if assignedName and endIdx then
+					local nextIdx = endIdx + 1
+					while nextIdx <= #lines and not lines[nextIdx]:match("%S") do
+						nextIdx = nextIdx + 1
+					end
+					local notName = nextIdx <= #lines and (
+						lines[nextIdx]:match("^" .. luaPE(ind) .. "if%s+not%s+%(%s*([%a_][%w_]*)%s*%)%s+then%s*$")
+						or lines[nextIdx]:match("^" .. luaPE(ind) .. "if%s+not%s+([%a_][%w_]*)%s+then%s*$")
+					) or nil
+					if notName == assignedName then
+						local fallbackName = nil
+						local blockEnd = nil
+						local k = nextIdx + 1
+						while k <= #lines do
+							local text = lines[k]:match("^%s*(.-)%s*$")
+							local lineInd = lines[k]:match("^(%s*)") or ""
+							if text == "" then
+								k = k + 1
+							elseif lineInd == ind and text == "end" then
+								blockEnd = k
+								break
+							elseif not fallbackName then
+								fallbackName = lines[k]:match("^%s*([%a_][%w_]*)%s*=%s*Instance%.new%s*%(")
+								k = k + 1
+							else
+								k = k + 1
+							end
+						end
+						if fallbackName and fallbackName ~= assignedName and blockEnd then
+							local afterIdx = blockEnd + 1
+							while afterIdx <= #lines and not lines[afterIdx]:match("%S") do
+								afterIdx = afterIdx + 1
+							end
+							if afterIdx <= #lines and lines[afterIdx]:find(identPat(fallbackName)) then
+								for copyIdx = i, endIdx do
+									out[#out+1] = lines[copyIdx]
+								end
+								if lines[endIdx + 1] and lines[endIdx + 1]:match("^%s*$") then
+									out[#out+1] = lines[endIdx + 1]
+								end
+								out[#out+1] = ind .. fallbackName .. " = " .. assignedName
+								i = endIdx + 1
+								if lines[i] and lines[i]:match("^%s*$") then
+									i = i + 1
+								end
+								continue
+							end
+						end
+					end
+				end
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
+local function hoistLocalsUsedOutsideDeclBlock(lines)
+	if #lines == 0 then return lines end
+	local function processSegment(segment)
+		if #segment == 0 then return segment end
+		local depth = 0
+		local decls = {}
+		local topDeclared = {}
+		for i, line in ipairs(segment) do
+			local text = line:match("^%s*(.-)%s*$")
+			local name = line:match("^%s*local%s+([%a_][%w_]*)%s*=")
+			if name then
+				if depth <= 1 then
+					topDeclared[name] = true
+				else
+					decls[#decls+1] = { idx = i, name = name, depth = depth }
+				end
+			end
+			if text ~= "" and text:sub(1, 2) ~= "--" then
+				if text == "end" or text:match("^until%s+") then
+					if depth > 0 then depth = depth - 1 end
+				elseif text ~= "else" and not text:match("^elseif%s+.+%s+then$") then
+					if opensBlockText(text) then depth = depth + 1 end
+				end
+			end
+		end
+		if #decls == 0 then return segment end
+		local toHoist = {}
+		local hoistOrder = {}
+		for _, decl in ipairs(decls) do
+			local depth2 = 0
+			for j = 1, #segment do
+				local text = segment[j]:match("^%s*(.-)%s*$")
+				if j > decl.idx
+					and depth2 < decl.depth
+					and not segment[j]:match("^%s*local%s+" .. luaPE(decl.name) .. "%f[^%a_%d]")
+					and lineHasAnyIdent(segment[j], { [decl.name] = true })
+				then
+					if not toHoist[decl.name] and not topDeclared[decl.name] then
+						toHoist[decl.name] = true
+						hoistOrder[#hoistOrder+1] = decl.name
+					end
+					break
+				end
+				if text ~= "" and text:sub(1, 2) ~= "--" then
+					if text == "end" or text:match("^until%s+") then
+						if depth2 > 0 then depth2 = depth2 - 1 end
+					elseif text ~= "else" and not text:match("^elseif%s+.+%s+then$") then
+						if opensBlockText(text) then depth2 = depth2 + 1 end
+					end
+				end
+			end
+		end
+		if #hoistOrder == 0 then return segment end
+		local insertIdx = 1
+		for i, line in ipairs(segment) do
+			local text = line:match("^%s*(.-)%s*$")
+			if text ~= "" and text:sub(1, 2) ~= "--" then
+				insertIdx = (text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) and (i + 1) or i
+				break
+			end
+		end
+		local out = {}
+		for i, line in ipairs(segment) do
+			if i == insertIdx then
+				local ind = line:match("^(%s*)") or ""
+				if line:match("^%s*local%s+function%f[%W]") or line:match("^%s*function%f[%W]") then
+					ind = ind .. "\t"
+				end
+				for _, name in ipairs(hoistOrder) do
+					out[#out+1] = ind .. "local " .. name
+				end
+			end
+			for name in pairs(toHoist) do
+				local ind, rhs = line:match("^(%s*)local%s+" .. luaPE(name) .. "%s*=%s*(.+)$")
+				if ind and rhs then
+					line = ind .. name .. " = " .. rhs
+					break
+				end
+			end
+			out[#out+1] = line
+		end
+		return out
+	end
+	local outAll = {}
+	local i = 1
+	while i <= #lines do
+		local text = lines[i]:match("^%s*(.-)%s*$")
+		if (lines[i]:match("^(%s*)") or "") == "" and text:match("^local%s+function%f[%W]") then
+			local stack = { "block" }
+			local j = i + 1
+			while j <= #lines do
+				local t = lines[j]:match("^%s*(.-)%s*$")
+				if t ~= "" and t:sub(1, 2) ~= "--" then
+					if t == "end" or t:match("^until%s+") then
+						closeBlockText(t, stack)
+					elseif t ~= "else" and not t:match("^elseif%s+.+%s+then$") then
+						local kind = opensBlockText(t)
+						if kind then stack[#stack+1] = kind end
+					end
+				end
+				if #stack == 0 then break end
+				j = j + 1
+			end
+			local segment = {}
+			for k = i, math.min(j, #lines) do segment[#segment+1] = lines[k] end
+			local processed = processSegment(segment)
+			for _, line in ipairs(processed) do outAll[#outAll+1] = line end
+			i = math.min(j, #lines) + 1
+		else
+			outAll[#outAll+1] = lines[i]
+			i = i + 1
+		end
+	end
+	return outAll
+end
+
+local function fixModelPivotCFrameFallback(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		if i + 4 <= #lines then
+			local ind, receiver = lines[i]:match("^(%s*)if%s+(.+):IsA%(%s*\"Model\"%s*%)%s+then%s*$")
+			local pivotInd, pivotReceiver, pivotExpr = lines[i + 1]:match("^(%s*)(.+):PivotTo%((.+)%)%s*$")
+			local localInd = lines[i + 2] and lines[i + 2]:match("^(%s*)local%s+[%a_][%w_]*%s*=%s*%b{}%s*$")
+			local insertInd = lines[i + 3] and lines[i + 3]:match("^(%s*)table%.insert%(.+%)%s*$")
+			local endInd = lines[i + 4] and lines[i + 4]:match("^(%s*)end%s*$")
+			if ind and receiver and pivotInd and pivotReceiver == receiver and localInd == pivotInd and insertInd == pivotInd and endInd == ind then
+				local aliasName = nil
+				for back = i - 1, 1, -1 do
+					local text = lines[back]:match("^%s*(.-)%s*$")
+					if text:match("^local%s+function%f[%W]") then
+						break
+					end
+					local found = lines[back]:match("^%s*" .. luaPE(receiver) .. "%s*=%s*([%a_][%w_]*)%s*$")
+					if found then
+						aliasName = found
+						break
+					end
+				end
+				local localLine = lines[i + 2]:gsub("^" .. luaPE(pivotInd), ind, 1)
+				if aliasName then
+					localLine = localLine:gsub("IsCustomModel%s*=%s*true", "IsCustomModel = (" .. aliasName .. " ~= nil)")
+				end
+				out[#out+1] = lines[i]
+				out[#out+1] = lines[i + 1]
+				out[#out+1] = ind .. "else"
+				out[#out+1] = pivotInd .. receiver .. ".CFrame = " .. pivotExpr
+				out[#out+1] = lines[i + 4]
+				out[#out+1] = localLine
+				out[#out+1] = lines[i + 3]:gsub("^" .. luaPE(pivotInd), ind, 1)
+				i = i + 5
+				continue
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
+local function findFirstChildGuardParts(line)
+	local ind, expr, child = line:match("^(%s*)if%s+not%s+%((.+:FindFirstChild%s*%(%s*\"([^\"]+)\".-%))%)%s+then%s*$")
+	if ind then return ind, expr, cleanGeneratedIdent(child) end
+	ind, expr, child = line:match("^(%s*)if%s+not%s+%((.+:FindFirstChild%s*%(%s*'([^']+)'.-%))%)%s+then%s*$")
+	if ind then return ind, expr, cleanGeneratedIdent(child) end
+	return nil
+end
+
+local function nameUsedBeforeNextTopLevel(lines, startIdx, name)
+	for i = startIdx, math.min(#lines, startIdx + 80) do
+		local text = lines[i]:match("^%s*(.-)%s*$")
+		local ind = lines[i]:match("^(%s*)") or ""
+		if ind == "" and (text == "end" or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) then
+			return false
+		end
+		if lineHasAnyIdent(lines[i], { [name] = true }) then
+			return true
+		end
+	end
+	return false
+end
+
+local function fixFindFirstChildGuardLocals(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind, findExpr, childName = findFirstChildGuardParts(lines[i])
+		if ind and childName and isValidIdent(childName) and nameUsedBeforeNextTopLevel(lines, i + 1, childName) then
+			local prevIdx = #out
+			while prevIdx > 0 and not out[prevIdx]:match("%S") do
+				prevIdx = prevIdx - 1
+			end
+			local alreadyDeclared = prevIdx > 0 and out[prevIdx]:match("^" .. luaPE(ind) .. "local%s+" .. luaPE(childName) .. "%s*=%s*" .. luaPE(findExpr) .. "%s*$")
+			if not alreadyDeclared then
+				out[#out+1] = ind .. "local " .. childName .. " = " .. findExpr
+			end
+			out[#out+1] = ind .. "if not " .. childName .. " then"
+			i = i + 1
+			continue
+		end
+		local dynInd, dynExpr = lines[i]:match("^(%s*)if%s+not%s+%((.+:FindFirstChild%s*%(.+%))%)%s+then%s*$")
+		if dynInd then
+			local guardEnd = nil
+			for j = i + 1, math.min(#lines, i + 4) do
+				local text = lines[j]:match("^%s*(.-)%s*$")
+				local jInd = lines[j]:match("^(%s*)") or ""
+				if jInd == dynInd and text == "end" then
+					guardEnd = j
+					break
+				end
+			end
+			if guardEnd then
+				local nextIdx = guardEnd + 1
+				while nextIdx <= #lines and not lines[nextIdx]:match("%S") do
+					nextIdx = nextIdx + 1
+				end
+				local tempName = nextIdx <= #lines and (
+					lines[nextIdx]:match("^%s*(_r%d+[_%d]*)[:%.]")
+					or lines[nextIdx]:match("^%s*if%s+(_r%d+[_%d]*)[:%.]")
+					or lines[nextIdx]:match("^%s*if%s+not%s+(_r%d+[_%d]*)[:%.]")
+				) or nil
+				if tempName then
+					out[#out+1] = dynInd .. "local " .. tempName .. " = " .. dynExpr
+					out[#out+1] = dynInd .. "if not " .. tempName .. " then"
+					i = i + 1
+					continue
+				end
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
+local function restoreGuardedFindCallResultLocals(lines)
+	local out = {}
+	local function firstTempUse(startIdx)
+		for j = startIdx, math.min(#lines, startIdx + 80) do
+			local text = lines[j]:match("^%s*(.-)%s*$")
+			local ind = lines[j]:match("^(%s*)") or ""
+			if ind == "" and (text == "end" or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) then
+				return nil
+			end
+			local name = lines[j]:match("%f[%a_](_r%d+[_%d]*)%f[^%a_%d]")
+			if name then return name end
+		end
+		return nil
+	end
+	local function firstSemanticResultUse(startIdx, expr)
+		local receiver = type(expr) == "string" and expr:match("^(.-):FindFirstChild[%a_]*%s*%(") or nil
+		local base = receiver and receiver:match("([%a_][%w_]*)%s*$") or nil
+		if not (base and isValidIdent(base)) then return nil end
+		local candidates = {}
+		for suffix = 2, 6 do
+			candidates[#candidates+1] = base .. "_" .. tostring(suffix)
+		end
+		for j = startIdx, math.min(#lines, startIdx + 80) do
+			local text = lines[j]:match("^%s*(.-)%s*$")
+			local ind = lines[j]:match("^(%s*)") or ""
+			if ind == "" and (text == "end" or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) then
+				return nil
+			end
+			for _, candidate in ipairs(candidates) do
+				if lineHasAnyIdent(lines[j], { [candidate] = true }) then
+					return candidate
+				end
+			end
+		end
+		return nil
+	end
+	local i = 1
+	while i <= #lines do
+		local ind, expr = lines[i]:match("^(%s*)if%s+not%s+%((.+:FindFirstChild[%a_]*%s*%(.+%))%)%s+then%s+return%s+end%s*$")
+		local endIdx = i
+		if not ind and i + 2 <= #lines then
+			ind, expr = lines[i]:match("^(%s*)if%s+not%s+%((.+:FindFirstChild[%a_]*%s*%(.+%))%)%s+then%s*$")
+			if ind and not (lines[i + 1]:match("^" .. luaPE(ind) .. "\t?return%s*$") and matchEnd(lines[i + 2]) == ind) then
+				ind, expr = nil, nil
+			else
+				endIdx = i + 2
+			end
+		end
+		if ind and expr then
+			local hint = deriveNameHint(expr)
+			local name = hint and cleanGeneratedIdent(hint) or nil
+			if not (name and isValidIdent(name) and nameUsedBeforeNextTopLevel(lines, i + 1, name)) then
+				name = firstSemanticResultUse(i + 1, expr) or firstTempUse(i + 1)
+			end
+			if name and isValidIdent(name) and nameUsedBeforeNextTopLevel(lines, i + 1, name) then
+				out[#out+1] = ind .. "local " .. name .. " = " .. expr
+				out[#out+1] = ind .. "if not " .. name .. " then return end"
+				i = endIdx + 1
+				continue
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
+local function fixNestedModelBasePartElseif(lines, indentUnit)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind, receiver = lines[i]:match("^(%s*)if%s+(.+):IsA%(%s*\"Model\"%s*%)%s+then%s*$")
+		if ind and i + 4 <= #lines then
+			local childInd, primaryReceiver = lines[i + 1]:match("^(%s*)if%s+(.+)%.PrimaryPart%s+then%s*$")
+			if childInd == ind .. indentUnit and primaryReceiver == receiver then
+				local elseifIdx = nil
+				local innerEndIdx = nil
+				local outerEndIdx = nil
+				local j = i + 2
+				while j <= #lines do
+					local text = lines[j]:match("^%s*(.-)%s*$")
+					local lineInd = lines[j]:match("^(%s*)") or ""
+					if lineInd == childInd and text == "elseif " .. receiver .. ":IsA(\"BasePart\") then" then
+						elseifIdx = j
+					elseif elseifIdx and lineInd == childInd and text == "end" then
+						innerEndIdx = j
+						break
+					elseif lineInd == ind and text == "end" then
+						break
+					end
+					j = j + 1
+				end
+				if innerEndIdx then
+					local k = innerEndIdx + 1
+					while k <= #lines and not lines[k]:match("%S") do k = k + 1 end
+					if k <= #lines and (lines[k]:match("^(%s*)") or "") == ind and lines[k]:match("^%s*end%s*$") then
+						outerEndIdx = k
+					end
+				end
+				if elseifIdx and innerEndIdx and outerEndIdx then
+					for copyIdx = i, elseifIdx - 1 do
+						out[#out+1] = lines[copyIdx]
+					end
+					out[#out+1] = childInd .. "end"
+					out[#out+1] = ind .. "elseif " .. receiver .. ":IsA(\"BasePart\") then"
+					for copyIdx = elseifIdx + 1, innerEndIdx - 1 do
+						local moved = lines[copyIdx]
+						if moved:sub(1, #indentUnit) == indentUnit then
+							moved = moved:sub(#indentUnit + 1)
+						end
+						out[#out+1] = moved
+					end
+					out[#out+1] = lines[outerEndIdx]
+					i = outerEndIdx + 1
+					continue
+				end
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
 local function renderSource(bc)
 	local out = { "-- ============== SOURCE ==============" }
 	if bc.main_id >= 0 and bc.main_id < #bc.protos then
@@ -6650,6 +8260,15 @@ local function renderSource(bc)
 	lines = foldPcallRequireUpvalueWriters(lines)
 	lines = predeclareHoistedUpvalues(lines)
 	lines = renderLuaAstLines(lines, "\t")
+	lines = reattachLeakedFunctionTails(lines, "\t")
+	lines = fixFindFirstChildGuardLocals(lines)
+	lines = restoreGuardedFindCallResultLocals(lines)
+	lines = fixSplitFallbackObjectAlias(lines)
+	lines = hoistLocalsUsedOutsideDeclBlock(lines)
+	lines = fixNestedModelBasePartElseif(lines, "\t")
+	lines = fixModelPivotCFrameFallback(lines)
+	lines = hoistLocalsUsedOutsideDeclBlock(lines)
+	lines = renderLuaAstLines(lines, "\t")
 	lines = dropInvalidTopLevelReturns(lines)
 	return table.concat(lines, "\n")
 end
@@ -6659,30 +8278,36 @@ local function normalizeOptions(options)
 		return {
 			mode = string.lower(options),
 			filename = "bytecode",
+			noComments = false,
 		}
 	end
 	if type(options) ~= "table" then
 		return {
 			mode = "source",
 			filename = "bytecode",
+			noComments = false,
 		}
 	end
 	local mode = type(options.mode) == "string" and string.lower(options.mode) or "source"
 	local filename = type(options.filename) == "string" and options.filename or "bytecode"
+	local noComments = options.noComments == true or options.no_comments == true or options.stripComments == true or options.strip_comments == true
 	return {
 		mode = mode,
 		filename = filename,
+		noComments = noComments,
 	}
 end
 
-local function renderBytecode(filename, data, mode)
+local function renderBytecode(filename, data, mode, noComments)
 	local bc = parseBytecode(data)
 	local out = {}
-	push(out, "-- " .. basename(filename))
-	push(out, "-- Original size: " .. tostring(#data) .. " bytes")
-	push(out, "-- Bytecode version: " .. tostring(bc.version) .. ", types version: " .. tostring(bc.typesversion))
-	push(out, "-- Strings: " .. tostring(#bc.strings) .. ", Protos: " .. tostring(#bc.protos) .. ", Main proto: " .. tostring(bc.main_id))
-	push(out, "")
+	if not noComments then
+		push(out, "-- " .. basename(filename))
+		push(out, "-- Original size: " .. tostring(#data) .. " bytes")
+		push(out, "-- Bytecode version: " .. tostring(bc.version) .. ", types version: " .. tostring(bc.typesversion))
+		push(out, "-- Strings: " .. tostring(#bc.strings) .. ", Protos: " .. tostring(#bc.protos) .. ", Main proto: " .. tostring(bc.main_id))
+		push(out, "")
+	end
 
 	if mode == "asm" or mode == "both" then
 		push(out, renderDisassembly(bc))
@@ -6693,7 +8318,69 @@ local function renderBytecode(filename, data, mode)
 		end
 		push(out, renderSource(bc))
 	end
-	return table.concat(out, "\n")
+	local result = table.concat(out, "\n")
+	if noComments then
+		result = stripGeneratedComments(result)
+	end
+	return result
+end
+
+local function analyzeBytecode(data)
+	local bc = parseBytecode(data)
+	local stats = {
+		protoCount = #bc.protos,
+		blockCount = 0,
+		edgeCount = 0,
+		backEdgeCount = 0,
+		branchMergeCount = 0,
+		phiCandidateCount = 0,
+		phiLocvarHintCount = 0,
+		orDefaultHintCount = 0,
+		counterHintCount = 0,
+		guardedCallCount = 0,
+		aliasHintCount = 0,
+	}
+	local protos = {}
+	for protoIdx = 0, #bc.protos - 1 do
+		local p = protoAt(bc, protoIdx)
+		local ok, analysis = pcall(analyzeProtoFlow, p, bc)
+		if ok and type(analysis) == "table" and type(analysis.cfg) == "table" then
+			applyPhiLocvarHints(p, analysis, true)
+			local cfg = analysis.cfg
+			local edgeCount = 0
+			for _, block in ipairs(cfg.blocks or {}) do
+				edgeCount = edgeCount + #(block.successors or {})
+			end
+			local protoStats = {
+				proto = protoIdx,
+				blocks = #(cfg.blocks or {}),
+				edges = edgeCount,
+				backEdges = #(cfg.backEdges or {}),
+				branchMerges = analysis.branchMergeCount or 0,
+				phiCandidates = analysis.phiCandidateCount or 0,
+				phiLocvarHints = analysis.phiLocvarHintCount or 0,
+				orDefaultHints = analysis.orDefaultHintCount or 0,
+				counterHints = analysis.counterHintCount or 0,
+				guardedCalls = analysis.guardedCallCount or 0,
+				aliasHints = analysis.aliasHintCount or 0,
+			}
+			protos[#protos+1] = protoStats
+			stats.blockCount = stats.blockCount + protoStats.blocks
+			stats.edgeCount = stats.edgeCount + protoStats.edges
+			stats.backEdgeCount = stats.backEdgeCount + protoStats.backEdges
+			stats.branchMergeCount = stats.branchMergeCount + protoStats.branchMerges
+			stats.phiCandidateCount = stats.phiCandidateCount + protoStats.phiCandidates
+			stats.phiLocvarHintCount = stats.phiLocvarHintCount + protoStats.phiLocvarHints
+			stats.orDefaultHintCount = stats.orDefaultHintCount + protoStats.orDefaultHints
+			stats.counterHintCount = stats.counterHintCount + protoStats.counterHints
+			stats.guardedCallCount = stats.guardedCallCount + protoStats.guardedCalls
+			stats.aliasHintCount = stats.aliasHintCount + protoStats.aliasHints
+		end
+	end
+	return {
+		stats = stats,
+		protos = protos,
+	}
 end
 
 local Module = {}
@@ -6703,13 +8390,18 @@ function Module.parseBytecode(data)
 	return parseBytecode(data)
 end
 
+function Module.analyze(data)
+	assert(type(data) == "string", "analyze expects raw bytecode string")
+	return analyzeBytecode(data)
+end
+
 function Module.render(data, options)
 	assert(type(data) == "string", "render expects raw bytecode string")
 	local normalized = normalizeOptions(options)
 	if normalized.mode ~= "source" and normalized.mode ~= "asm" and normalized.mode ~= "both" then
 		error("Invalid mode: " .. tostring(normalized.mode) .. " (expected source|asm|both)")
 	end
-	return renderBytecode(normalized.filename, data, normalized.mode)
+	return renderBytecode(normalized.filename, data, normalized.mode, normalized.noComments)
 end
 
 function Module.decompile(data, options)
