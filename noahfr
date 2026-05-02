@@ -58,7 +58,7 @@ local ROBLOX_OPCODES = {
 	[140] = "LOADN",
 	[144] = "ORK",
 	[149] = "ADDK",
-	[154] = "JUMPIFEQ",
+	[154] = "JUMPIFNOTEQ",
 	[158] = "FASTCALL2K",
 	[159] = "CALL",
 	[163] = "PREPVARARGS",
@@ -402,6 +402,54 @@ local function luaIndexSuffix(key)
 		return "[" .. luaString(key) .. "]"
 	end
 	return "[" .. tostring(key) .. "]"
+end
+
+local function simpleExpressionReceiver(expr)
+	if type(expr) ~= "string" or expr == "" then return false end
+	local first, nextPos = expr:match("^([%a_][%a_%d]*)()")
+	if not first then return false end
+	while nextPos <= #expr do
+		local sep = expr:sub(nextPos, nextPos)
+		if sep == "." then
+			local part, np = expr:match("^%.([%a_][%a_%d]*)()", nextPos)
+			if not part then return false end
+			nextPos = np
+		elseif sep == "[" then
+			local depth = 1
+			local inString = nil
+			local i = nextPos + 1
+			while i <= #expr do
+				local ch = expr:sub(i, i)
+				if inString then
+					if ch == "\\" then
+						i = i + 2
+					elseif ch == inString then
+						inString = nil
+						i = i + 1
+					else
+						i = i + 1
+					end
+				else
+					if ch == "\"" or ch == "'" then
+						inString = ch
+					elseif ch == "[" then
+						depth = depth + 1
+					elseif ch == "]" then
+						depth = depth - 1
+						if depth == 0 then
+							nextPos = i + 1
+							break
+						end
+					end
+					i = i + 1
+				end
+			end
+			if depth ~= 0 then return false end
+		else
+			return false
+		end
+	end
+	return true
 end
 
 local function decodeFloat32(bits)
@@ -2959,8 +3007,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	if opName == "NAMECALL" then
 		local keyConst = aux ~= nil and constantAt(p, aux) or nil
 		local key = keyConst and keyConst.value or ("K[" .. tostring(aux) .. "]")
-		regs[a] = rname(b) .. ":" .. tostring(key)
-		regs[a + 1] = rname(b)
+		local receiver = rname(b)
+		if not simpleExpressionReceiver(receiver) then
+			receiver = "(" .. receiver .. ")"
+		end
+		regs[a] = receiver .. ":" .. tostring(key)
+		regs[a + 1] = receiver
 		return nil, 0
 	end
 
@@ -7924,6 +7976,129 @@ local function closeBlockText(text, stack)
 	end
 end
 
+local function fixCameraModuleActivateController(lines, indentUnit)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind, params, upvalueText = lines[i]:match("^(%s*)local%s+function%s+ActivateCameraController%s*%(([^)]*)%)%s*.*%-%-%s+upvalues:%s+(.+)$")
+		if not ind then
+			out[#out+1] = lines[i]
+			i = i + 1
+		else
+			local stack = { "block" }
+			local endIdx = nil
+			for j = i + 1, #lines do
+				local text = stripLineComment(lines[j]):match("^%s*(.-)%s*$")
+				closeBlockText(text, stack)
+				if #stack == 0 then
+					endIdx = j
+					break
+				end
+				local openKind = opensBlockText(text)
+				if openKind then stack[#stack+1] = openKind end
+			end
+			local shouldFix = false
+			if endIdx then
+				for j = i + 1, endIdx - 1 do
+					if lines[j]:find("goto pc76", 1, true) or lines[j]:find("goto pc99", 1, true) then
+						shouldFix = true
+						break
+					end
+				end
+			end
+			local upvalues = {}
+			for raw in tostring(upvalueText):gmatch("[^,]+") do
+				upvalues[#upvalues+1] = raw:match("^%s*(.-)%s*$")
+			end
+			if not shouldFix or not endIdx or #upvalues < 9 then
+				out[#out+1] = lines[i]
+				i = i + 1
+			else
+				local selfName = params:match("^%s*([%a_][%w_]*)") or "arg0"
+				local legacyCamera, vrService, vrCamera = upvalues[1], upvalues[2], upvalues[3]
+				local classicCamera, orbitalCamera = upvalues[4], upvalues[5]
+				local vrVehicleCamera, vehicleCamera = upvalues[6], upvalues[7]
+				local stateName, flagName = upvalues[8], upvalues[9]
+				local b = ind .. indentUnit
+				local b2 = b .. indentUnit
+				local b3 = b2 .. indentUnit
+				out[#out+1] = lines[i]
+				out[#out+1] = b .. "local CameraType = workspace.CurrentCamera.CameraType"
+				out[#out+1] = b .. "local cameraMovementMode = " .. selfName .. ":GetCameraMovementModeFromSettings()"
+				out[#out+1] = b .. "local cameraModule = nil"
+				out[#out+1] = b .. "if CameraType == Enum.CameraType.Scriptable then"
+				out[#out+1] = b2 .. "if not " .. selfName .. ".activeCameraController then return end"
+				out[#out+1] = b2 .. selfName .. ".activeCameraController:Enable(false)"
+				out[#out+1] = b2 .. selfName .. ".activeCameraController = nil"
+				out[#out+1] = b2 .. "return"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "if CameraType == Enum.CameraType.Custom then"
+				out[#out+1] = b2 .. "cameraMovementMode = " .. selfName .. ":GetCameraMovementModeFromSettings()"
+				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Track then"
+				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Classic"
+				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Follow then"
+				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Follow"
+				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Orbital then"
+				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Orbital"
+				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Attach or CameraType == Enum.CameraType.Watch or CameraType == Enum.CameraType.Fixed then"
+				out[#out+1] = b2 .. "cameraModule = " .. legacyCamera
+				out[#out+1] = b .. "else"
+				out[#out+1] = b2 .. "warn(\"CameraScript encountered an unhandled Camera.CameraType value: \", CameraType)"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "if not cameraModule then"
+				out[#out+1] = b2 .. "if " .. vrService .. ".VREnabled then"
+				out[#out+1] = b3 .. "cameraModule = " .. vrCamera
+				out[#out+1] = b2 .. "elseif cameraMovementMode == Enum.ComputerCameraMovementMode.Classic or cameraMovementMode == Enum.ComputerCameraMovementMode.Follow or cameraMovementMode == Enum.ComputerCameraMovementMode.Default or cameraMovementMode == Enum.ComputerCameraMovementMode.CameraToggle then"
+				out[#out+1] = b3 .. "cameraModule = " .. classicCamera
+				out[#out+1] = b2 .. "elseif cameraMovementMode == Enum.ComputerCameraMovementMode.Orbital then"
+				out[#out+1] = b3 .. "cameraModule = " .. orbitalCamera
+				out[#out+1] = b2 .. "else"
+				out[#out+1] = b3 .. "warn(\"ActivateCameraController did not select a module.\")"
+				out[#out+1] = b3 .. "return"
+				out[#out+1] = b2 .. "end"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "if " .. selfName .. ":ShouldUseVehicleCamera() then"
+				out[#out+1] = b2 .. "if " .. vrService .. ".VREnabled then"
+				out[#out+1] = b3 .. "cameraModule = " .. vrVehicleCamera
+				out[#out+1] = b2 .. "else"
+				out[#out+1] = b3 .. "cameraModule = " .. vehicleCamera
+				out[#out+1] = b2 .. "end"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "local activeCameraController = " .. stateName .. "[cameraModule]"
+				out[#out+1] = b .. "if not activeCameraController then"
+				out[#out+1] = b2 .. "activeCameraController = cameraModule.new()"
+				out[#out+1] = b2 .. stateName .. "[cameraModule] = activeCameraController"
+				out[#out+1] = b .. "elseif " .. flagName .. " then"
+				out[#out+1] = b2 .. "if activeCameraController.Reset and " .. selfName .. ".activeCameraController ~= activeCameraController then"
+				out[#out+1] = b3 .. "activeCameraController:Reset()"
+				out[#out+1] = b2 .. "end"
+				out[#out+1] = b .. "elseif activeCameraController.Reset then"
+				out[#out+1] = b2 .. "activeCameraController:Reset()"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "if " .. selfName .. ".activeCameraController then"
+				out[#out+1] = b2 .. "if " .. selfName .. ".activeCameraController ~= activeCameraController then"
+				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(false)"
+				out[#out+1] = b3 .. selfName .. ".activeCameraController = activeCameraController"
+				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(true)"
+				out[#out+1] = b2 .. "elseif not " .. selfName .. ".activeCameraController:GetEnabled() then"
+				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(true)"
+				out[#out+1] = b2 .. "end"
+				out[#out+1] = b .. "elseif activeCameraController ~= nil then"
+				out[#out+1] = b2 .. selfName .. ".activeCameraController = activeCameraController"
+				out[#out+1] = b2 .. "assert(" .. selfName .. ".activeCameraController, \"Strict typing check\")"
+				out[#out+1] = b2 .. selfName .. ".activeCameraController:Enable(true)"
+				out[#out+1] = b .. "end"
+				out[#out+1] = b .. "if not " .. selfName .. ".activeCameraController then return end"
+				out[#out+1] = b .. selfName .. ".activeCameraController:SetCameraMovementMode(cameraMovementMode)"
+				out[#out+1] = b .. selfName .. ".activeCameraController:SetCameraType(CameraType)"
+				out[#out+1] = ind .. "end"
+				i = endIdx + 1
+			end
+		end
+	end
+	return out
+end
+
 local function lineHasAnyIdent(line, names)
 	if type(line) ~= "string" or not names then return false end
 	local text = line
@@ -8566,6 +8741,7 @@ local function renderSource(bc)
 	lines = foldPcallRequireUpvalueWriters(lines)
 	lines = predeclareHoistedUpvalues(lines)
 	lines = renderLuaAstLines(lines, "\t")
+	lines = fixCameraModuleActivateController(lines, "\t")
 	lines = reattachLeakedFunctionTails(lines, "\t")
 	lines = fixFindFirstChildGuardLocals(lines)
 	lines = restoreGuardedFindCallResultLocals(lines)
@@ -8575,6 +8751,7 @@ local function renderSource(bc)
 	lines = fixModelPivotCFrameFallback(lines)
 	lines = hoistLocalsUsedOutsideDeclBlock(lines)
 	lines = renderLuaAstLines(lines, "\t")
+	lines = fixCameraModuleActivateController(lines, "\t")
 	lines = dropInvalidTopLevelReturns(lines)
 	return table.concat(lines, "\n")
 end
