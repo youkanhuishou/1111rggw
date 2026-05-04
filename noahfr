@@ -2030,7 +2030,7 @@ local function analyzeProtoFlow(p, bc)
 				return sourceName
 			end
 		end
-		local hint = deriveNameHint(write.expr)
+		local hint = (write.opName == "GETTABLE" or write.opName == "GETTABLEKS") and nil or deriveNameHint(write.expr)
 		if hint and isValidIdent(hint) and not isParamName(hint) and hint ~= "nil" then
 			return hint
 		end
@@ -2164,7 +2164,35 @@ local function analyzeProtoFlow(p, bc)
 			if isNilPhiValueWrite(write) then
 				local writeInfo = cfg.instructions and cfg.instructions[write.pc] or nil
 				local nextPc = writeInfo and (write.pc + writeInfo.len) or nil
-				local nextInfo = nextPc and cfg.instructions and cfg.instructions[nextPc] or nil
+				local nextInfo = nextPc and ((cfg.instructions and cfg.instructions[nextPc]) or decodedInsnAt(p, nextPc)) or nil
+				local jumpGuardPc = nextInfo and nextInfo.opName == "JUMP" and jumpTargetForInsn(nextInfo) or nil
+				local jumpGuardInfo = jumpGuardPc and jumpGuardPc < #p.code and ((cfg.instructions and cfg.instructions[jumpGuardPc]) or decodedInsnAt(p, jumpGuardPc)) or nil
+				local skippedNilPc = nextPc and nextInfo and (nextPc + nextInfo.len) or nil
+				local skippedNilWrite = jumpGuardPc and skippedNilPc and firstWriteBetween(reg, skippedNilPc, jumpGuardPc) or nil
+				if jumpGuardPc
+					and jumpGuardPc > nextPc
+					and jumpGuardInfo
+					and (jumpGuardInfo.opName == "JUMPIF" or jumpGuardInfo.opName == "JUMPIFNOT")
+					and jumpGuardInfo.a == reg
+					and skippedNilPc
+					and skippedNilPc < jumpGuardPc
+					and skippedNilWrite
+					and skippedNilWrite.pc == skippedNilPc
+					and skippedNilWrite.opName == "LOADNIL"
+					and regReadBeforeWrite(p, reg, jumpGuardPc, #p.code - 1)
+				then
+					local branchWrites = {}
+					local initWrite = lastWriteBefore(reg, write.pc)
+					if initWrite
+						and initWrite.opName == "LOADNIL"
+						and not firstWriteBetween(reg, initWrite.pc + 1, write.pc)
+					then
+						branchWrites[#branchWrites+1] = initWrite
+					end
+					branchWrites[#branchWrites+1] = write
+					branchWrites[#branchWrites+1] = skippedNilWrite
+					addNilPhiHintsForWrites(reg, jumpGuardPc, branchWrites)
+				end
 				local mergePc = nextInfo and nextInfo.opName == "JUMP" and jumpTargetForInsn(nextInfo) or nil
 				if mergePc and mergePc > nextPc and regReadBeforeWrite(p, reg, mergePc, #p.code - 1) then
 					local branchWrites = {}
@@ -2373,15 +2401,16 @@ local function analyzeProtoFlow(p, bc)
 				local reg = info.a
 				local preWrite = lastWriteBefore(reg, info.pc)
 				local fallbackWrite = firstWriteBetween(reg, info.pc + info.len, target)
-				if fallbackWrite and fallbackWrite.opName == "NAMECALL" then
-					local callWrite = firstWriteBetween(reg, fallbackWrite.pc + fallbackWrite.len, target)
+				local fallbackWriteInfo = fallbackWrite and cfg.instructions and cfg.instructions[fallbackWrite.pc] or nil
+				if fallbackWrite and fallbackWrite.opName == "NAMECALL" and fallbackWriteInfo then
+					local callWrite = firstWriteBetween(reg, fallbackWrite.pc + fallbackWriteInfo.len, target)
 					if callWrite and callWrite.opName == "CALL" then
 						fallbackWrite = callWrite
 					end
 				end
 				local fallbackOnlyWrite = fallbackWrite ~= nil
 				if fallbackOnlyWrite then
-					for _, otherWrite in ipairs(regWrites[reg] or {}) do
+					for _, otherWrite in ipairs(analysis.regWrites[reg] or {}) do
 						if otherWrite.pc >= info.pc + info.len and otherWrite.pc < target and otherWrite.pc ~= fallbackWrite.pc then
 							local allowNamecall = fallbackWrite.opName == "CALL"
 								and otherWrite.opName == "NAMECALL"
@@ -3577,20 +3606,25 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "GETTABLE" then
 		local expr = rname(b) .. "[" .. rname(c) .. "]"
+		local nilPhiAssigned = assignNilPhiValue(a, expr)
+		if nilPhiAssigned then
+			return nilPhiAssigned, 0
+		end
 		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
 		local valuePhiAssigned = assignHintedValue(a, expr, valuePhiHint)
 		if valuePhiAssigned then
 			return valuePhiAssigned, 0
-		end
-		local nilPhiAssigned = assignNilPhiValue(a, expr)
-		if nilPhiAssigned then
-			return nilPhiAssigned, 0
 		end
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
 			targetLocal = sanitizeLocalName(targetLocal, a, pc)
 			regs[a] = targetLocal
 			return indent .. "local " .. targetLocal .. " = " .. expr, 0
+		end
+		local trackedNilPhi = regs.__nilPhiDeclared and regs.__nilPhiDeclared[a] and regs[a] or nil
+		if trackedNilPhi and isValidIdent(trackedNilPhi) and trackedNilPhi ~= expr then
+			regs[a] = trackedNilPhi
+			return indent .. trackedNilPhi .. " = " .. expr, 0
 		end
 		regs[a] = expr
 		return nil, 0
@@ -3606,6 +3640,10 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local key = keyConst and keyConst.kind == "string" and keyConst.value or ("K[" .. tostring(idx) .. "]")
 		local baseExpr = rname(b)
 		local expr = baseExpr .. luaIndexSuffix(key)
+		local nilPhiAssigned = assignNilPhiValue(a, expr)
+		if nilPhiAssigned then
+			return nilPhiAssigned, 0
+		end
 		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
 		local valuePhiAssigned = assignHintedValue(a, expr, valuePhiHint)
 		if valuePhiAssigned then
@@ -3714,15 +3752,16 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 				end
 			end
 		end
-		local nilPhiAssigned = assignNilPhiValue(a, expr)
-		if nilPhiAssigned then
-			return nilPhiAssigned, 0
-		end
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
 			targetLocal = sanitizeLocalName(targetLocal, a, pc)
 			regs[a] = targetLocal
 			return indent .. "local " .. targetLocal .. " = " .. expr, 0
+		end
+		local trackedNilPhi = regs.__nilPhiDeclared and regs.__nilPhiDeclared[a] and regs[a] or nil
+		if trackedNilPhi and isValidIdent(trackedNilPhi) and trackedNilPhi ~= expr then
+			regs[a] = trackedNilPhi
+			return indent .. trackedNilPhi .. " = " .. expr, 0
 		end
 		regs[a] = expr
 		return nil, 0
@@ -6910,6 +6949,49 @@ local function fixGuardReturnBeforeFallbackLocal(lines)
 	return out
 end
 
+local function fixNilPhiGuardAssignments(lines, indentUnit)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local fixed = false
+		if i + 5 <= #lines then
+			local ind = matchIfOpen(lines[i])
+			local thenAssignInd, thenTarget, thenExpr = lines[i + 1]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+)%s*$")
+			local elseInd = lines[i + 2]:match("^(%s*)else%s*$")
+			local elseAssignInd, elseTarget = lines[i + 3]:match("^(%s*)([%a_][%w_]*)%s*=%s*nil%s*$")
+			local endInd = matchEnd(lines[i + 4])
+			local guardIndent, guardName = lines[i + 5]:match("^(%s*)if%s+not%s+%(([%a_][%w_]*)%)%s+then%s*$")
+			if not guardName then
+				guardIndent, guardName = lines[i + 5]:match("^(%s*)if%s+not%s+([%a_][%w_]*)%s+then%s*$")
+			end
+			if ind
+				and thenAssignInd == ind .. indentUnit
+				and elseInd == ind
+				and elseAssignInd == ind .. indentUnit
+				and endInd == ind
+				and guardIndent == ind
+				and elseTarget == guardName
+				and thenTarget ~= guardName
+				and not thenExpr:find(identPat(guardName))
+			then
+				out[#out + 1] = lines[i]
+				out[#out + 1] = thenAssignInd .. guardName .. " = " .. thenExpr
+				out[#out + 1] = lines[i + 2]
+				out[#out + 1] = lines[i + 3]
+				out[#out + 1] = lines[i + 4]
+				out[#out + 1] = lines[i + 5]
+				i = i + 6
+				fixed = true
+			end
+		end
+		if not fixed then
+			out[#out + 1] = lines[i]
+			i = i + 1
+		end
+	end
+	return out
+end
+
 local function fixGuardedLookupFallbackReturn(lines)
 	local out = {}
 	local i = 1
@@ -7169,7 +7251,7 @@ local function restoreFirstMatchLoopBreaks(lines)
 						if lines[j]:find("^%s*local%s+" .. luaPE(targetName) .. "%f[^%a_%d]") or lines[j]:find("^%s*" .. luaPE(targetName) .. "%s*=") then
 							break
 						end
-						if countIdentUsesOutsideStrings(lines[j], targetName) > 0 or lineHasAnyIdent(lines[j], { [targetName] = true }) then
+						if countIdentUsesOutsideStrings(lines[j], targetName) > 0 then
 							usedLater = true
 							break
 						end
@@ -8660,6 +8742,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = foldTableHashInitializers(lines)
 	lines = inlineSingleUseTempLocals(lines)
 	lines = fixGuardReturnBeforeFallbackLocal(lines)
+	lines = fixNilPhiGuardAssignments(lines, indentUnit)
 	lines = fixGuardedLookupFallbackReturn(lines)
 	lines = dropLoadbArtifacts(lines)
 	lines = dropUnknownOpArtifacts(lines)
