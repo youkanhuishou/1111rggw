@@ -58,7 +58,7 @@ local ROBLOX_OPCODES = {
 	[140] = "LOADN",
 	[144] = "ORK",
 	[149] = "ADDK",
-	[154] = "JUMPIFNOTEQ",
+	[154] = "JUMPIFEQ",
 	[158] = "FASTCALL2K",
 	[159] = "CALL",
 	[163] = "PREPVARARGS",
@@ -2191,7 +2191,17 @@ local function analyzeProtoFlow(p, bc)
 						and onlyFallbackWriteBetween(nextPc + nextInfo.len, mergePc, fallbackWrite.pc)
 						and regReadBeforeWrite(p, reg, mergePc, #p.code - 1)
 					then
-						addNilPhiHintsForWrites(reg, mergePc, { write, fallbackWrite })
+						local branchWrites = {}
+						local initWrite = lastWriteBefore(reg, write.pc)
+						if initWrite
+							and initWrite.opName == "LOADNIL"
+							and not firstWriteBetween(reg, initWrite.pc + 1, write.pc)
+						then
+							branchWrites[#branchWrites+1] = initWrite
+						end
+						branchWrites[#branchWrites+1] = write
+						branchWrites[#branchWrites+1] = fallbackWrite
+						addNilPhiHintsForWrites(reg, mergePc, branchWrites)
 					end
 				end
 			end
@@ -2990,6 +3000,25 @@ local function deriveSetupvalWriteName(bc, childId, upvalueIdx)
 	return nil
 end
 
+local function childWritesUpvalue(bc, childId, upvalueIdx)
+	local child = protoAt(bc, childId)
+	if not child then return false end
+	local pc = 0
+	while pc < #child.code do
+		local insn = codeWordAt(child, pc)
+		local op = bit32_band(insn, 0xFF)
+		local opName = OPCODES[op] or ""
+		if opName == "SETUPVAL" then
+			local b = bit32_band(bit32_rshift(insn, 16), 0xFF)
+			if b == upvalueIdx then
+				return true
+			end
+		end
+		pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+	end
+	return false
+end
+
 local function propagateUpvalueNames(protoIdx, bc, visited)
 	visited = visited or {}
 	if visited[protoIdx] then return end
@@ -3769,6 +3798,22 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			args = table.concat(argParts, ", ")
 		end
 		local callExpr = callee .. "(" .. args .. ")"
+		local closureWriteCaptures = regs.__closureWriteCaptures
+		if closureWriteCaptures and (callee == "pcall" or callee == "xpcall") then
+			local callbackExpr = regs[a + 1]
+			local writableCaptures = type(callbackExpr) == "string" and closureWriteCaptures[callbackExpr] or nil
+			if writableCaptures then
+				for _, capture in ipairs(writableCaptures) do
+					if type(capture) == "table"
+						and type(capture.reg) == "number"
+						and type(capture.name) == "string"
+						and isValidIdent(capture.name)
+					then
+						regs[capture.reg] = capture.name
+					end
+				end
+			end
+		end
 		if c == 1 then
 			return indent .. callExpr, 0
 		end
@@ -4009,12 +4054,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 				return nil, 0
 			end
 		end
-		local cond = opName == "JUMPIF" and rname(a) or ("not " .. rname(a))
+		local rawCond = rname(a)
+		local cond = opName == "JUMPIF" and rawCond or ("not " .. rawCond)
 		return indent .. "if " .. cond .. " then goto pc" .. tostring(pc + b + 1) .. " end", 0
 	end
 
 	if opName == "JUMPIFEQ" or opName == "JUMPIFLE" or opName == "JUMPIFLT" or opName == "JUMPIFNOTEQ" or opName == "JUMPIFNOTLE" or opName == "JUMPIFNOTLT" then
-		local notFlag = bit32_band(bit32_rshift(aux or 0, 31), 1)
 		local rb = bit32_band(aux or 0, 0x7FFFFFFF)
 		local baseSymbols = {
 			JUMPIFEQ = "==",
@@ -4033,9 +4078,6 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			[">="] = "<",
 		}
 		local symbol = baseSymbols[opName]
-		if notFlag ~= 0 then
-			symbol = negate[symbol]
-		end
 		return indent .. "if " .. rname(a) .. " " .. symbol .. " " .. rname(rb) .. " then goto pc" .. tostring(pc + d + 1) .. " end", 0
 	end
 
@@ -8209,11 +8251,24 @@ local function liftConditionalFallback(lines, indentUnit)
 					local v1 = r1:match("^return%s+(.+)$")
 					local v2 = r2:match("^return%s+(.+)$")
 					if v1 and v2 then
-						local nc = negateCond(cond)
-						out[#out+1] = mi .. "return " .. wrapForAnd(nc) .. " or (" .. wrapForAnd(v1) .. " or " .. wrapForAnd(v2) .. ")"
-						i = i + 5
-						changed = true
-						folded = true
+						local tv1 = v1:match("^%s*(.-)%s*$")
+						local tv2 = v2:match("^%s*(.-)%s*$")
+						if tv1 == tv2 then
+							out[#out+1] = mi .. "return " .. tv1
+							i = i + 5
+							changed = true
+							folded = true
+						elseif tv1 == "true" and tv2 == "false" then
+							out[#out+1] = mi .. "return " .. cond
+							i = i + 5
+							changed = true
+							folded = true
+						elseif tv1 == "false" and tv2 == "true" then
+							out[#out+1] = mi .. "return " .. negateCond(cond)
+							i = i + 5
+							changed = true
+							folded = true
+						end
 					end
 				end
 			end
@@ -8729,10 +8784,12 @@ local function decompileProto(p, bc, protoIdx)
 			closureName = pendingClosureProtoId ~= nil and ("anon" .. tostring(pendingClosureProtoId)) or "anon_unknown"
 		end
 		regs[pendingClosureTarget] = closureName
+		regs.__closureWriteCaptures = regs.__closureWriteCaptures or {}
 		if #pendingClosureCaps > 0 then
 			local capDescs = {}
 			local hasParentCapture = false
 			local materialized = {}
+			local writableCaptures = nil
 			local childRenameHints = bc.upvalueRenameHints and pendingClosureProtoId ~= nil and bc.upvalueRenameHints[pendingClosureProtoId] or nil
 			for capIdx, cap in ipairs(pendingClosureCaps) do
 				local childUpvalue = childProto and childProto.upvalues[capIdx] or nil
@@ -8762,9 +8819,25 @@ local function decompileProto(p, bc, protoIdx)
 				else
 					push(capDescs, cap.expr)
 				end
+				if pendingClosureProtoId ~= nil
+					and (cap.kind == "VAL" or cap.kind == "REF")
+					and childWritesUpvalue(bc, pendingClosureProtoId, capIdx - 1)
+					and type(cap.reg) == "number"
+					and type(cap.captureName or cap.semanticName or cap.expr) == "string"
+					and isValidIdent(cap.captureName or cap.semanticName or cap.expr)
+				then
+					writableCaptures = writableCaptures or {}
+					push(writableCaptures, {
+						reg = cap.reg,
+						name = cap.captureName or cap.semanticName or cap.expr,
+					})
+				end
 				if cap.kind == "VAL" or cap.kind == "REF" or cap.kind == "UPVAL" or cap.kind == "UPREF" then
 					hasParentCapture = true
 				end
+			end
+			if writableCaptures and #writableCaptures > 0 then
+				regs.__closureWriteCaptures[closureName] = writableCaptures
 			end
 			local tag = hasParentCapture and " [parent-local capture]" or ""
 			push(out, bodyIndent .. "-- " .. closureName .. " captures: " .. table.concat(capDescs, ", ") .. tag)
@@ -8798,10 +8871,16 @@ local function decompileProto(p, bc, protoIdx)
 			if kind == "VAL" or kind == "REF" then
 				local capIdx = #pendingClosureCaps
 				local semanticName = pendingClosureProtoId ~= nil and (deriveSetupvalWriteName(bc, pendingClosureProtoId, capIdx) or deriveUpvalueSemanticName(bc, pendingClosureProtoId, capIdx, {})) or nil
+				local capExpr = regRepr(regs, p, b, pc)
+				local captureName = localAt(p, b, pc) or localAt(p, b, math.max(0, pc - 1))
+				if not (type(captureName) == "string" and isValidIdent(captureName)) then
+					captureName = type(capExpr) == "string" and isValidIdent(capExpr) and capExpr or nil
+				end
 				push(pendingClosureCaps, {
 					kind = kind,
-					expr = regRepr(regs, p, b, pc),
+					expr = capExpr,
 					reg = b,
+					captureName = captureName,
 					semanticName = semanticName,
 				})
 			else
