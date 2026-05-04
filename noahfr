@@ -3498,7 +3498,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
 		local valuePhiAssigned = assignHintedValue(a, src, valuePhiHint)
 		if valuePhiAssigned then
-			return valuePhiAssigned, 0
+			-- suppress self-assignment no-ops (X = X) that arise when hint name matches src
+			local lhs = valuePhiAssigned:match("^%s*local%s+([%a_][%w_]*)%s*=") or valuePhiAssigned:match("^%s*([%a_][%w_]*)%s*=")
+			if not (lhs and lhs == src and not (valuePhiHint and valuePhiHint.declare)) then
+				return valuePhiAssigned, 0
+			end
+			-- self-assignment: register already set by assignHintedValue, just skip emission
 		end
 		local nilPhiHint = flowAnalysis and flowAnalysis.nilPhiHints and flowAnalysis.nilPhiHints[pc] or nil
 		if nilPhiHint and nilPhiHint.targetName and isValidIdent(nilPhiHint.targetName) then
@@ -3513,6 +3518,10 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		if branchValueHint and branchValueHint.targetName and isValidIdent(branchValueHint.targetName) then
 			local targetName = sanitizeLocalName(branchValueHint.targetName, a)
 			regs[a] = targetName
+			-- suppress self-assignment no-ops (X = X)
+			if targetName == src then
+				return nil, 0
+			end
 			return indent .. targetName .. " = " .. src, 0
 		end
 		local aliasHint = flowAnalysis and flowAnalysis.moveAliasHints and flowAnalysis.moveAliasHints[pc] or nil
@@ -3533,6 +3542,10 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 				targetLocal = preferredTracked
 			end
 			regs[a] = targetLocal
+			-- suppress self-assignment no-ops (X = X) that arise when src and dst get the same name
+			if targetLocal == src then
+				return nil, 0
+			end
 			return indent .. targetLocal .. " = " .. src, 0
 		end
 		if a < p.numparams then
@@ -3640,15 +3653,6 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local key = keyConst and keyConst.kind == "string" and keyConst.value or ("K[" .. tostring(idx) .. "]")
 		local baseExpr = rname(b)
 		local expr = baseExpr .. luaIndexSuffix(key)
-		local nilPhiAssigned = assignNilPhiValue(a, expr)
-		if nilPhiAssigned then
-			return nilPhiAssigned, 0
-		end
-		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
-		local valuePhiAssigned = assignHintedValue(a, expr, valuePhiHint)
-		if valuePhiAssigned then
-			return valuePhiAssigned, 0
-		end
 		local nextPc = pc + getOpLength(opName)
 		local nextInfo = nextPc < #p.code and decodedInsnAt(p, nextPc) or nil
 		if nextInfo and nextInfo.opName == "JUMPIF" and nextInfo.a == a then
@@ -3751,6 +3755,15 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 					return indent .. "local " .. targetName .. " = ((" .. baseExpr .. ") and (" .. expr .. ")) or nil", nextInfo.len + fallbackInfo.len
 				end
 			end
+		end
+		local nilPhiAssigned = assignNilPhiValue(a, expr)
+		if nilPhiAssigned then
+			return nilPhiAssigned, 0
+		end
+		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+		local valuePhiAssigned = assignHintedValue(a, expr, valuePhiHint)
+		if valuePhiAssigned then
+			return valuePhiAssigned, 0
 		end
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
@@ -5051,6 +5064,22 @@ local function dropUnknownOpArtifacts(lines)
 	for _, line in ipairs(lines) do
 		if line:match("^%s*%-%-%s+ROBLOX_OP_%d+%s+") then
 			-- skip
+		else
+			out[#out+1] = line
+		end
+	end
+	return out
+end
+
+-- Remove self-assignment no-op lines: `<indent>X = X` where both sides are the same identifier.
+-- These arise from MOVE Rdst = Rsrc when both registers share the same name.
+local function dropSelfAssignmentNoops(lines)
+	local out = {}
+	for _, line in ipairs(lines) do
+		local name = line:match("^%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+		-- only drop if: exactly "INDENT NAME = NAME" (bare assignment, no `local`, same ident both sides)
+		if name and line:match("^%s+([%a_][%w_]*)%s*=%s*%1%s*$") and not line:match("^%s*local%s") then
+			-- self-assignment no-op: skip
 		else
 			out[#out+1] = line
 		end
@@ -6788,10 +6817,27 @@ local function foldTableHashInitializers(lines)
 					if mutName and pendingLocals[mutName] then
 						mutatedLocals[mutName] = true
 					end
+					-- also detect bare assignment mutations inside nested blocks (any deeper indentation)
+					-- e.g. "    X = nil" or "    X = val" inside an if/else block
+					if not mutName then
+						local bareName = lines[j]:match("^%s+([%a_][%w_]*)%s*=[^=~<>]")
+						if bareName and pendingLocals[bareName] and not lines[j]:match("^%s+local%s") then
+							mutatedLocals[bareName] = true
+						end
+						-- also detect "local X = nil" (re-declaration shadowing outer pendingLocal)
+						-- LOADNIL can emit "local X = nil" when the startpc aligns; this shadows the outer local
+						local shadowNilName = lines[j]:match("^%s+local%s+([%a_][%w_]*)%s*=%s*nil%s*$")
+						if shadowNilName and pendingLocals[shadowNilName] then
+							mutatedLocals[shadowNilName] = true
+						end
+					end
 					-- accept interleaved local declarations that don't reference nm
 					local declName, declRhs = lines[j]:match("^" .. luaPE(ind) .. "local%s+([%a_][%w_]*)%s*=%s*(.+)%s*$")
 					if declName and declName ~= nm and not declRhs:find(identPat(nm)) then
-						pendingLocals[declName] = { rhs = declRhs:match("^(.-)%s*$"), lineIdx = j }
+						-- Only add to pendingLocals if not already marked as mutated
+						if not mutatedLocals[declName] then
+							pendingLocals[declName] = { rhs = declRhs:match("^(.-)%s*$"), lineIdx = j }
+						end
 						j = j + 1
 					else
 						-- accept any other passthrough line that does NOT reference nm
@@ -8377,7 +8423,8 @@ local function liftMixedGuardOrPair(lines, indentUnit)
 				local ei = matchEnd(lines[i+2])
 				if ai and ei and ei == gi then
 					local varPat, rhs = dv:match("^([%a_][%a_%d%.]*)%s*=%s*(.+)$")
-					if varPat and rhs then
+					local trimmedRhs = rhs and rhs:match("^%s*(.-)%s*$") or nil
+					if varPat and rhs and trimmedRhs ~= "nil" then
 						out[#out+1] = gi .. varPat .. " = " .. negCond .. " and " .. varPat .. " or " .. rhs
 						i = i + 3
 						changed = true
@@ -8807,6 +8854,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = fixInvalidGenericForHeaders(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
 	lines = foldTableHashInitializers(lines)
+	lines = dropSelfAssignmentNoops(lines)
 	lines = fixGuardReturnBeforeFallbackLocal(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
 
