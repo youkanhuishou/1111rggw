@@ -1074,7 +1074,7 @@ local function formatDisasm(pc, opName, a, b, c, d, e, aux, p)
 		return opName .. " -> pc" .. tostring(pc + d + 1)
 	end
 	if opName == "JUMPIF" or opName == "JUMPIFNOT" then
-		return opName .. " R" .. tostring(a) .. " -> pc" .. tostring(pc + b + 1)
+		return opName .. " R" .. tostring(a) .. " -> pc" .. tostring(pc + d + 1)
 	end
 	if opName == "NEWCLOSURE" then
 		local childId = childProtoIdAt(p, d)
@@ -1247,7 +1247,7 @@ end
 local function jumpTargetForInsn(info)
 	local opName = info.opName
 	if opName == "JUMPIF" or opName == "JUMPIFNOT" then
-		return info.pc + info.b + 1
+		return info.pc + info.d + 1
 	end
 	if opName == "JUMP"
 		or opName == "JUMPBACK"
@@ -6785,6 +6785,11 @@ local function foldTableHashInitializers(lines)
 			local consumedLines = {} -- set of line indices consumed by the fold (to skip)
 			local fieldAssignLines = {} -- set of line indices that are nm.X = ... (handled inside fold)
 			local lastUsedJ = i
+			-- Track simple-identifier field RHS values that were NOT inlined (used by name).
+			-- If any such variable is mutated after its field assignment, the fold would evaluate
+			-- the variable AFTER the mutation (wrong semantics), so we must abort the fold.
+			local lockedRhsNames = {}
+			local lockedRhsMutated = false
 			local j = i + 1
 			while j <= #lines do
 				local fieldKey, fieldRhs = lines[j]:match("^" .. luaPE(ind) .. luaPE(nm) .. "%.([%a_][%w_]*)%s*=%s*(.+)%s*$")
@@ -6793,11 +6798,18 @@ local function foldTableHashInitializers(lines)
 					local rhsTrim = fieldRhs:match("^(.-)%s*$")
 					-- if rhsTrim is exactly a name from pendingLocals AND not mutated, inline its rhs
 					local pl = pendingLocals[rhsTrim]
+					local wasInlined = false
 					if pl and not mutatedLocals[rhsTrim] then
 						local origName = rhsTrim
 						rhsTrim = pl.rhs
 						consumedLines[pl.lineIdx] = true
 						pendingLocals[origName] = nil
+						wasInlined = true
+					end
+					-- If rhsTrim is a plain identifier and was NOT inlined, lock it:
+					-- a later mutation of this variable would make the fold semantically wrong.
+					if not wasInlined and rhsTrim:match("^[%a_][%w_]*$") then
+						lockedRhsNames[rhsTrim] = true
 					end
 					local existingIdx = seenKeys[fieldKey]
 					if existingIdx then
@@ -6821,14 +6833,28 @@ local function foldTableHashInitializers(lines)
 					-- e.g. "    X = nil" or "    X = val" inside an if/else block
 					if not mutName then
 						local bareName = lines[j]:match("^%s+([%a_][%w_]*)%s*=[^=~<>]")
-						if bareName and pendingLocals[bareName] and not lines[j]:match("^%s+local%s") then
-							mutatedLocals[bareName] = true
+						if bareName and not lines[j]:match("^%s+local%s") then
+							if pendingLocals[bareName] then
+								mutatedLocals[bareName] = true
+							end
+							-- abort fold if a locked (non-inlined) field RHS variable is mutated
+							if lockedRhsNames[bareName] then
+								lockedRhsMutated = true
+								break
+							end
 						end
 						-- also detect "local X = nil" (re-declaration shadowing outer pendingLocal)
 						-- LOADNIL can emit "local X = nil" when the startpc aligns; this shadows the outer local
 						local shadowNilName = lines[j]:match("^%s+local%s+([%a_][%w_]*)%s*=%s*nil%s*$")
-						if shadowNilName and pendingLocals[shadowNilName] then
-							mutatedLocals[shadowNilName] = true
+						if shadowNilName then
+							if pendingLocals[shadowNilName] then
+								mutatedLocals[shadowNilName] = true
+							end
+							-- also abort fold if a locked RHS name is shadow-nil'd
+							if lockedRhsNames[shadowNilName] then
+								lockedRhsMutated = true
+								break
+							end
 						end
 					end
 					-- accept interleaved local declarations that don't reference nm
@@ -6849,7 +6875,8 @@ local function foldTableHashInitializers(lines)
 			-- trim trailing passthrough lines beyond last folded field
 			j = lastUsedJ + 1
 			-- only fold if we actually consumed at least one nm.X = ... line (otherwise it's a no-op rewrap)
-			local meaningful = lastUsedJ > i and #pairs_ >= 2
+			-- also abort if any field's non-inlined RHS variable was mutated after the field assignment
+			local meaningful = lastUsedJ > i and #pairs_ >= 2 and not lockedRhsMutated
 			if meaningful then
 				-- Output any unconsumed lines (passthrough) in order
 				for k = i + 1, j - 1 do
