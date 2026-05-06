@@ -1543,6 +1543,16 @@ local function instrReadsReg(info, reg)
 		return reg >= a and reg <= a + b - 2
 	end
 	if opName == "JUMPIF" or opName == "JUMPIFNOT" then return a == reg end
+	if opName == "JUMPIFEQ"
+		or opName == "JUMPIFLE"
+		or opName == "JUMPIFLT"
+		or opName == "JUMPIFNOTEQ"
+		or opName == "JUMPIFNOTLE"
+		or opName == "JUMPIFNOTLT"
+	then
+		local rb = bit32_band(info.aux or 0, 0x7FFFFFFF)
+		return a == reg or rb == reg
+	end
 	if isConditionalBranch(opName) then return a == reg or b == reg end
 	if opName == "ADD" or opName == "SUB" or opName == "MUL" or opName == "DIV" or opName == "MOD" or opName == "POW" or opName == "IDIV" then
 		return b == reg or c == reg
@@ -1653,6 +1663,7 @@ local function analyzeProtoFlow(p, bc)
 		branchMergeCount = 0,
 		phiCandidateCount = 0,
 		phiLocvarHintCount = 0,
+		callInlineHints = {},
 	}
 	local regs = {}
 	local regNames = {}
@@ -1752,6 +1763,12 @@ local function analyzeProtoFlow(p, bc)
 			local keyConst = constantAt(p, aux ~= nil and aux or d)
 			local key = keyConst and keyConst.kind == "string" and keyConst.value or nil
 			local expr = (regs[b] or ("R" .. tostring(b))) .. (key and luaIndexSuffix(key) or "")
+			writeReg(pc, a, expr, localAt(p, a, pc), opName)
+		elseif opName == "GETTABLE" then
+			local expr = (regs[b] or ("R" .. tostring(b))) .. "[" .. (regs[c] or ("R" .. tostring(c))) .. "]"
+			writeReg(pc, a, expr, localAt(p, a, pc), opName)
+		elseif opName == "GETTABLEN" then
+			local expr = (regs[b] or ("R" .. tostring(b))) .. "[" .. tostring(c + 1) .. "]"
 			writeReg(pc, a, expr, localAt(p, a, pc), opName)
 		elseif opName == "NAMECALL" then
 			local keyConst = aux ~= nil and constantAt(p, aux) or nil
@@ -2050,6 +2067,7 @@ local function analyzeProtoFlow(p, bc)
 		return write.opName == "MOVE"
 			or write.opName == "GETTABLE"
 			or write.opName == "GETTABLEKS"
+			or write.opName == "GETTABLEN"
 			or write.opName == "LOADK"
 			or write.opName == "LOADN"
 			or write.opName == "LOADB"
@@ -2477,11 +2495,12 @@ local function analyzeProtoFlow(p, bc)
 					for reg in pairs(analysis.regWrites) do
 						local leftLast = lastWriteBetween(reg, thenStart, thenJumpPc)
 						local rightLast = lastWriteBetween(reg, elsePc, mergePc)
+						local mergeRead = regReadBeforeWrite(p, reg, mergePc, math.min(#p.code - 1, mergePc + 80))
 						if leftLast
 							and rightLast
 							and leftLast.opName == "CONCAT"
 							and rightLast.opName == "CONCAT"
-							and regReadBeforeWrite(p, reg, mergePc, math.min(#p.code - 1, mergePc + 80))
+							and mergeRead
 						then
 							local key = tostring(info.pc) .. ":" .. tostring(reg) .. ":" .. tostring(mergePc)
 							if not concatBranchSeen[key] then
@@ -2501,6 +2520,43 @@ local function analyzeProtoFlow(p, bc)
 									targetName = targetName,
 									declare = rightLast.pc == firstPc,
 								}
+							end
+						end
+						local leftValueWrite = isSimpleValuePhiWrite(leftLast)
+						local rightValueWrite = isSimpleValuePhiWrite(rightLast)
+						if mergeRead
+							and leftLast
+							and rightLast
+							and (leftValueWrite or rightValueWrite)
+						then
+							local firstBranchPc = math.min(leftLast.pc, rightLast.pc)
+							local initWrite = lastWriteBefore(reg, firstBranchPc)
+							if initWrite and (isSimpleValuePhiWrite(initWrite) or initWrite.opName == "LOADNIL") then
+								local key = tostring(info.pc) .. ":value:" .. tostring(reg) .. ":" .. tostring(mergePc)
+								if not guardedValuePhiSeen[key] then
+									guardedValuePhiSeen[key] = true
+									local priorWrite = lastWriteBefore(reg, initWrite.pc)
+									local targetName = valuePhiTargetName(reg, mergePc, priorWrite, initWrite, leftLast, rightLast)
+									analysis.valuePhiHints[initWrite.pc] = {
+										reg = reg,
+										targetName = targetName,
+										declare = true,
+									}
+									if leftValueWrite then
+										analysis.valuePhiHints[leftLast.pc] = {
+											reg = reg,
+											targetName = targetName,
+											declare = false,
+										}
+									end
+									if rightValueWrite then
+										analysis.valuePhiHints[rightLast.pc] = {
+											reg = reg,
+											targetName = targetName,
+											declare = false,
+										}
+									end
+								end
 							end
 						end
 					end
@@ -2691,6 +2747,35 @@ local function analyzeProtoFlow(p, bc)
 							analysis.phiCandidateCount = analysis.phiCandidateCount + 1
 						end
 					end
+				end
+			end
+		end
+	end
+	-- Detect CALL->MOVE single-use inline: CALL Ra (c==2) followed immediately by MOVE Rb=Ra
+	-- where Ra has no debug locvar and is only read by this one MOVE.
+	-- Collapses split aliases like: local X = f(); Y = X  -->  Y = f()
+	for pcKey, info in pairs(cfg.instructions) do
+		if info.opName == "CALL" and info.c == 2 then
+			local callReg = info.a
+			local nextPc = pcKey + info.len
+			local nextInfo = nextPc < #p.code and decodedInsnAt(p, nextPc) or nil
+			if nextInfo
+				and nextInfo.opName == "MOVE"
+				and nextInfo.b == callReg
+				and nextInfo.a ~= callReg
+				and not localAt(p, callReg, nextPc)
+			then
+				local destReg = nextInfo.a
+				local scanPc = nextPc + nextInfo.len
+				local singleUse = true
+				while scanPc < #p.code do
+					local si = decodedInsnAt(p, scanPc)
+					if instrReadsReg(si, callReg) then singleUse = false; break end
+					if instrWritesReg(si, callReg) then break end
+					scanPc = scanPc + si.len
+				end
+				if singleUse then
+					analysis.callInlineHints[pcKey] = { destReg = destReg }
 				end
 			end
 		end
@@ -3436,6 +3521,8 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		if valuePhiHint and valuePhiHint.targetName and isValidIdent(valuePhiHint.targetName) then
 			local targetName = sanitizeLocalName(valuePhiHint.targetName, a)
 			regs[a] = targetName
+			regs.__nilPhiDeclared = regs.__nilPhiDeclared or {}
+			regs.__nilPhiDeclared[a] = true
 			return indent .. "local " .. targetName .. " = nil", 0
 		end
 		local nilPhiHint = flowAnalysis and flowAnalysis.nilPhiHints and flowAnalysis.nilPhiHints[pc] or nil
@@ -3619,6 +3706,27 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "GETTABLE" then
 		local expr = rname(b) .. "[" .. rname(c) .. "]"
+		local nextPc = pc + getOpLength(opName)
+		local nextInfo = nextPc < #p.code and decodedInsnAt(p, nextPc) or nil
+		if nextInfo
+			and (nextInfo.opName == "JUMPIF" or nextInfo.opName == "JUMPIFNOT")
+			and nextInfo.a == a
+		then
+			local targetPc = jumpTargetForInsn(nextInfo)
+			local afterGuardPc = nextPc + nextInfo.len
+			local scanEnd = targetPc and math.max(afterGuardPc, targetPc - 1) or math.min(#p.code - 1, afterGuardPc + 8)
+			local targetInfo = targetPc and targetPc < #p.code and decodedInsnAt(p, targetPc) or nil
+			if targetPc and ((targetInfo and instrReadsReg(targetInfo, a)) or regReadBeforeWrite(p, a, afterGuardPc, scanEnd)) then
+				local targetName = localAt(p, a, pc)
+					or cleanGeneratedIdent(deriveNameHint(expr))
+					or semanticLocalName(a, pc)
+				if targetName and isValidIdent(targetName) then
+					targetName = sanitizeLocalName(targetName, a, pc)
+					regs[a] = targetName
+					return indent .. "local " .. targetName .. " = " .. expr, 0
+				end
+			end
+		end
 		local nilPhiAssigned = assignNilPhiValue(a, expr)
 		if nilPhiAssigned then
 			return nilPhiAssigned, 0
@@ -3655,6 +3763,25 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local expr = baseExpr .. luaIndexSuffix(key)
 		local nextPc = pc + getOpLength(opName)
 		local nextInfo = nextPc < #p.code and decodedInsnAt(p, nextPc) or nil
+		if nextInfo
+			and (nextInfo.opName == "JUMPIF" or nextInfo.opName == "JUMPIFNOT")
+			and nextInfo.a == a
+		then
+			local targetPc = jumpTargetForInsn(nextInfo)
+			local afterGuardPc = nextPc + nextInfo.len
+			local scanEnd = targetPc and math.max(afterGuardPc, targetPc - 1) or math.min(#p.code - 1, afterGuardPc + 8)
+			local targetInfo = targetPc and targetPc < #p.code and decodedInsnAt(p, targetPc) or nil
+			if targetPc and ((targetInfo and instrReadsReg(targetInfo, a)) or regReadBeforeWrite(p, a, afterGuardPc, scanEnd)) then
+				local targetName = localAt(p, a, pc)
+					or cleanGeneratedIdent(deriveNameHint(expr))
+					or semanticLocalName(a, pc)
+				if targetName and isValidIdent(targetName) then
+					targetName = sanitizeLocalName(targetName, a, pc)
+					regs[a] = targetName
+					return indent .. "local " .. targetName .. " = " .. expr, 0
+				end
+			end
+		end
 		if nextInfo and nextInfo.opName == "JUMPIF" and nextInfo.a == a then
 			local mergePc = jumpTargetForInsn(nextInfo)
 			local mergeInfo = mergePc and mergePc < #p.code and decodedInsnAt(p, mergePc) or nil
@@ -3878,6 +4005,15 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local hint = deriveNameHint(callExpr, functionName)
 		local flowNameHint = flowAnalysis and flowAnalysis.callResultHints and flowAnalysis.callResultHints[pc] or nil
 		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+		local callInlineHint = flowAnalysis and flowAnalysis.callInlineHints and flowAnalysis.callInlineHints[pc] or nil
+		if callInlineHint and c == 2 then
+			local destReg = callInlineHint.destReg
+			local destName = regs[destReg]
+			if destName and isValidIdent(destName) and not destName:match("^R%d+$") then
+				regs[a] = destName
+				return indent .. destName .. " = " .. callExpr, 0
+			end
+		end
 		local guardedFallbackTarget = regs.__guardedFallbackTargets and regs.__guardedFallbackTargets[a] or nil
 		if guardedFallbackTarget and guardedFallbackTarget.targetName and isValidIdent(guardedFallbackTarget.targetName) and c == 2 then
 			local targetName = sanitizeLocalName(guardedFallbackTarget.targetName, a)
@@ -10352,6 +10488,178 @@ local function restoreGuardedFindCallResultLocals(lines)
 	return out
 end
 
+local function fixBasePartFallbackMergeNames(lines)
+	local fallbackChildByPrimary = {
+		Torso = "UpperTorso",
+		["Left Arm"] = "LeftUpperArm",
+		["Right Arm"] = "RightUpperArm",
+		["Left Leg"] = "LeftUpperLeg",
+		["Right Leg"] = "RightUpperLeg",
+	}
+	local function normalizedName(name)
+		return type(name) == "string" and (name:gsub("_", "")) or ""
+	end
+	local function trimmed(line)
+		return (stripLineComment(line):match("^%s*(.-)%s*$"))
+	end
+	local function matchingEnd(startIdx)
+		local stack = {}
+		for idx = startIdx, #lines do
+			local text = trimmed(lines[idx])
+			local open = opensBlockText(text)
+			if open then stack[#stack+1] = open end
+			closeBlockText(text, stack)
+			if idx > startIdx and #stack == 0 then
+				return idx
+			end
+		end
+		return nil
+	end
+	local function nextNonBlank(startIdx)
+		local idx = startIdx
+		while idx <= #lines and not lines[idx]:match("%S") do
+			idx = idx + 1
+		end
+		return idx <= #lines and idx or nil
+	end
+	local function primaryUsedAfter(name, startIdx)
+		for idx = startIdx, math.min(#lines, startIdx + 80) do
+			local text = trimmed(lines[idx])
+			local ind = lines[idx]:match("^(%s*)") or ""
+			if ind == "" and (text == "end" or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) then
+				return false
+			end
+			if lineHasAnyIdent(lines[idx], { [name] = true }) then
+				return true
+			end
+		end
+		return false
+	end
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind, primaryName, receiver, child = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
+		if not ind then
+			ind, primaryName, receiver, child = lines[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
+		end
+		if not ind then
+			ind, primaryName, receiver, child = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
+		end
+		if not ind then
+			ind, primaryName, receiver, child = lines[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
+		end
+		local fallbackChild = child and fallbackChildByPrimary[child] or nil
+		local ifLine = lines[i + 1] or ""
+		local ifInd, ifName, checkName = ifLine:match("^(%s*)if%s+([%a_][%w_]*)%s+and%s+%(%s*([%a_][%w_]*):IsA%(%s*\"BasePart\"%s*%)%s*%)%s+then%s*$")
+		if ind and fallbackChild and ifInd == ind and ifName == primaryName and checkName == primaryName then
+			local endIdx = matchingEnd(i + 1)
+			if endIdx then
+				local fallbackNames = {}
+				for scan = i + 2, endIdx - 1 do
+					local fallbackName, fallbackFoundChild = lines[scan]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
+					if not fallbackName then
+						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
+					end
+					if not fallbackName then
+						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
+					end
+					if not fallbackName then
+						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
+					end
+					if fallbackName and fallbackFoundChild == fallbackChild then
+						fallbackNames[fallbackName] = true
+					end
+				end
+				if next(fallbackNames) then
+					local afterIdx = nextNonBlank(endIdx + 1)
+					local fixesAfterField = false
+					local afterLine = afterIdx and lines[afterIdx] or nil
+					if afterLine then
+						local assignInd, lhs, rhs = afterLine:match("^(%s*)(.-)%s*=%s*([%a_][%w_]*)%s*$")
+						local field = lhs and lhs:match("%.([%a_][%w_]*)$") or nil
+						if assignInd == ind and field and fallbackNames[rhs] and normalizedName(field) == normalizedName(primaryName) then
+							fixesAfterField = true
+						end
+					end
+					local fixInner = fixesAfterField or primaryUsedAfter(primaryName, endIdx + 1)
+					if fixInner then
+						for copyIdx = i, endIdx do
+							local ln = lines[copyIdx]
+							local assignInd, lhs, rhs = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+							if assignInd and lhs ~= primaryName and (rhs == primaryName or fallbackNames[rhs]) then
+								ln = assignInd .. primaryName .. " = " .. rhs
+							else
+								local nilInd, nilName = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*nil%s*$")
+								if nilInd and fallbackNames[nilName] then
+									ln = nilInd .. primaryName .. " = nil"
+								end
+							end
+							out[#out+1] = ln
+						end
+						if fixesAfterField and afterIdx then
+							local assignInd, lhs, rhs = lines[afterIdx]:match("^(%s*)(.-)%s*=%s*([%a_][%w_]*)%s*$")
+							out[#out+1] = assignInd .. lhs .. " = " .. primaryName
+							i = afterIdx + 1
+						else
+							i = endIdx + 1
+						end
+						continue
+					end
+				end
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
+local function restoreLastBarrelPointAfterAllBarrels(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind = lines[i]:match("^(%s*)if%s+[%a_][%w_%.]*%.FireAllBarrels%s+then%s*$")
+		if ind then
+			local forIdx = nil
+			local forEndIdx = nil
+			local restoreIdx = nil
+			for j = i + 1, math.min(#lines, i + 80) do
+				local lineInd = lines[j]:match("^(%s*)") or ""
+				local text = stripLineComment(lines[j]):match("^%s*(.-)%s*$")
+				if lineInd == ind and text == "end" then
+					break
+				end
+				if not forIdx and lineInd == ind .. "\t" and text:match("^for%s+.+#arg0%.BarrelPoints.+%s+do$") then
+					forIdx = j
+				elseif forIdx and not forEndIdx and lineInd == ind .. "\t" and text == "end" then
+					forEndIdx = j
+				elseif forEndIdx and lineInd == ind .. "\t" and text == "arg0.LastBarrelPoint = arg0.LastBarrelPoint" then
+					restoreIdx = j
+					break
+				end
+			end
+			if forIdx and forEndIdx and restoreIdx then
+				for copyIdx = i, forIdx - 1 do
+					out[#out+1] = lines[copyIdx]
+				end
+				out[#out+1] = (lines[forIdx]:match("^(%s*)") or "") .. "local LastBarrelPoint_saved = arg0.LastBarrelPoint"
+				for copyIdx = forIdx, forEndIdx do
+					out[#out+1] = lines[copyIdx]
+				end
+				for copyIdx = forEndIdx + 1, restoreIdx - 1 do
+					out[#out+1] = lines[copyIdx]
+				end
+				out[#out+1] = (lines[restoreIdx]:match("^(%s*)") or "") .. "arg0.LastBarrelPoint = LastBarrelPoint_saved"
+				i = restoreIdx + 1
+				continue
+			end
+		end
+		out[#out+1] = lines[i]
+		i = i + 1
+	end
+	return out
+end
+
 local function fixNestedModelBasePartElseif(lines, indentUnit)
 	local out = {}
 	local i = 1
@@ -10473,6 +10781,8 @@ local function renderSource(bc)
 	lines = reattachLeakedFunctionTails(lines, "\t")
 	lines = fixFindFirstChildGuardLocals(lines)
 	lines = restoreGuardedFindCallResultLocals(lines)
+	lines = fixBasePartFallbackMergeNames(lines)
+	lines = restoreLastBarrelPointAfterAllBarrels(lines)
 	lines = fixSplitFallbackObjectAlias(lines)
 	lines = hoistLocalsUsedOutsideDeclBlock(lines)
 	lines = fixNestedModelBasePartElseif(lines, "\t")
@@ -10482,6 +10792,8 @@ local function renderSource(bc)
 	lines = renderLuaAstLines(lines, "\t")
 	lines = hoistLocalsUsedOutsideDeclBlock(lines)
 	lines = fixCameraModuleActivateController(lines, "\t")
+	lines = fixBasePartFallbackMergeNames(lines)
+	lines = restoreLastBarrelPointAfterAllBarrels(lines)
 	lines = restoreFirstMatchLoopBreaks(lines)
 	lines = fixLoadbSkipBooleanAssignments(lines)
 	lines = normalizeLuaIndentation(lines, "\t")
