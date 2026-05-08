@@ -3717,7 +3717,40 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			local scanEnd = targetPc and math.max(afterGuardPc, targetPc - 1) or math.min(#p.code - 1, afterGuardPc + 8)
 			local targetInfo = targetPc and targetPc < #p.code and decodedInsnAt(p, targetPc) or nil
 			if targetPc and ((targetInfo and instrReadsReg(targetInfo, a)) or regReadBeforeWrite(p, a, afterGuardPc, scanEnd)) then
-				local targetName = localAt(p, a, pc)
+				if nextInfo.opName == "JUMPIF" then
+					local guardFbPc = afterGuardPc
+					local guardFbInfo = guardFbPc < #p.code and decodedInsnAt(p, guardFbPc) or nil
+					local fbSrc = nil
+					if guardFbInfo and guardFbInfo.a == a and guardFbPc + guardFbInfo.len == targetPc then
+						if guardFbInfo.opName == "MOVE" then
+							fbSrc = rname(guardFbInfo.b)
+						elseif guardFbInfo.opName == "GETTABLEKS" then
+							local fbAux2 = OPS_WITH_AUX[guardFbInfo.opName] and guardFbPc + 1 < #p.code and codeWordAt(p, guardFbPc + 1) or nil
+							local fbIdx2 = fbAux2 ~= nil and fbAux2 or guardFbInfo.d
+							local fbKeyConst = constantAt(p, fbIdx2)
+							local fbKey = fbKeyConst and fbKeyConst.kind == "string" and fbKeyConst.value or nil
+							if fbKey then
+								fbSrc = rname(guardFbInfo.b) .. luaIndexSuffix(fbKey)
+							end
+						end
+					end
+					if fbSrc then
+						local guardPhiHint2 = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+						local tname = (guardPhiHint2 and guardPhiHint2.targetName and isValidIdent(guardPhiHint2.targetName) and guardPhiHint2.targetName)
+							or localAt(p, a, guardFbPc)
+							or cleanGeneratedIdent(deriveNameHint(expr))
+							or semanticLocalName(a, pc)
+						if tname and isValidIdent(tname) then
+							tname = sanitizeLocalName(tname, a, guardFbPc)
+							regs[a] = tname
+							local orExpr = "(" .. expr .. " or " .. fbSrc .. ")"
+							return indent .. "local " .. tname .. " = " .. orExpr, nextInfo.len + guardFbInfo.len
+						end
+					end
+				end
+				local guardPhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+				local targetName = (guardPhiHint and guardPhiHint.targetName and isValidIdent(guardPhiHint.targetName) and guardPhiHint.targetName)
+					or localAt(p, a, pc)
 					or cleanGeneratedIdent(deriveNameHint(expr))
 					or semanticLocalName(a, pc)
 				if targetName and isValidIdent(targetName) then
@@ -3772,7 +3805,82 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			local scanEnd = targetPc and math.max(afterGuardPc, targetPc - 1) or math.min(#p.code - 1, afterGuardPc + 8)
 			local targetInfo = targetPc and targetPc < #p.code and decodedInsnAt(p, targetPc) or nil
 			if targetPc and ((targetInfo and instrReadsReg(targetInfo, a)) or regReadBeforeWrite(p, a, afterGuardPc, scanEnd)) then
-				local targetName = localAt(p, a, pc)
+				-- Check: is this actually an or-default? (JUMPIF Ra; fallback Ra=...; merge right after fallback)
+				if nextInfo.opName == "JUMPIF" then
+					local guardFbPc = afterGuardPc
+					local guardFbInfo = guardFbPc < #p.code and decodedInsnAt(p, guardFbPc) or nil
+					local fbSrc = nil
+					if guardFbInfo and guardFbInfo.a == a and guardFbPc + guardFbInfo.len == targetPc then
+						if guardFbInfo.opName == "MOVE" then
+							fbSrc = rname(guardFbInfo.b)
+						elseif guardFbInfo.opName == "GETTABLEKS" then
+							local fbAux2 = OPS_WITH_AUX[guardFbInfo.opName] and guardFbPc + 1 < #p.code and codeWordAt(p, guardFbPc + 1) or nil
+							local fbIdx2 = fbAux2 ~= nil and fbAux2 or guardFbInfo.d
+							local fbKeyConst = constantAt(p, fbIdx2)
+							local fbKey = fbKeyConst and fbKeyConst.kind == "string" and fbKeyConst.value or nil
+							if fbKey then
+								fbSrc = rname(guardFbInfo.b) .. luaIndexSuffix(fbKey)
+							end
+						elseif guardFbInfo.opName == "LOADNIL" then
+							fbSrc = "nil"
+						end
+					end
+					if fbSrc then
+						-- Scan backward for outer JUMPIFNOT guard (for ((base) and (chain)) or fallback)
+						local outerGuardExpr2 = nil
+						local chainStartPc2 = pc
+						local scanBack2 = pc
+						while scanBack2 >= 2 do
+							local candPc2 = scanBack2 - 2
+							if candPc2 >= 0 then
+								local candInfo2 = decodedInsnAt(p, candPc2)
+								if candInfo2.opName == "GETTABLEKS" and candInfo2.a == a and candPc2 + candInfo2.len == scanBack2 then
+									chainStartPc2 = candPc2
+									scanBack2 = candPc2
+								else
+									break
+								end
+							else
+								break
+							end
+						end
+						if chainStartPc2 >= 1 then
+							local outerGuardPc2 = chainStartPc2 - 1
+							local outerGuardInfo2 = outerGuardPc2 >= 0 and decodedInsnAt(p, outerGuardPc2) or nil
+							local outerTarget2 = outerGuardInfo2 and jumpTargetForInsn(outerGuardInfo2) or nil
+							if outerGuardInfo2
+								and outerGuardInfo2.opName == "JUMPIFNOT"
+								and outerGuardInfo2.a ~= a
+								and (outerTarget2 == targetPc or outerTarget2 == guardFbPc)
+							then
+								local outerBase2 = rname(outerGuardInfo2.a)
+								if outerBase2 and isValidIdent(outerBase2) then
+									outerGuardExpr2 = "((" .. outerBase2 .. ") and (" .. expr .. ")) or " .. fbSrc
+								end
+							end
+						end
+						local guardPhiHint2 = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+						local tname = (guardPhiHint2 and guardPhiHint2.targetName and isValidIdent(guardPhiHint2.targetName) and guardPhiHint2.targetName)
+							or localAt(p, a, guardFbPc)
+							or cleanGeneratedIdent(deriveNameHint(expr))
+							or semanticLocalName(a, pc)
+						if tname and isValidIdent(tname) then
+							tname = sanitizeLocalName(tname, a, guardFbPc)
+							regs[a] = tname
+							local orExpr = outerGuardExpr2 or ("(" .. expr .. " or " .. fbSrc .. ")")
+							local declared = regs.__nilPhiDeclared and regs.__nilPhiDeclared[a]
+							local prefix = declared and "" or "local "
+							if not declared then
+								regs.__nilPhiDeclared = regs.__nilPhiDeclared or {}
+								regs.__nilPhiDeclared[a] = true
+							end
+							return indent .. prefix .. tname .. " = " .. orExpr, nextInfo.len + guardFbInfo.len
+						end
+					end
+				end
+				local guardPhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
+				local targetName = (guardPhiHint and guardPhiHint.targetName and isValidIdent(guardPhiHint.targetName) and guardPhiHint.targetName)
+					or localAt(p, a, pc)
 					or cleanGeneratedIdent(deriveNameHint(expr))
 					or semanticLocalName(a, pc)
 				if targetName and isValidIdent(targetName) then
@@ -3880,6 +3988,80 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 					targetName = sanitizeLocalName(targetName, a, fallbackPc)
 					regs[a] = targetName
 					return indent .. "local " .. targetName .. " = ((" .. baseExpr .. ") and (" .. expr .. ")) or nil", nextInfo.len + fallbackInfo.len
+				end
+			end
+		end
+		if nextInfo and nextInfo.opName == "JUMPIF" and nextInfo.a == a then
+			local orMergePc = jumpTargetForInsn(nextInfo)
+			local orFallbackPc = nextPc + nextInfo.len
+			local orFallbackInfo = orFallbackPc < #p.code and decodedInsnAt(p, orFallbackPc) or nil
+			local fallbackSrc = nil
+			
+			if orMergePc and orFallbackInfo and orFallbackInfo.a == a and orFallbackPc + orFallbackInfo.len == orMergePc then
+				if orFallbackInfo.opName == "MOVE" then
+					fallbackSrc = rname(orFallbackInfo.b)
+				elseif orFallbackInfo.opName == "GETTABLEKS" then
+					local fbAux3 = OPS_WITH_AUX[orFallbackInfo.opName] and orFallbackPc + 1 < #p.code and codeWordAt(p, orFallbackPc + 1) or nil
+					local fbIdx3 = fbAux3 ~= nil and fbAux3 or orFallbackInfo.d
+					local fbKeyConst3 = constantAt(p, fbIdx3)
+					local fbKey3 = fbKeyConst3 and fbKeyConst3.kind == "string" and fbKeyConst3.value or nil
+					if fbKey3 then
+						fallbackSrc = rname(orFallbackInfo.b) .. luaIndexSuffix(fbKey3)
+					end
+				end
+			end
+			if fallbackSrc then
+				-- Check for outer JUMPIFNOT guard targeting the same fallback
+				local outerGuardExpr = nil
+				local chainStartPc = pc
+				local scanBack = pc
+				while scanBack >= 2 do
+					local candPc = scanBack - 2
+					if candPc >= 0 then
+						local candInfo = decodedInsnAt(p, candPc)
+						if candInfo.opName == "GETTABLEKS" and candInfo.a == a and candPc + candInfo.len == scanBack then
+							chainStartPc = candPc
+							scanBack = candPc
+						else
+							break
+						end
+					else
+						break
+					end
+				end
+				if chainStartPc >= 1 then
+					local prevPc = chainStartPc - 1
+					if prevPc >= 0 then
+						local prevInfo = decodedInsnAt(p, prevPc)
+						if prevInfo.opName == "JUMPIFNOT"
+							and jumpTargetForInsn(prevInfo) == orFallbackPc
+						then
+							outerGuardExpr = rname(prevInfo.a)
+						end
+					end
+				end
+				local orExpr
+				if outerGuardExpr then
+					orExpr = "((" .. outerGuardExpr .. ") and (" .. expr .. ")) or " .. fallbackSrc
+				else
+					orExpr = "(" .. expr .. " or " .. fallbackSrc .. ")"
+				end
+				local vph = flowAnalysis and flowAnalysis.valuePhiHints
+				local targetName = (vph and vph[pc] and vph[pc].targetName)
+					or (vph and vph[orFallbackPc] and vph[orFallbackPc].targetName)
+					or localAt(p, a, orFallbackPc)
+					or cleanGeneratedIdent(deriveNameHint(expr))
+					or semanticLocalName(a, pc)
+				if targetName and isValidIdent(targetName) then
+					targetName = sanitizeLocalName(targetName, a, orFallbackPc)
+					regs[a] = targetName
+					local declared = regs.__nilPhiDeclared and regs.__nilPhiDeclared[a]
+					local prefix = declared and "" or "local "
+					if not declared then
+						regs.__nilPhiDeclared = regs.__nilPhiDeclared or {}
+						regs.__nilPhiDeclared[a] = true
+					end
+					return indent .. prefix .. targetName .. " = " .. orExpr, nextInfo.len + orFallbackInfo.len
 				end
 			end
 		end
@@ -4240,6 +4422,77 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 				and jumpTargetForInsn(guardInfo) == fallbackPc + fallbackInfo.len
 			then
 				return nil, 0
+			end
+			-- Extended: JUMPIFNOT Ra → Fb; GETTABLEKS chain Rx; JUMPIF Rx → Mg; MOVE Rx=Rf (at Fb)
+			-- Pattern: Rx = ((Ra) and (chain_expr)) or Rf
+			if fallbackInfo and fallbackInfo.opName == "MOVE" then
+				local chainPc = nextPc
+				local chainReg = nil
+				local foundJumpIf = false
+				while chainPc < fallbackPc do
+					local si = decodedInsnAt(p, chainPc)
+					if si.opName == "GETTABLEKS" then
+						if chainReg == nil then
+							if si.b ~= a then break end
+							chainReg = si.a
+						else
+							if si.b ~= chainReg or si.a ~= chainReg then break end
+						end
+						chainPc = chainPc + si.len
+					elseif si.opName == "JUMPIF" and chainReg and si.a == chainReg then
+						local mergePc = jumpTargetForInsn(si)
+						if mergePc
+							and chainPc + si.len == fallbackPc
+							and fallbackInfo.a == chainReg
+							and fallbackPc + fallbackInfo.len == mergePc
+						then
+							foundJumpIf = true
+						end
+						break
+					else
+						break
+					end
+				end
+				if foundJumpIf then
+					return nil, 0
+				end
+			end
+			-- Extended: JUMPIFNOT Ra → Mg; GETTABLEKS chain Rx; JUMPIF Rx → Mg; LOADNIL Rx; Mg
+			-- Pattern: Rx = ((Ra) and (chain_expr)) or nil  (both guards target same merge)
+			do
+				local chainPc2 = nextPc
+				local chainReg2 = nil
+				local foundJumpIfLoadnil = false
+				while chainPc2 < fallbackPc do
+					local si2 = decodedInsnAt(p, chainPc2)
+					if si2.opName == "GETTABLEKS" then
+						if chainReg2 == nil then
+							if si2.b ~= a then break end
+							chainReg2 = si2.a
+						else
+							if si2.b ~= chainReg2 or si2.a ~= chainReg2 then break end
+						end
+						chainPc2 = chainPc2 + si2.len
+					elseif si2.opName == "JUMPIF" and chainReg2 and si2.a == chainReg2 then
+						local jumpMerge2 = jumpTargetForInsn(si2)
+						local loadnilPc2 = chainPc2 + si2.len
+						local loadnilInfo2 = loadnilPc2 < #p.code and decodedInsnAt(p, loadnilPc2) or nil
+						if loadnilInfo2
+							and loadnilInfo2.opName == "LOADNIL"
+							and loadnilInfo2.a == chainReg2
+							and loadnilPc2 == fallbackPc
+							and jumpMerge2 == fallbackPc + loadnilInfo2.len
+						then
+							foundJumpIfLoadnil = true
+						end
+						break
+					else
+						break
+					end
+				end
+				if foundJumpIfLoadnil then
+					return nil, 0
+				end
 			end
 		end
 		local rawCond = rname(a)
