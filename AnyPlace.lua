@@ -7,123 +7,109 @@ local Mouse = LocalPlayer:GetMouse()
 
 LocalPlayer:SetAttribute("buildrange2x", true)
 
-local function waitAndRequire(path)
-    local node = ReplicatedStorage
-    for _, name in ipairs(path) do
-        node = node:WaitForChild(name, 10)
-        if not node then return nil end
-    end
-    local ok, mod = pcall(require, node)
+local function safeRequire(inst)
+    if not inst then return nil end
+    local ok, mod = pcall(require, inst)
     if ok then return mod end
     return nil
 end
 
-local BuildUtils = waitAndRequire({"SharedModules", "BuildUtils"})
+local BuildUtils = safeRequire(ReplicatedStorage:FindFirstChild("SharedModules") and ReplicatedStorage.SharedModules:FindFirstChild("BuildUtils"))
 if BuildUtils then
     BuildUtils.GetBuildRange = function()
         return 99999, 99999, true
     end
 end
 
-local buildlist = waitAndRequire({"buildlist"})
+local buildlist = safeRequire(ReplicatedStorage:FindFirstChild("buildlist"))
 if buildlist and buildlist.builds then
     for _, data in pairs(buildlist.builds) do
         data.norange = true
     end
 end
 
-local filterParams = RaycastParams.new()
-filterParams.FilterType = Enum.RaycastFilterType.Exclude
-filterParams.IgnoreWater = false
+local BridgeNet2 = ReplicatedStorage:FindFirstChild("BridgeNet2")
+local ClientProcess = BridgeNet2 and safeRequire(BridgeNet2:FindFirstChild("src") and BridgeNet2.src:FindFirstChild("Client") and BridgeNet2.src.Client:FindFirstChild("ClientProcess"))
 
-local function getIgnoreList()
-    local list = {}
-    if LocalPlayer.Character then
-        table.insert(list, LocalPlayer.Character)
-    end
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") then
-            if obj:GetAttribute("ghostype") ~= nil then
-                table.insert(list, obj)
-            end
-        end
-    end
-    return list
-end
-
-local function getMouseWorldHit()
-    filterParams.FilterDescendantsInstances = getIgnoreList()
+local function projectMouseTo2DPlane(planeZ)
+    planeZ = planeZ or 0
     local cam = workspace.CurrentCamera
-    if not cam then return nil end
-    local unitRay = cam:ViewportPointToRay(Mouse.X, Mouse.Y)
-    local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * 10000, filterParams)
-    if result then
-        return result.Position, result.Normal
+    if not cam then return Vector3.new(0, 0, planeZ) end
+    local unitRay = cam:ScreenPointToRay(Mouse.X, Mouse.Y, 0)
+    local origin = unitRay.Origin
+    local direction = unitRay.Direction
+    if math.abs(direction.Z) < 1e-5 then
+        return Vector3.new(origin.X, origin.Y, planeZ)
     end
-    return unitRay.Origin + unitRay.Direction * 200, Vector3.new(0, 1, 0)
+    local t = (planeZ - origin.Z) / direction.Z
+    return origin + direction * t
 end
 
-local function findGhosts()
-    local ghosts = {}
+local OVERRIDE_GHOST = true
+local FORCE_VALID_COLOR = true
+
+RunService.PreRender:Connect(function()
+    if not OVERRIDE_GHOST then return end
     for _, obj in ipairs(workspace:GetChildren()) do
         if obj:GetAttribute("ghostype") ~= nil then
-            table.insert(ghosts, obj)
-        end
-    end
-    return ghosts
-end
-
-local buildRotation = 0
-UserInputService.InputChanged:Connect(function(input, processed)
-    if processed then return end
-    if input.UserInputType == Enum.UserInputType.MouseWheel then
-        if UserInputService:IsKeyDown(Enum.KeyCode.R) or UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-            buildRotation = buildRotation + input.Position.Z * 15
-        end
-    end
-end)
-
-RunService.RenderStepped:Connect(function()
-    local ghosts = findGhosts()
-    if #ghosts == 0 then return end
-    local hitPos, hitNormal = getMouseWorldHit()
-    if not hitPos then return end
-    for _, ghost in ipairs(ghosts) do
-        ghost:SetAttribute("ghostype", 0)
-        if ghost:IsA("Model") then
-            local pivot = ghost:GetPivot()
-            local _, currentY, _ = pivot:ToOrientation()
-            local newCF = CFrame.new(hitPos) * CFrame.Angles(0, math.rad(buildRotation), 0)
-            pcall(function() ghost:PivotTo(newCF) end)
-            for _, desc in ipairs(ghost:GetDescendants()) do
-                if desc:IsA("BasePart") then
-                    local origColor = desc:GetAttribute("color")
-                    if origColor then
-                        desc.Color = origColor
+            local pos = projectMouseTo2DPlane(0)
+            local target = pos + Vector3.new(0, 0, 0.1)
+            local pivot = obj:GetPivot()
+            local _, _, currentZRot = pivot:ToOrientation()
+            local newCF = CFrame.new(target) * CFrame.Angles(0, 0, currentZRot)
+            pcall(function()
+                if obj:IsA("Model") then
+                    obj:PivotTo(newCF)
+                elseif obj:IsA("BasePart") then
+                    obj.CFrame = newCF
+                end
+            end)
+            if FORCE_VALID_COLOR then
+                obj:SetAttribute("ghostype", 0)
+                if obj:IsA("Model") then
+                    for _, p in ipairs(obj:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            local origColor = p:GetAttribute("color")
+                            if origColor then p.Color = origColor end
+                            p.LocalTransparencyModifier = 0.35
+                        end
                     end
-                    desc.LocalTransparencyModifier = 0.35
+                elseif obj:IsA("BasePart") then
+                    local origColor = obj:GetAttribute("color")
+                    if origColor then obj.Color = origColor end
+                    obj.LocalTransparencyModifier = 0.35
                 end
             end
-        elseif ghost:IsA("BasePart") then
-            ghost.CFrame = CFrame.new(hitPos) * CFrame.Angles(0, math.rad(buildRotation), 0)
-            local origColor = ghost:GetAttribute("color")
-            if origColor then
-                ghost.Color = origColor
-            end
-            ghost.LocalTransparencyModifier = 0.35
         end
     end
 end)
 
-for _, obj in ipairs(workspace:GetChildren()) do
-    if obj.Name == "shamancircle" or obj.Name:lower():find("shamancircle") then
-        obj:Destroy()
+local function destroyShamanCircle()
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if type(obj.Name) == "string" and obj.Name:lower():find("shamancircle") then
+            pcall(function() obj:Destroy() end)
+        end
     end
 end
+destroyShamanCircle()
 workspace.ChildAdded:Connect(function(obj)
-    if obj.Name == "shamancircle" or obj.Name:lower():find("shamancircle") then
-        task.wait()
+    task.wait()
+    if type(obj.Name) == "string" and obj.Name:lower():find("shamancircle") then
         pcall(function() obj:Destroy() end)
     end
 end)
 
+if ClientProcess and ClientProcess.addToQueue then
+    local origAdd = ClientProcess.addToQueue
+    ClientProcess.addToQueue = function(id, data, ...)
+        if type(data) == "table" and data.cframe and data.name then
+            local x, y, z = data.cframe.X, data.cframe.Y, data.cframe.Z
+            print(string.format("[BuildAnywhere] OUT name=%s skin=%s pos=(%.2f, %.2f, %.2f)",
+                tostring(data.name), tostring(data.skin), x, y, z))
+        end
+        return origAdd(id, data, ...)
+    end
+    print("yes")
+else
+    warn("[BuildAnywhere] Could not hook ClientProcess.addToQueue")
+end
