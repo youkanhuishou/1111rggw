@@ -5,10 +5,10 @@ local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 local enabled = false
-local teleportDelay = 0.08
-local offsetX = 0
-local offsetY = 3
-local offsetZ = 0
+local teleportDelay = 0.11
+local offsetX = 1
+local offsetY = 0.6
+local offsetZ = -9.6
 
 local cachedCoins = {}
 local cachedDoor = nil
@@ -129,16 +129,16 @@ local function makeSlider(yPos, labelText, minVal, maxVal, defaultVal, decimals,
     end)
 end
 
-makeSlider(80, "Speed (sec)", 0.02, 0.5, teleportDelay, 2, function(v)
+makeSlider(80, "Speed", 0.02, 0.5, teleportDelay, 2, function(v)
     teleportDelay = v
 end)
 makeSlider(115, "Offset X", -10, 10, offsetX, 1, function(v)
     offsetX = v
 end)
-makeSlider(150, "Offset Y", 0, 10, offsetY, 1, function(v)
+makeSlider(150, "Offset Y", -10, 10, offsetY, 1, function(v)
     offsetY = v
 end)
-makeSlider(185, "Offset Z", -10, 10, offsetZ, 1, function(v)
+makeSlider(185, "Offset Z", -20, 20, offsetZ, 1, function(v)
     offsetZ = v
 end)
 
