@@ -2878,9 +2878,14 @@ local function deriveUpvalueSemanticName(bc, childId, upvalueIdx, seen)
 		if OPS_WITH_AUX[opName] and pc + 1 < #child.code then
 			aux = codeWordAt(child, pc + 1)
 		end
-		if opName == "GETUPVAL" and b == upvalueIdx then
-			holders[a] = true
-		elseif opName == "SETUPVAL" and b == upvalueIdx then
+		if opName == "GETUPVAL" then
+			if b == upvalueIdx then
+				holders[a] = true
+			else
+				holders[a] = nil
+			end
+		end
+		if opName == "SETUPVAL" and b == upvalueIdx then
 			local writer = lastWriter[a]
 			if writer then
 				writeKinds[writer] = true
@@ -3044,6 +3049,7 @@ local function deriveUpvalueSemanticName(bc, childId, upvalueIdx, seen)
 		pc = pc + (opName ~= "" and getOpLength(opName) or 1)
 	end
 	if hasDisconnect or hasConnectCall then return "connection" end
+	if writeKinds.LOADB and hasBooleanTest and not (hasLength or writeKinds.NEWTABLE or writeKinds.DUPTABLE) then return "flag" end
 	if hasLength or writeKinds.NEWTABLE or writeKinds.DUPTABLE or hasTableOp then return "state" end
 	if writeKinds.LOADB or hasBooleanTest then return "flag" end
 	if writeKinds.LOADN or usedAsIndex then return "index" end
@@ -3108,6 +3114,18 @@ local function deriveSetupvalWriteName(bc, childId, upvalueIdx)
 			regExpr[a + 1] = nil
 			regLocalName[a] = nil
 			regLocalName[a + 1] = nil
+		elseif opName == "LOADB" or opName == "LOADN" or opName == "LOADK" or opName == "LOADKX"
+			or opName == "LOADKC" or opName == "LOADNIL" or opName == "NEWTABLE" or opName == "DUPTABLE"
+			or opName == "GETGLOBAL" or opName == "GETTABLE" or opName == "GETTABLEN"
+			or opName == "ADD" or opName == "SUB" or opName == "MUL" or opName == "DIV" or opName == "MOD"
+			or opName == "POW" or opName == "IDIV" or opName == "ADDK" or opName == "SUBK" or opName == "MULK"
+			or opName == "DIVK" or opName == "MODK" or opName == "POWK" or opName == "IDIVK" or opName == "SUBRK"
+			or opName == "DIVRK" or opName == "ORK" or opName == "ANDK" or opName == "OR" or opName == "AND"
+			or opName == "MINUS" or opName == "NOT" or opName == "LENGTH" or opName == "CONCAT"
+			or opName == "NEWCLOSURE" or opName == "DUPCLOSURE"
+		then
+			regExpr[a] = nil
+			regLocalName[a] = nil
 		end
 		pc = pc + (opName ~= "" and getOpLength(opName) or 1)
 	end
