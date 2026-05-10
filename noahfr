@@ -5272,12 +5272,10 @@ local function liftElseifPatterns(lines)
 				local innerInd = outerInd .. innerExtra
 				local depth = 1
 				local j = i + 2
-				local hasElseAtInner = false
 				while j <= #out and depth > 0 do
 					local s = out[j]:match("^%s*(.-)%s*$")
 					local li = out[j]:match("^(%s*)")
 					if #li == #innerInd then
-						if s == "else" or s:sub(1,7) == "elseif " then hasElseAtInner = true end
 						if s:sub(1,3) == "if " or s:sub(1,4) == "for " or s:sub(1,6) == "while " or s == "repeat" or s == "do" then
 							depth = depth + 1
 						elseif s == "end" or s:sub(1,6) == "until " then
@@ -5287,7 +5285,7 @@ local function liftElseifPatterns(lines)
 					j = j + 1
 				end
 				j = j - 1
-				if depth == 0 and j + 1 <= #out and not hasElseAtInner and matchEnd(out[j+1]) then
+				if depth == 0 and j + 1 <= #out and matchEnd(out[j+1]) then
 					local outerEndInd = out[j+1]:match("^(%s*)")
 					if outerEndInd == outerInd then
 						local newBlock = {outerInd .. "elseif " .. cond .. " then"}
@@ -5297,7 +5295,7 @@ local function liftElseifPatterns(lines)
 							else newBlock[#newBlock+1] = ln2 end
 						end
 						for k = 1, #newBlock do out[i + k - 1] = newBlock[k] end
-						for _ = #newBlock + i, j + 1 do table.remove(out, #newBlock + i) end
+						for _ = #newBlock + i, j do table.remove(out, #newBlock + i) end
 						transformed = true
 					end
 				end
@@ -7789,6 +7787,18 @@ local function dropGotoToImmediatePostIfLabel(lines)
 				and (nextText == "else" or nextText == "end" or nextText:sub(1, 7) == "elseif ")
 			)
 			if branchTail then
+				for k = i + 1, labelIdx - 1 do
+					local txt = lines[k]:match("^%s*(.-)%s*$")
+					local kind = #(lines[k]:match("^(%s*)") or "")
+					if txt ~= "" and kind < #gi
+						and txt ~= "end" and txt ~= "else" and txt:sub(1, 7) ~= "elseif "
+					then
+						branchTail = false
+						break
+					end
+				end
+			end
+			if branchTail then
 				local result = {}
 				for k = 1, i - 1 do result[#result+1] = lines[k] end
 				for k = i + 1, labelIdx - 1 do result[#result+1] = lines[k] end
@@ -8473,8 +8483,19 @@ local function liftMultilineIfGotoElse(lines, indentUnit)
 							end
 							local bodyInner = {}
 							for j = i + 1, k - 1 do bodyInner[#bodyInner+1] = lines[j] end
+							local truncIdx = labelIdx
+							for tj = endIdx + 1, labelIdx - 1 do
+								if lines[tj]:match("%S") then
+									local li2 = #(lines[tj]:match("^(%s*)") or "")
+									if li2 < #mii then
+										truncIdx = tj
+										break
+									end
+								end
+							end
 							local elseBody = {}
-							for j = endIdx + 1, labelIdx - 1 do elseBody[#elseBody+1] = lines[j] end
+							for j = endIdx + 1, truncIdx - 1 do elseBody[#elseBody+1] = lines[j] end
+							local truncated = truncIdx ~= labelIdx
 							local bodyHasGoto = false
 							local tgtPat = "%f[%a_]goto%s+" .. luaPE(gTgt) .. "%f[^%a_%d]"
 							for _, bl in ipairs(bodyInner) do if bl:find(tgtPat) then bodyHasGoto = true break end end
@@ -8500,10 +8521,13 @@ local function liftMultilineIfGotoElse(lines, indentUnit)
 								end
 							end
 							newBlock[#newBlock+1] = mii .. "end"
-							local keepLabel = bodyHasGoto or elseHasGoto or outsideRefs
+							local keepLabel = bodyHasGoto or elseHasGoto or outsideRefs or truncated
 							local result = {}
 							for j = 1, i - 1 do result[#result+1] = lines[j] end
 							for _, bl in ipairs(newBlock) do result[#result+1] = bl end
+							if truncated then
+								for j = truncIdx, labelIdx - 1 do result[#result+1] = lines[j] end
+							end
 							if keepLabel then result[#result+1] = lines[labelIdx] end
 							for j = labelIdx + 1, #lines do result[#result+1] = lines[j] end
 							return result, true
@@ -9284,6 +9308,13 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 		lines, changed = wrapOrphanIfGotosAsGuards(lines, indentUnit)
 		if not changed then break end
 	end
+	for _ = 1, 16 do
+		local changedMlif
+		lines, changedMlif = liftMultilineIfGotoElse(lines, indentUnit)
+		if not changedMlif then break end
+		lines = liftElseifPatterns(lines)
+		lines = dropOrphanLabels(lines)
+	end
 	lines = dropInvalidTopLevelReturns(lines)
 	lines = fixInvalidGenericForHeaders(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
@@ -9336,6 +9367,7 @@ local function decompileProto(p, bc, protoIdx)
 	local pendingClosureTarget = nil
 	local pendingClosureProtoId = nil
 	local pendingClosureCaps = {}
+	local protoMaterialized = {}
 	local pc = 0
 	local codeLen = #p.code
 
@@ -9353,7 +9385,7 @@ local function decompileProto(p, bc, protoIdx)
 		if #pendingClosureCaps > 0 then
 			local capDescs = {}
 			local hasParentCapture = false
-			local materialized = {}
+			local materialized = protoMaterialized
 			local writableCaptures = nil
 			local childRenameHints = bc.upvalueRenameHints and pendingClosureProtoId ~= nil and bc.upvalueRenameHints[pendingClosureProtoId] or nil
 			for capIdx, cap in ipairs(pendingClosureCaps) do
