@@ -1040,14 +1040,6 @@ local function regRepr(regs, p, reg, pc)
 	return regs[reg] or ("R" .. tostring(reg))
 end
 
-local function assignTarget(p, reg, pc)
-	local name = localAt(p, reg, pc)
-	if name then
-		return "local " .. name
-	end
-	return "local _r" .. tostring(reg)
-end
-
 local function formatHex32(value)
 	return string.format("0x%08X", value)
 end
@@ -5743,6 +5735,83 @@ local function recoverEmptyFieldGuards(lines)
 	return out
 end
 
+-- When the renderer drops a guarded `IsA`/inline-call check, the surviving
+-- two-jump chain can be collapsed into `if NAME then warn(...); return end`
+-- where the `then` branch is supposed to be the FAILURE branch.  The clear
+-- signal of this bug is that code after the `end` reads `NAME` (via field or
+-- method) while a successful entry into the `then` branch always returns —
+-- so the post-`end` use is unreachable unless the condition is inverted.
+local function fixInvertedFalseyGuard(lines)
+	local function isFieldUse(line, name)
+		-- Find `NAME.` or `NAME:` not preceded by an identifier character.
+		local i = 1
+		local n = #line
+		while i <= n do
+			local s, e = line:find(name, i, true)
+			if not s then break end
+			local prev = s > 1 and line:sub(s - 1, s - 1) or ""
+			local nxt = e + 1 <= n and line:sub(e + 1, e + 1) or ""
+			if not prev:match("[%w_]") and (nxt == "." or nxt == ":") then
+				return true
+			end
+			i = e + 1
+		end
+		return false
+	end
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ind, name = lines[i]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
+		if ind and name then
+			-- Locate the matching `end` at the same indent.
+			local endIdx = nil
+			for j = i + 1, math.min(#lines, i + 12) do
+				local jInd = lines[j]:match("^(%s*)end%s*$")
+				if jInd == ind then endIdx = j; break end
+				-- Bail out if we hit something at the same indent before `end`.
+				local sameIndentNonEnd = lines[j]:match("^(" .. luaPE(ind) .. ")[^%s]") and not lines[j]:match("^" .. luaPE(ind) .. "end")
+				-- (We only really care about finding the end; bail if scanned too long.)
+				if sameIndentNonEnd and j ~= i then break end
+			end
+			if endIdx then
+				-- Body must end with a `return` statement (so the `then` branch
+				-- never falls through).
+				local hasReturn = false
+				for j = i + 1, endIdx - 1 do
+					local t = lines[j]:match("^%s*(.-)%s*$")
+					if t == "return" or t:sub(1, 7) == "return " then
+						hasReturn = true; break
+					end
+				end
+				-- Subsequent line at the same indent (or deeper) must read NAME
+				-- as a field/method receiver.
+				local usesAfter = false
+				if hasReturn then
+					for j = endIdx + 1, math.min(#lines, endIdx + 6) do
+						local tInd = lines[j]:match("^(%s*)") or ""
+						if #tInd < #ind then break end
+						if isFieldUse(lines[j], name) then usesAfter = true; break end
+						-- Only look until first non-empty statement at >= ind.
+						if lines[j]:match("%S") and #tInd <= #ind then break end
+					end
+				end
+				if hasReturn and usesAfter then
+					out[#out+1] = ind .. "if not " .. name .. " then"
+					for j = i + 1, endIdx do out[#out+1] = lines[j] end
+					i = endIdx + 1
+				else
+					out[#out+1] = lines[i]; i = i + 1
+				end
+			else
+				out[#out+1] = lines[i]; i = i + 1
+			end
+		else
+			out[#out+1] = lines[i]; i = i + 1
+		end
+	end
+	return out
+end
+
 local function fixInvertedIsaGuard(lines)
 	local out = {}
 	local i = 1
@@ -9366,6 +9435,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = dropEmptyIfBlocks(lines)
 	lines = fixFindBasePartFallbackReturns(lines)
 	lines = fixInvertedIsaGuard(lines)
+	lines = fixInvertedFalseyGuard(lines)
 	lines = hoistRepeatedLocals(lines)
 	lines = coalesceAlternativeFinds(lines)
 	lines = fixBareMethodReferences(lines)
@@ -9412,6 +9482,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = balanceLuaBlocksByIndent(lines)
 	lines = dropUnmatchedEndLines(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
+	lines = fixInvertedFalseyGuard(lines)
 	lines = dropUnknownOpArtifacts(lines)
 	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
@@ -9611,6 +9682,45 @@ local function decompileProto(p, bc, protoIdx)
 		end
 
 		if not handledCapture then
+			-- Flush stale inline references: if this instruction will overwrite
+			-- regs[a] AND oldName is a materialized variable (has been emitted
+			-- as an assignment target), AND other pending inline expressions in
+			-- regs[] reference oldName, materialize those expressions first.
+			local oldName = regs[a]
+			if type(oldName) == "string" and isValidIdent(oldName) and oldName ~= ("R" .. tostring(a)) then
+				local writesA = (opName == "MOVE" or opName == "GETTABLEKS" or opName == "GETTABLEN"
+					or opName == "GETTABLE" or opName == "GETIMPORT" or opName == "GETUPVAL"
+					or opName == "LOADK" or opName == "LOADN" or opName == "LOADB" or opName == "LOADNIL"
+					or opName == "LOADKX" or opName == "ADD" or opName == "SUB" or opName == "MUL"
+					or opName == "DIV" or opName == "MOD" or opName == "POW" or opName == "IDIV"
+					or opName == "ADDK" or opName == "SUBK" or opName == "MULK" or opName == "DIVK"
+					or opName == "MODK" or opName == "POWK" or opName == "SUBRK" or opName == "DIVRK"
+					or opName == "CONCAT" or opName == "MINUS" or opName == "LENGTH" or opName == "NOT"
+					or opName == "NEWTABLE" or opName == "DUPTABLE" or opName == "AND" or opName == "OR"
+					or opName == "ANDK" or opName == "ORK")
+				if writesA then
+					-- Only flush if oldName was previously materialized (emitted as
+					-- an assignment target).  Pure inline expressions (not yet output)
+					-- don't need flushing since they haven't been "named" in the output.
+					local isMaterialized = localAt(p, a, pc) == oldName
+						or localAt(p, a, math.max(0, pc - 1)) == oldName
+						or (regs.__materialized and regs.__materialized[oldName])
+					if isMaterialized then
+						local pat = "%f[%a_]" .. oldName .. "%f[^%a_%d]"
+						for reg, expr in pairs(regs) do
+							if type(reg) == "number" and reg ~= a and type(expr) == "string"
+								and not isValidIdent(expr) and expr:find(pat)
+							then
+								local matName = generatedNameFor and generatedNameFor(oldName .. "_val", "_r" .. tostring(reg)) or ("_r" .. tostring(reg))
+								push(out, bodyIndent .. "local " .. matName .. " = " .. expr)
+								regs[reg] = matName
+								regs.__materialized = regs.__materialized or {}
+								regs.__materialized[matName] = true
+							end
+						end
+					end
+				end
+			end
 			local line, advanceExtra = emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, bodyIndent, generatedNameFor, name, renameHints, flowAnalysis)
 			if opName == "NEWCLOSURE" then
 				pendingClosureTarget = a
@@ -9624,6 +9734,13 @@ local function decompileProto(p, bc, protoIdx)
 			end
 			if line then
 				push(out, line)
+				-- Track materialized names: if this line assigns to regs[a] and
+				-- regs[a] is a valid identifier, mark it as materialized.
+				local curName = regs[a]
+				if type(curName) == "string" and isValidIdent(curName) and curName ~= ("R" .. tostring(a)) then
+					regs.__materialized = regs.__materialized or {}
+					regs.__materialized[curName] = true
+				end
 			end
 			pc = pc + getOpLength(opName) + advanceExtra
 		end
