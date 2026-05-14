@@ -360,9 +360,25 @@ local function deriveNameHint(expr, functionName)
 	})[bareCall] then
 		return cleanGeneratedIdent(bareCall .. "_result")
 	end
+	-- tostring(expr) → derive name from inner field access
+	if bareCall == "tostring" or bareCall == "tonumber" then
+		local tostrArg = e:match("^[%a_][%w_]*%s*%((.+)%)%s*$")
+		if tostrArg then
+			local inner = tostrArg:match("%.([%a_][%w_]*)%s*$")
+			if inner and isValidIdent(inner) then
+				local suffix = bareCall == "tostring" and "_str" or "_num"
+				return cleanGeneratedIdent(inner .. suffix)
+			end
+		end
+	end
 	local idxBase = e:match("^([%a_][%w_]*)%s*%[")
 	if idxBase and isValidIdent(idxBase) then
 		return idxBase .. "_entry"
+	end
+	-- obj.Field[key] → Field_entry (dynamic table field index)
+	local fieldIdx = e:match("%.([%a_][%w_]*)%s*%[")
+	if fieldIdx and isValidIdent(fieldIdx) then
+		return fieldIdx .. "_entry"
 	end
 	return nil
 end
@@ -2305,12 +2321,25 @@ local function analyzeProtoFlow(p, bc)
 		for idx = 1, #writes - 1 do
 			local write = writes[idx]
 			local nextWrite = writes[idx + 1]
+			local writeInfo = write and cfg.instructions and cfg.instructions[write.pc] or nil
 			local nextInfo = nextWrite and cfg.instructions and cfg.instructions[nextWrite.pc] or nil
+			-- Treat the pair as a real phi candidate only when the FIRST LOADB's
+			-- result is NOT consumed before the second LOADB rewrites the same
+			-- register.  Otherwise we are looking at two independent sequential
+			-- `Field = false` / `Field = true` assignments that happen to reuse
+			-- the same scratch register (e.g.
+			--     LOADB R6 = false; SETTABLEKS R5.CanCollide = R6;
+			--     LOADB R6 = false; SETTABLEKS R5.CastShadow = R6;
+			-- ), in which case we must NOT promote them to a `_flag<N>` local
+			-- since the original source wrote each as `T.X = false` directly.
+			local readBetween = write and nextWrite and writeInfo
+				and regReadBeforeWrite(p, reg, write.pc + writeInfo.len, nextWrite.pc - 1)
 			if write
 				and nextWrite
 				and write.opName == "LOADB"
 				and nextWrite.opName == "LOADB"
 				and nextInfo
+				and not readBetween
 				and regReadBeforeWrite(p, reg, nextWrite.pc + nextInfo.len, #p.code - 1)
 			then
 				local targetName = localAt(p, reg, nextWrite.pc) or localAt(p, reg, write.pc) or stableGeneratedTempName(reg, "_flag")
@@ -3576,9 +3605,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		if assigned then
 			return assigned, 0
 		end
-		if regReadBeforeWrite(p, a, pc + getOpLength(opName), #p.code - 1) then
-			return assignGeneratedFlag(a, value .. suffix), 0
-		end
+		-- No locvar binding and no phi/flag hint: do NOT materialize a
+		-- `local _flag<reg>` temporary.  The literal value has already been
+		-- stored in `regs[a]`, so the next consumer (e.g. `SETTABLEKS T.X = Ra`)
+		-- will read the literal directly and emit `T.X = false`, which matches
+		-- the natural pre-compile source `T.X = false` instead of the verbose
+		-- `_flag<N> = false; T.X = _flag<N>` form.
 		return suffix ~= "" and (indent .. "-- LOADB R" .. tostring(a) .. " = " .. value .. suffix) or nil, 0
 	end
 
@@ -4291,18 +4323,78 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			regs[a] = orHint.expr
 			return nil, 0
 		end
-		local name = semanticLocalName(a, pc)
+		-- Try to derive a name from the first SETTABLEKS that sets a field on this register
+		local name = nil
+		if not localAt(p, a, pc) then
+			local scanPc = pc + getOpLength(opName)
+			local limit = math.min(#p.code - 1, scanPc + 32)
+			while scanPc <= limit do
+				local si = decodedInsnAt(p, scanPc)
+				if instrWritesReg(si, a) then break end  -- reg overwritten before first use
+				if si.opName == "SETTABLEKS" and si.b == a then
+					local auxVal = OPS_WITH_AUX[si.opName] and scanPc + 1 < #p.code and codeWordAt(p, scanPc + 1) or nil
+					local kidx = auxVal ~= nil and auxVal or si.d
+					local kc = constantAt(p, kidx)
+					if kc and kc.kind == "string" and isValidIdent(kc.value) then
+						local hint = cleanGeneratedIdent(kc.value)
+						if hint and isValidIdent(hint) and not hint:match("^_r%d") then
+								name = generatedNameFor and generatedNameFor(hint, "_r" .. tostring(a)) or sanitizeLocalName(hint, a)
+						end
+					end
+					break
+				end
+				scanPc = scanPc + si.len
+			end
+		end
+		name = name or semanticLocalName(a, pc)
 		regs[a] = name
 		return indent .. "local " .. name .. " = {}", 0
 	end
-
 	if opName == "DUPTABLE" then
 		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
 		if orHint and orHint.reg == a and orHint.expr then
 			regs[a] = orHint.expr
 			return nil, 0
 		end
-		local name = semanticLocalName(a, pc)
+		-- Derive name from first meaningful SETTABLEKS that sets a field on this register
+		local name = nil
+		if not localAt(p, a, pc) then
+			-- Try from constant template keys (table_kv has fields already)
+			local dc = constantAt(p, d)
+			if dc and dc.kind == "table_kv" and #dc.value > 0 then
+				for _, pair in ipairs(dc.value) do
+					local kc = constantAt(p, pair.k_idx)
+					if kc and kc.kind == "string" and isValidIdent(kc.value) and #kc.value > 2 then
+						local hint = cleanGeneratedIdent(kc.value)
+						if hint and not hint:match("^_r%d") then
+							name = generatedNameFor and generatedNameFor(hint, "_r" .. tostring(a)) or sanitizeLocalName(hint, a)
+							break
+						end
+					end
+				end
+			end
+			-- Fallback: scan forward for first SETTABLEKS on this register
+			if not name then
+				local scanPc = pc + getOpLength(opName)
+				local limit = math.min(#p.code - 1, scanPc + 32)
+				while scanPc <= limit do
+					local si = decodedInsnAt(p, scanPc)
+					if instrWritesReg(si, a) then break end
+					if si.opName == "SETTABLEKS" and si.b == a then
+						local auxVal = OPS_WITH_AUX[si.opName] and scanPc + 1 < #p.code and codeWordAt(p, scanPc + 1) or nil
+						local kidx = auxVal ~= nil and auxVal or si.d
+						local kc = constantAt(p, kidx)
+						if kc and kc.kind == "string" and isValidIdent(kc.value) and not kc.value:match("^_r%d") then
+							local hint = cleanGeneratedIdent(kc.value) or kc.value
+							name = generatedNameFor and generatedNameFor(hint, "_r" .. tostring(a)) or sanitizeLocalName(hint, a)
+						end
+						break
+					end
+					scanPc = scanPc + si.len
+				end
+			end
+		end
+		name = name or semanticLocalName(a, pc)
 		regs[a] = name
 		return indent .. "local " .. name .. " = " .. kvalLua(p, d), 0
 	end
@@ -5227,13 +5319,33 @@ local function removeUnreachableAfterReturn(lines)
 	return out
 end
 
--- Drop redundant trailing `return` before closing `end`
+-- Drop redundant trailing `return` before closing `end`, and also drop a bare
+-- trailing `return` at the very end of the main chunk (which has no enclosing
+-- `end`). The latter is important for LocalScript-style outputs that otherwise
+-- end with an artifact `return` from the implicit RETURN R0.. (0 values).
 local function dropTrailingReturn(lines)
 	if #lines == 0 then return lines end
 	local last = #lines
 	while last >= 1 and not lines[last]:match("%S") do last = last - 1 end
 	if last < 1 then return lines end
-	if not matchEnd(lines[last]) then return lines end
+	if not matchEnd(lines[last]) then
+		-- No closing `end`: check if this is the main chunk and ends with `return`
+		local firstNonBlank
+		for _, ln in ipairs(lines) do
+			if ln:match("%S") then firstNonBlank = ln break end
+		end
+		if firstNonBlank and firstNonBlank:match("^%-%-%s*main chunk%s*%(") then
+			local txt = lines[last]:match("^%s*(.-)%s*$")
+			if txt == "return" then
+				local out = {}
+				for k = 1, #lines do
+					if k ~= last then out[#out+1] = lines[k] end
+				end
+				return out
+			end
+		end
+		return lines
+	end
 	local endIndent = lines[last]:match("^(%s*)")
 	local prev = last - 1
 	while prev >= 1 and not lines[prev]:match("%S") do prev = prev - 1 end
@@ -9382,7 +9494,13 @@ local function decompileProto(p, bc, protoIdx)
 		end
 		regs[pendingClosureTarget] = closureName
 		regs.__closureWriteCaptures = regs.__closureWriteCaptures or {}
-		if #pendingClosureCaps > 0 then
+		-- Always emit a `-- closureName captures: ...` marker, even for zero-capture
+		-- closures.  The marker is consumed by `spliceHoistedChild` to inline the
+		-- proto definition at the point where it was originally created.  Without
+		-- this, zero-capture closures (e.g. `Connect(function() ... end)` with no
+		-- upvalues) would stay at the top of the file instead of being placed at
+		-- their natural source position inside the main chunk.
+		do
 			local capDescs = {}
 			local hasParentCapture = false
 			local materialized = protoMaterialized
@@ -9541,47 +9659,53 @@ local function identifyHoistTargets(bc)
 		push(result[parentId], childId)
 		already[childId] = true
 	end
+	-- Scan every proto (including the main chunk) for NEWCLOSURE/DUPCLOSURE
+	-- instructions and record `child` as a hoist target of its `parent`. For the
+	-- main chunk, treat all closures it creates as hoist candidates regardless
+	-- of whether they capture any local: this way `local function FOO() ... end`
+	-- definitions are inlined into the main chunk in the position where they
+	-- actually appear in the original source, instead of being emitted as a flat
+	-- list above the main chunk.
 	for parentId = 0, #bc.protos - 1 do
-		if parentId ~= bc.main_id then
-			local p = protoAt(bc, parentId)
-			local pc = 0
-			local pendingChild = nil
-			local hasParentCap = false
-			local already = {}
-			while p and pc < #p.code do
-				local insn = codeWordAt(p, pc)
-				local op = bit32_band(insn, 0xFF)
-				local opName = OPCODES[op] or ""
-				if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
-					if pendingChild ~= nil and hasParentCap and not already[pendingChild] then
-						addTarget(parentId, pendingChild, already)
-					end
-					local d = decodeSignedD(insn)
-					if opName == "NEWCLOSURE" then
-						pendingChild = childProtoIdAt(p, d)
-					else
-						local closureConst = constantAt(p, d)
-						pendingChild = closureConst and closureConst.kind == "closure" and closureConst.value or nil
-					end
-					hasParentCap = false
-				elseif opName == "CAPTURE" and pendingChild ~= nil then
-					local kindId = bit32_band(bit32_rshift(insn, 8), 0xFF)
-					local kind = CAPTURE_KINDS[kindId] or ""
-					if kind == "VAL" or kind == "REF" or kind == "UPVAL" or kind == "UPREF" then
-						hasParentCap = true
-					end
-				elseif opName ~= "CAPTURE" then
-					if pendingChild ~= nil and hasParentCap and not already[pendingChild] then
-						addTarget(parentId, pendingChild, already)
-					end
-					pendingChild = nil
-					hasParentCap = false
+		local p = protoAt(bc, parentId)
+		local pc = 0
+		local pendingChild = nil
+		local hasParentCap = false
+		local already = {}
+		local mainChunk = (parentId == bc.main_id)
+		while p and pc < #p.code do
+			local insn = codeWordAt(p, pc)
+			local op = bit32_band(insn, 0xFF)
+			local opName = OPCODES[op] or ""
+			if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+				if pendingChild ~= nil and (hasParentCap or mainChunk) and not already[pendingChild] then
+					addTarget(parentId, pendingChild, already)
 				end
-				pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+				local d = decodeSignedD(insn)
+				if opName == "NEWCLOSURE" then
+					pendingChild = childProtoIdAt(p, d)
+				else
+					local closureConst = constantAt(p, d)
+					pendingChild = closureConst and closureConst.kind == "closure" and closureConst.value or nil
+				end
+				hasParentCap = false
+			elseif opName == "CAPTURE" and pendingChild ~= nil then
+				local kindId = bit32_band(bit32_rshift(insn, 8), 0xFF)
+				local kind = CAPTURE_KINDS[kindId] or ""
+				if kind == "VAL" or kind == "REF" or kind == "UPVAL" or kind == "UPREF" then
+					hasParentCap = true
+				end
+			elseif opName ~= "CAPTURE" then
+				if pendingChild ~= nil and (hasParentCap or mainChunk) and not already[pendingChild] then
+					addTarget(parentId, pendingChild, already)
+				end
+				pendingChild = nil
+				hasParentCap = false
 			end
-			if pendingChild ~= nil and hasParentCap and not already[pendingChild] then
-				addTarget(parentId, pendingChild, already)
-			end
+			pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+		end
+		if pendingChild ~= nil and (hasParentCap or mainChunk) and not already[pendingChild] then
+			addTarget(parentId, pendingChild, already)
 		end
 	end
 	return result
@@ -9608,7 +9732,14 @@ local function spliceHoistedChild(parentBody, childName, childBody)
 	end
 	for _, ln in ipairs(parentLines) do
 		if not spliced then
+			-- Splice marker is `-- ChildName captures: ...` optionally followed by
+			-- `[parent-local capture]`. The trailing tag is required for non-main
+			-- hoists (so we never accidentally splice into an unrelated parent),
+			-- but for closures emitted by the main chunk we accept the bare
+			-- `captures:` line too because zero-capture closures (e.g. anon1 used
+			-- only as a `:Connect(anon1)` argument) never get tagged.
 			local indent = ln:match("^(%s*)%-%-%s+" .. namePat .. "%s+captures:.*%[parent%-local capture%]%s*$")
+				or ln:match("^(%s*)%-%-%s+" .. namePat .. "%s+captures:.*$")
 			if indent then
 				for _, cl in ipairs(childLines) do
 					out[#out+1] = cl ~= "" and (indent .. cl) or cl
@@ -11078,7 +11209,12 @@ local function renderSource(bc)
 		lines[#lines+1] = line
 	end
 	lines = foldPcallRequireUpvalueWriters(lines)
-	lines = predeclareHoistedUpvalues(lines)
+	-- predeclareHoistedUpvalues intentionally disabled: hoist already forward-declares
+	-- repeated locals inside the main chunk, and the top-of-file `local X, Y, Z`
+	-- block plus stripped `local` prefixes in main chunk produces noisy/duplicate
+	-- declarations such as `local Players` appearing both at the top and inside
+	-- the main chunk body.
+	-- lines = predeclareHoistedUpvalues(lines)
 	lines = renderLuaAstLines(lines, "\t")
 	lines = fixCameraModuleActivateController(lines, "\t")
 	lines = reattachLeakedFunctionTails(lines, "\t")
@@ -11101,6 +11237,570 @@ local function renderSource(bc)
 	lines = fixLoadbSkipBooleanAssignments(lines)
 	lines = normalizeLuaIndentation(lines, "\t")
 	lines = dropInvalidTopLevelReturns(lines)
+	-- Merge `local NAME` (bare forward-declaration) with the first subsequent
+	-- bare `NAME = expr` at the same indentation, so e.g.
+	--     local Players
+	--     local ReplicatedStorage
+	--     Players = game:GetService("Players")
+	--     ReplicatedStorage = game:GetService("ReplicatedStorage")
+	-- becomes:
+	--     local Players = game:GetService("Players")
+	--     local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	-- We only merge when NAME is NEVER read or written before the matching
+	-- bare assignment, to preserve scoping for closures that need an earlier
+	-- forward declaration.
+	do
+		-- Count occurrences of `name` as a standalone identifier, skipping
+		-- string/comment regions AND any occurrence that is a field name (`.X`
+		-- or `:X`).  We can't use `countIdentUsesOutsideStrings` here because
+		-- it counts `T.Modules.X` (where `Modules` is just a field path) as a
+		-- real reference to a local named `Modules`.
+		local function countNonFieldUses(line, name)
+			local count = 0
+			local i, len = 1, #line
+			local inStr = nil
+			while i <= len do
+				local c = line:sub(i, i)
+				if inStr then
+					if c == "\\" and i < len then
+						i = i + 2
+					elseif c == inStr then
+						inStr = nil
+						i = i + 1
+					else
+						i = i + 1
+					end
+				elseif c == '"' or c == "'" then
+					inStr = c
+					i = i + 1
+				elseif c == "-" and line:sub(i + 1, i + 1) == "-" then
+					break
+				elseif c:match("[%a_]") then
+					local prevChar = i > 1 and line:sub(i - 1, i - 1) or ""
+					local j = i
+					while j <= len and line:sub(j, j):match("[%w_]") do j = j + 1 end
+					if line:sub(i, j - 1) == name and prevChar ~= "." and prevChar ~= ":" then
+						count = count + 1
+					end
+					i = j
+				else
+					i = i + 1
+				end
+			end
+			return count
+		end
+		local deletedIdx = {}
+		for i = 1, #lines do
+			local indent, name = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*$")
+			if indent and name then
+				local foundIdx = nil
+				for j = i + 1, #lines do
+					local line = lines[j]
+					local jIndent = line:match("^(%s*)") or ""
+					local uses = countNonFieldUses(line, name)
+					if jIndent == indent then
+						local lhs = line:match("^" .. luaPE(indent) .. "([%a_][%w_]*)%s*=%s*.+$")
+						if lhs == name and uses == 1 then
+							foundIdx = j
+							break
+						end
+					end
+					if uses > 0 then break end
+				end
+				if foundIdx then
+					-- Prepend `local ` after the existing indent (avoiding the
+					-- empty-capture-becomes-position pitfall of `^()(name=)`).
+					lines[foundIdx] = indent .. "local " .. lines[foundIdx]:sub(#indent + 1)
+					deletedIdx[i] = true
+				end
+			end
+		end
+		if next(deletedIdx) then
+			local out = {}
+			for i, line in ipairs(lines) do
+				if not deletedIdx[i] then out[#out + 1] = line end
+			end
+			lines = out
+		end
+	end
+	-- Collapse `local function NAME(args) ... end\nTABLE.NAME = NAME` into
+	-- `function TABLE.NAME(args) ... end`, but ONLY when the bytecode indicates
+	-- the original source actually used the `function TABLE.NAME(...)` form (i.e.
+	-- the parent proto's NEWCLOSURE/DUPCLOSURE register has NO debug locvar
+	-- binding immediately after the closure is created).  If the parent has a
+	-- locvar entry for that register, the original source explicitly wrote
+	-- `local function NAME() ... end TABLE.NAME = NAME`, so we keep both lines
+	-- to stay faithful to the pre-compile source.
+	do
+		-- Map childProtoId -> "local" | "field".  We try to recover the original
+		-- source form by inspecting the parent proto's bytecode around the
+		-- NEWCLOSURE/DUPCLOSURE for each child:
+		--   * If parent has a real `local FOO = (closure)` binding, locvarAt
+		--     will return a locvar whose name differs from any neighbouring
+		--     SETTABLEKS field assignment.  We treat that as "local".
+		--   * Roblox Luau's debug info also emits synthetic locvars on the
+		--     closure register whose NAME equals the field the closure is
+		--     stored into (`function T.FOO(...) end` produces a locvar called
+		--     `FOO` even though no source local exists).  We detect this by
+		--     scanning forward past CAPTUREs for a SETTABLEKS that writes the
+		--     same register; if the field name matches the locvar name, treat
+		--     it as "field".
+		local protoBinding = {}
+		local function locateNextFieldStore(p, regA, fromPc)
+			local scanPc = fromPc
+			local limit = math.min(#p.code - 1, scanPc + 16)
+			while scanPc <= limit do
+				local insn = codeWordAt(p, scanPc)
+				local op = bit32_band(insn, 0xFF)
+				local opName = OPCODES[op] or ""
+				if opName == "" then return nil end
+				if opName == "CAPTURE" then
+					scanPc = scanPc + getOpLength(opName)
+				elseif opName == "SETTABLEKS" then
+					local sA = bit32_band(bit32_rshift(insn, 8), 0xFF)
+					if sA == regA then
+						local auxPc = scanPc + 1
+						if auxPc <= #p.code - 1 then
+							local kc = constantAt(p, codeWordAt(p, auxPc))
+							if kc and kc.kind == "string" then return kc.value end
+						end
+					end
+					return nil
+				else
+					return nil
+				end
+			end
+			return nil
+		end
+		for parentId = 0, #bc.protos - 1 do
+			local p = protoAt(bc, parentId)
+			if p then
+				local pc = 0
+				while pc < #p.code do
+					local insn = codeWordAt(p, pc)
+					local op = bit32_band(insn, 0xFF)
+					local opName = OPCODES[op] or ""
+					if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+						local d = decodeSignedD(insn)
+						local childId
+						if opName == "NEWCLOSURE" then
+							childId = childProtoIdAt(p, d)
+						else
+							local cc = constantAt(p, d)
+							childId = cc and cc.kind == "closure" and cc.value or nil
+						end
+						if type(childId) == "number" then
+							local a = bit32_band(bit32_rshift(insn, 8), 0xFF)
+							local nextPc = pc + getOpLength(opName)
+							local lv = locvarAt(p, a, nextPc)
+							local nextField = locateNextFieldStore(p, a, nextPc)
+							local form
+							if lv == nil then
+								form = "field"
+							elseif nextField and lv.name == nextField then
+								-- Synthetic Roblox debug locvar; not a real local.
+								form = "field"
+							else
+								form = "local"
+							end
+							if form == "local" then
+								protoBinding[childId] = "local"
+							elseif protoBinding[childId] == nil then
+								protoBinding[childId] = "field"
+							end
+						end
+					end
+					pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+				end
+			end
+		end
+		local toDelete = {}
+		local rewrites = {}
+		-- Count distinct uses of each candidate name across the whole file so we
+		-- only collapse when it is safe (no recursive self-references, no extra
+		-- aliases).  Uses inside strings and comments are deliberately ignored.
+		local useCounts = {}
+		local function scanIdents(line, cb)
+			local i, len = 1, #line
+			local inStr = nil
+			while i <= len do
+				local c = line:sub(i, i)
+				if inStr then
+					if c == "\\" and i < len then
+						i = i + 2
+					elseif c == inStr then
+						inStr = nil
+						i = i + 1
+					else
+						i = i + 1
+					end
+				elseif c == '"' or c == "'" then
+					inStr = c
+					i = i + 1
+				elseif c == "-" and line:sub(i + 1, i + 1) == "-" then
+					break  -- rest of line is a comment
+				elseif c:match("[%a_]") then
+					-- Skip identifiers that are field/method names (immediately preceded
+					-- by `.` or `:`).  These do not denote a reference to a local of the
+					-- same name -- e.g. `_index.new = new` only references the local
+					-- `new` once (on the right-hand side); the `.new` part is a field.
+					local prevChar = i > 1 and line:sub(i - 1, i - 1) or ""
+					local j = i
+					while j <= len and line:sub(j, j):match("[%w_]") do j = j + 1 end
+					if prevChar ~= "." and prevChar ~= ":" then
+						cb(line:sub(i, j - 1))
+					end
+					i = j
+				else
+					i = i + 1
+				end
+			end
+		end
+		for _, line in ipairs(lines) do
+			scanIdents(line, function(tok) useCounts[tok] = (useCounts[tok] or 0) + 1 end)
+		end
+		for i, line in ipairs(lines) do
+			local indent, fnName, args = line:match("^(%s*)local%s+function%s+([%a_][%w_]*)(%b())")
+			if indent and fnName then
+				-- Find the matching `end` line at the same indent.
+				local endIdx = nil
+				for j = i + 1, #lines do
+					local lineInd = lines[j]:match("^(%s*)") or ""
+					local text = lines[j]:match("^%s*(.-)%s*$")
+					if lineInd == indent and text == "end" then
+						endIdx = j
+						break
+					end
+				end
+				if endIdx then
+					-- The next non-blank line at the same indent must be `T.NAME = NAME`.
+					local nextIdx = endIdx + 1
+					while nextIdx <= #lines and not lines[nextIdx]:match("%S") do
+						nextIdx = nextIdx + 1
+					end
+					if nextIdx <= #lines then
+						local nIndent, tableExpr, rhs = lines[nextIdx]:match(
+							"^(%s*)([%a_][%w_]*%.[%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$"
+						)
+						if nIndent == indent and rhs == fnName and tableExpr:match("%." .. luaPE(fnName) .. "$") then
+							-- Bytecode is the authoritative source.  When the parent proto
+							-- shows the original used `function T.NAME(...)` form (no real
+							-- locvar binding for the closure reg, or only a synthetic debug
+							-- locvar whose name matches the field), collapse regardless of
+							-- `useCounts`.  The local-name uses we see in other lines refer
+							-- to the OUTER same-named local (e.g. `local CreateChainEffect = {}`),
+							-- so removing the inner shadow leaves them resolving correctly.
+							-- If the bytecode shows the original wrote `local function NAME`
+							-- (real locvar binding with a different name), keep both lines.
+							local protoIdStr = line:match("%-%-%s*proto%[(%d+)%]")
+							local protoId = protoIdStr and tonumber(protoIdStr) or nil
+							local bytecodeAllowsCollapse = protoId ~= nil and protoBinding[protoId] == "field"
+							-- Extra safety: the function body must not call itself via bare
+							-- `NAME(...)` (would break after the local is removed).
+							local bodyUsesSelf = false
+							if bytecodeAllowsCollapse then
+								for j = i + 1, endIdx - 1 do
+									if countIdentUsesOutsideStrings(lines[j], fnName) > 0 then
+										bodyUsesSelf = true
+										break
+									end
+								end
+							end
+							if bytecodeAllowsCollapse and not bodyUsesSelf then
+								rewrites[i] = indent .. "function " .. tableExpr .. args
+								toDelete[nextIdx] = true
+							end
+						end
+					end
+				end
+			end
+		end
+		if next(rewrites) or next(toDelete) then
+			local out = {}
+			for i, line in ipairs(lines) do
+				if toDelete[i] then
+					-- removed: collapsed into the rewritten function declaration above
+				elseif rewrites[i] then
+					-- Preserve everything after the original `(args)` segment, which
+					-- typically holds the `-- proto[N], line ... -- upvalues: ...`
+					-- annotation.
+					local tail = line:match("^%s*local%s+function%s+[%a_][%w_]*%b()(.*)$") or ""
+					out[#out + 1] = rewrites[i] .. tail
+				else
+					out[#out + 1] = line
+				end
+			end
+			lines = out
+		end
+	end
+	-- User-requested deterministic naming scheme:
+	--   state, state_2, state_N    -> s1,  s2,  ... (by first appearance order)
+	--   flag,  flag_2,  _flagN     -> f1,  f2,  ...
+	--   _value, _value_N           -> v_u1, v_u2, ...
+	--   *_entry                    -> v<K>_e  (K by distinct base order)
+	--   argN inside function FOO   -> v<K>    (K assigned by function-scope walk,
+	--                                          so each parameter gets a unique number
+	--                                          across the whole file)
+	-- Strings ("..." / '...') are skipped so we never rewrite tokens inside literals.
+	-- Block-scope tracking (function / if / for / while / do / repeat) lets us know
+	-- which argument map is active on every line.
+	do
+		local renames = {}
+		local stateOrder, flagOrder, valueOrder, entryOrder = {}, {}, {}, {}
+		local function classify(tok)
+			if tok == "state" or tok:match("^state_%d+$") then return "state" end
+			if tok == "flag" or tok:match("^flag_%d+$") or tok:match("^_flag%d+$") then return "flag" end
+			if tok == "_value" or tok:match("^_value_%d+$") then return "value" end
+			-- Entry pattern accepts both `<base>_entry` and `<base>_entry_N`
+			-- (e.g. `arg1_entry_2` from a second loop iteration alias).
+			local base = tok:match("^(.+)_entry$")
+			if base then return "entry", base, "" end
+			local base2, suf = tok:match("^(.+)_entry(_%d+)$")
+			if base2 then return "entry", base2, suf end
+			return nil
+		end
+		local function scanTokens(line, cb)
+			local i, len = 1, #line
+			local inStr = nil
+			while i <= len do
+				local c = line:sub(i, i)
+				if inStr then
+					if c == "\\" and i < len then
+						i = i + 2
+					elseif c == inStr then
+						inStr = nil
+						i = i + 1
+					else
+						i = i + 1
+					end
+				elseif c == '"' or c == "'" then
+					inStr = c
+					i = i + 1
+				elseif c:match("[%a_]") then
+					local j = i
+					while j <= len and line:sub(j, j):match("[%w_]") do j = j + 1 end
+					cb(line:sub(i, j - 1))
+					i = j
+				else
+					i = i + 1
+				end
+			end
+		end
+		-- Phase 1: collect distinct names and entry bases by first appearance order.
+		local entryBaseSeen = {}
+		for _, line in ipairs(lines) do
+			scanTokens(line, function(tok)
+				local kind, base, suf = classify(tok)
+				if kind and not renames[tok] then
+					renames[tok] = true
+					if kind == "state" then
+						stateOrder[#stateOrder + 1] = tok
+					elseif kind == "flag" then
+						flagOrder[#flagOrder + 1] = tok
+					elseif kind == "value" then
+						valueOrder[#valueOrder + 1] = tok
+					else
+						-- entry: number by distinct base.  Carry the optional
+						-- `_N` index suffix through so `arg1_entry_2` becomes
+						-- `v<K>_e_2`, preserving the iteration-alias distinction.
+						if not entryBaseSeen[base] then
+							entryBaseSeen[base] = #entryOrder + 1
+							entryOrder[#entryOrder + 1] = base
+						end
+						renames[tok] = "v" .. entryBaseSeen[base] .. "_e" .. (suf or "")
+					end
+				end
+			end)
+		end
+		for idx, name in ipairs(stateOrder) do renames[name] = "s" .. idx end
+		for idx, name in ipairs(flagOrder) do renames[name] = "f" .. idx end
+		for idx, name in ipairs(valueOrder) do renames[name] = "v_u" .. idx end
+		-- Bytecode pre-scan: find function params that are captured by a child
+		-- closure under the name `self`.  The Roblox Luau compiler records the
+		-- captured upvalue's locvar name (in the CHILD proto's upvalue list),
+		-- so when the original source wrote `function module:Method(...)` the
+		-- implicit `self` parameter shows up as `self` in any inner closure's
+		-- upvalue list.  By renaming the parent's first param to `self` we
+		-- restore the original method-style signature and incidentally avoid
+		-- emitting a redundant `local self = v<N>` materialization line.
+		local selfParamHint = {}  -- protoId -> { [regIdx]=true }
+		for parentId = 0, #bc.protos - 1 do
+			local p = protoAt(bc, parentId)
+			if p then
+				local pc = 0
+				while pc < #p.code do
+					local insn = codeWordAt(p, pc)
+					local op = bit32_band(insn, 0xFF)
+					local opName = OPCODES[op] or ""
+					if opName == "NEWCLOSURE" or opName == "DUPCLOSURE" then
+						local d = decodeSignedD(insn)
+						local childId
+						if opName == "NEWCLOSURE" then
+							childId = childProtoIdAt(p, d)
+						else
+							local cc = constantAt(p, d)
+							childId = cc and cc.kind == "closure" and cc.value or nil
+						end
+						local childProto = type(childId) == "number" and protoAt(bc, childId) or nil
+						local capPc = pc + getOpLength(opName)
+						local capIdx = 1
+						while capPc < #p.code do
+							local capInsn = codeWordAt(p, capPc)
+							local capOpId = bit32_band(capInsn, 0xFF)
+							if (OPCODES[capOpId] or "") ~= "CAPTURE" then break end
+							local capKindId = bit32_band(bit32_rshift(capInsn, 8), 0xFF)
+							local capKind = CAPTURE_KINDS[capKindId] or ""
+							local capReg = bit32_band(bit32_rshift(capInsn, 16), 0xFF)
+							if (capKind == "VAL" or capKind == "REF") and childProto then
+								local uvName = childProto.upvalues[capIdx]
+								if uvName == "self" and capReg < (p.numparams or 0) then
+									selfParamHint[parentId] = selfParamHint[parentId] or {}
+									selfParamHint[parentId][capReg] = true
+								end
+							end
+							capIdx = capIdx + 1
+							capPc = capPc + getOpLength("CAPTURE")
+						end
+					end
+					pc = pc + (opName ~= "" and getOpLength(opName) or 1)
+				end
+			end
+		end
+		-- Phase 2: walk lines with a block stack to build per-function arg maps.
+		-- Each entry on the stack is { kind=function|block, argMap?, indent }.
+		-- The active argMap is the topmost function entry on the stack.
+		local stack = {}
+		local nextV = 1
+		local lineFuncMap = {}  -- li -> argMap (the active argMap for that line)
+		local function topFuncMap()
+			for k = #stack, 1, -1 do
+				if stack[k].kind == "function" then return stack[k].argMap end
+			end
+			return nil
+		end
+		local function lineOpens(text)
+			if text == "do" or text == "repeat" then return true end
+			if text:sub(1, 3) == "if " or text:match("^if%s.*%sthen$") then return true end
+			if text:sub(1, 4) == "for " then return true end
+			if text:sub(1, 6) == "while " then return true end
+			return false
+		end
+		local function tokenizeArgs(s)
+			local out = {}
+			for tok in s:gmatch("[%a_][%w_]*") do out[#out + 1] = tok end
+			return out
+		end
+		for li, line in ipairs(lines) do
+			local indent = line:match("^(%s*)") or ""
+			local text = line:match("^%s*(.-)%s*$")
+			-- Pop block entries whose indent equals current `end`/`elseif`/`else`.
+			-- For simplicity: when we see `end` or `until ...`, pop one entry.
+			-- Active map is recorded BEFORE we process opens on this line.
+			lineFuncMap[li] = topFuncMap()
+			-- Detect function definition on this line.
+			-- Supports: `local function NAME(args)` and `function NAME(args)`
+			-- and anonymous `function(args)` literals (e.g., proto[7], inside `:Connect(function(...)`)
+			local argList = line:match("function%s+[%a_][%w_%.:]*%s*%((.-)%)")
+				or line:match("function%s*%((.-)%)")
+			if argList ~= nil then
+				-- A nested function inherits its enclosing function's argMap, so that
+				-- upvalue references to outer parameters (e.g. an inner closure that
+				-- captures the parent's `arg0`) resolve to the same renumbered `vN`.
+				-- The nested function then overrides entries for its OWN parameters.
+				local outerMap = topFuncMap()
+				local argMap = {}
+				if outerMap then
+					for k, v in pairs(outerMap) do argMap[k] = v end
+				end
+				-- If the line carries a `-- proto[N]` annotation, consult the
+				-- `selfParamHint` map to keep `self` (instead of `vK`) for any
+				-- parameter the original source declared as the implicit colon
+				-- self.
+				local protoIdStr = line:match("%-%-%s*proto%[(%d+)%]")
+				local hintForProto = protoIdStr and selfParamHint[tonumber(protoIdStr)] or nil
+				local argTokens = tokenizeArgs(argList)
+				for idx, tok in ipairs(argTokens) do
+					if tok:match("^arg%d+$") then
+						local regIdx = idx - 1
+						if hintForProto and hintForProto[regIdx] then
+							argMap[tok] = "self"
+						else
+							argMap[tok] = "v" .. nextV
+							nextV = nextV + 1
+						end
+					end
+				end
+				stack[#stack + 1] = { kind = "function", argMap = argMap, indent = indent }
+				-- After we pushed the new function, references on this same line (e.g. in the
+				-- signature) should resolve against the NEW map.
+				lineFuncMap[li] = argMap
+			elseif lineOpens(text) then
+				stack[#stack + 1] = { kind = "block", indent = indent }
+			elseif text == "end" or text:sub(1, 6) == "until " then
+				if #stack > 0 then stack[#stack] = nil end
+			end
+		end
+		local function renameTokenInScope(tok, argMap)
+			local mapped = renames[tok]
+			if type(mapped) == "string" then return mapped end
+			if argMap then
+				local v = argMap[tok]
+				if v then return v end
+			end
+			return tok
+		end
+		local function rewriteLine(line, argMap)
+			local out, i, len = {}, 1, #line
+			local inStr = nil
+			while i <= len do
+				local c = line:sub(i, i)
+				if inStr then
+					out[#out + 1] = c
+					if c == "\\" and i < len then
+						out[#out + 1] = line:sub(i + 1, i + 1)
+						i = i + 2
+					elseif c == inStr then
+						inStr = nil
+						i = i + 1
+					else
+						i = i + 1
+					end
+				elseif c == '"' or c == "'" then
+					inStr = c
+					out[#out + 1] = c
+					i = i + 1
+				elseif c:match("[%a_]") then
+					local j = i
+					while j <= len and line:sub(j, j):match("[%w_]") do j = j + 1 end
+					out[#out + 1] = renameTokenInScope(line:sub(i, j - 1), argMap)
+					i = j
+				else
+					out[#out + 1] = c
+					i = i + 1
+				end
+			end
+			return table.concat(out)
+		end
+		for li, line in ipairs(lines) do
+			lines[li] = rewriteLine(line, lineFuncMap[li])
+		end
+		-- Drop identity-alias lines that became `local X = X` after we renamed
+		-- a parent's parameter to `self`.  The materialization in
+		-- `flushPendingClosure` emitted `local self = arg<N>`; after rename
+		-- both sides are the same name and the line is pure noise.
+		do
+			local out = {}
+			for _, line in ipairs(lines) do
+				local lhs, rhs = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+				if lhs and rhs and lhs == rhs then
+					-- skip
+				else
+					out[#out + 1] = line
+				end
+			end
+			lines = out
+		end
+	end
 	return table.concat(lines, "\n")
 end
 
