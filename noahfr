@@ -1,5 +1,5 @@
 --!nocheck
--- ddd
+-- bc i need to use luau lsp to check syntax error
 local bit32_band = bit32.band
 local bit32_rshift = bit32.rshift
 
@@ -172,6 +172,13 @@ local function numToString(x)
 	end
 	if isInteger(x) and math.abs(x) < 1e16 then
 		return string.format("%.0f", x)
+	end
+	-- Try progressively shorter representations; use the shortest that round-trips.
+	for _, prec in ipairs({14, 15, 16, 17}) do
+		local s = string.format("%." .. tostring(prec) .. "g", x)
+		if tonumber(s) == x then
+			return s
+		end
 	end
 	return string.format("%.17g", x)
 end
@@ -5761,32 +5768,37 @@ local function fixInvertedFalseyGuard(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
-		local ind, name = lines[i]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
-		if ind and name then
+		-- Match simple identifier guard: `if NAME then`
+		-- OR field-access guard: `if NAME.field then` / `if NAME.field.field then`
+		local ind, condExpr = lines[i]:match("^(%s*)if%s+([%a_][%w_.]*[%w_])%s+then%s*$")
+		if not ind then
+			-- Also try with parens: `if (NAME.field) then`
+			ind, condExpr = lines[i]:match("^(%s*)if%s+%(([%a_][%w_.]*[%w_])%)%s+then%s*$")
+		end
+		local name = condExpr and condExpr:match("^([%a_][%w_]*)") or nil
+		if ind and name and condExpr then
 			-- Locate the matching `end` at the same indent.
 			local endIdx = nil
 			for j = i + 1, math.min(#lines, i + 12) do
 				local jInd = lines[j]:match("^(%s*)end%s*$")
 				if jInd == ind then endIdx = j; break end
-				-- Bail out if we hit something at the same indent before `end`.
 				local sameIndentNonEnd = lines[j]:match("^(" .. luaPE(ind) .. ")[^%s]") and not lines[j]:match("^" .. luaPE(ind) .. "end")
-				-- (We only really care about finding the end; bail if scanned too long.)
 				if sameIndentNonEnd and j ~= i then break end
 			end
 			if endIdx then
-				-- Body must end with a `return` statement (so the `then` branch
-				-- never falls through).
-				local hasReturn = false
+				-- Body must end with a `return`, `continue`, or `break` statement
+				-- (so the `then` branch never falls through).
+				local hasExit = false
 				for j = i + 1, endIdx - 1 do
 					local t = lines[j]:match("^%s*(.-)%s*$")
-					if t == "return" or t:sub(1, 7) == "return " then
-						hasReturn = true; break
+					if t == "return" or t:sub(1, 7) == "return " or t == "continue" or t == "break" then
+						hasExit = true; break
 					end
 				end
 				-- Subsequent line at the same indent (or deeper) must read NAME
 				-- as a field/method receiver.
 				local usesAfter = false
-				if hasReturn then
+				if hasExit then
 					for j = endIdx + 1, math.min(#lines, endIdx + 6) do
 						local tInd = lines[j]:match("^(%s*)") or ""
 						if #tInd < #ind then break end
@@ -5795,8 +5807,8 @@ local function fixInvertedFalseyGuard(lines)
 						if lines[j]:match("%S") and #tInd <= #ind then break end
 					end
 				end
-				if hasReturn and usesAfter then
-					out[#out+1] = ind .. "if not " .. name .. " then"
+				if hasExit and usesAfter then
+					out[#out+1] = ind .. "if not " .. condExpr .. " then"
 					for j = i + 1, endIdx do out[#out+1] = lines[j] end
 					i = endIdx + 1
 				else
@@ -5809,7 +5821,160 @@ local function fixInvertedFalseyGuard(lines)
 			out[#out+1] = lines[i]; i = i + 1
 		end
 	end
-	return out
+	-- Pass 1b: fix `if EXPR then CALL() end; if not (EXPR) then return end`
+	-- The first if should be `if not EXPR then` (it's a "try to fix nil" pattern).
+	local out1b = {}
+	local j1b = 1
+	while j1b <= #out do
+		local pInd, pExpr = out[j1b]:match("^(%s*)if%s+([%a_][%w_.]*[%w_])%s+then%s*$")
+		if pInd and pExpr and j1b + 2 <= #out then
+			local bodyLine = out[j1b + 1]
+			local endLine = out[j1b + 2]
+			local endInd = endLine and endLine:match("^(%s*)end%s*$")
+			local nextIf = j1b + 3 <= #out and out[j1b + 3] or nil
+			-- Body must be a single function call (indented)
+			local isSingleCall = bodyLine and bodyLine:match("^" .. luaPE(pInd) .. "\t") and not bodyLine:match("^%s*if%s") and not bodyLine:match("^%s*local%s")
+			-- Next line must be `if not (EXPR) then` or `if not EXPR then`
+			local negGuard = nextIf and (
+				nextIf:match("^" .. luaPE(pInd) .. "if%s+not%s+%(" .. luaPE(pExpr) .. "%)%s+then")
+				or nextIf:match("^" .. luaPE(pInd) .. "if%s+not%s+" .. luaPE(pExpr) .. "%s+then")
+			)
+			if endInd == pInd and isSingleCall and negGuard then
+				out1b[#out1b+1] = pInd .. "if not " .. pExpr .. " then"
+				out1b[#out1b+1] = bodyLine
+				out1b[#out1b+1] = endLine
+				j1b = j1b + 3
+			else
+				out1b[#out1b+1] = out[j1b]; j1b = j1b + 1
+			end
+		else
+			out1b[#out1b+1] = out[j1b]; j1b = j1b + 1
+		end
+	end
+	-- Second pass: remove dead code after guard blocks that always return.
+	-- Pattern: if NAME then ... return ... end; DEAD_LINE (dead)
+	-- DEAD_LINE references guard var or a var only assigned inside the guard.
+	local out2 = {}
+	local j = 1
+	while j <= #out1b do
+		local gInd, gName = out1b[j]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
+		if not gInd then
+			out2[#out2+1] = out1b[j]; j = j + 1
+		else
+			local gEnd = nil
+			local gHasReturn = false
+			local gDepth = 0
+			local innerAssigned = {}
+			for k = j + 1, math.min(#out1b, j + 30) do
+				local kText = out1b[k]:match("^%s*(.-)%s*$")
+				local kInd = out1b[k]:match("^(%s*)") or ""
+				if kInd == gInd and kText == "end" and gDepth == 0 then
+					gEnd = k; break
+				end
+				if kInd == gInd and (kText:match("^if%s") or kText:match("^for%s") or kText:match("^while%s") or kText == "repeat") then
+					gDepth = gDepth + 1
+				elseif kInd == gInd and kText == "end" and gDepth > 0 then
+					gDepth = gDepth - 1
+				end
+				if kText == "return" or kText:match("^return%s") then
+					gHasReturn = true
+				end
+				-- Collect variables assigned inside the guard block
+				local assignedVar = out1b[k]:match("^%s*([%a_][%w_]*)%s*=")
+				if assignedVar and assignedVar ~= "local" then
+					innerAssigned[assignedVar] = true
+				end
+			end
+			if gEnd and gHasReturn then
+				local nxt = gEnd + 1
+				while nxt <= #out1b and not out1b[nxt]:match("%S") do nxt = nxt + 1 end
+				local deadLine = false
+				if nxt <= #out1b then
+					local nInd = out1b[nxt]:match("^(%s*)") or ""
+					if nInd == gInd then
+						-- Check if dead line references guard var or any inner-assigned var
+						local checkNames = {gName}
+						for vn in pairs(innerAssigned) do checkNames[#checkNames+1] = vn end
+						for _, chkName in ipairs(checkNames) do
+							if deadLine then break end
+							local ni = 1
+							local nLen = #out1b[nxt]
+							while ni <= nLen do
+								local s, e2 = out1b[nxt]:find(chkName, ni, true)
+								if not s then break end
+								local prev = s > 1 and out1b[nxt]:sub(s-1,s-1) or ""
+								local nx = e2+1 <= nLen and out1b[nxt]:sub(e2+1,e2+1) or ""
+								if not prev:match("[%w_]") and (nx == "." or nx == ":" or nx == "[") then
+									deadLine = true; break
+								end
+								ni = e2 + 1
+							end
+						end
+					end
+				end
+				if deadLine then
+					for k = j, gEnd do out2[#out2+1] = out1b[k] end
+					j = nxt + 1
+				else
+					out2[#out2+1] = out1b[j]; j = j + 1
+				end
+			else
+				out2[#out2+1] = out1b[j]; j = j + 1
+			end
+		end
+	end
+	-- Third pass: fix `if (EXPR) then return _rN end` where _rN is undeclared.
+	-- This arises when a JUMPIF skips over a NEWTABLE that overwrites the same
+	-- register.  The correct return value is EXPR itself.
+	local out3 = {}
+	for k = 1, #out2 do
+		local ln = out2[k]
+		local mInd, mExpr, mVar = ln:match("^(%s*)if%s+(%(.+%))%s+then%s+return%s+(_r%d+)%s+end%s*$")
+		if mVar then
+			-- Check if _rN is declared anywhere before this line
+			local declared = false
+			for prev = 1, k - 1 do
+				if out2[prev]:match("%f[%a_]" .. mVar .. "%f[^%a_%d]") then
+					declared = true; break
+				end
+			end
+			if not declared then
+				out3[#out3+1] = mInd .. "if " .. mExpr .. " then return " .. mExpr .. " end"
+			else
+				out3[#out3+1] = ln
+			end
+		else
+			out3[#out3+1] = ln
+		end
+	end
+	-- Fourth pass: remove stale `X = X_result` assignments where X_result is
+	-- an undeclared variable (artifact of CALL result register reuse).
+	-- Pattern: `VAR = someFunction(...)\n VAR = someFunction_result`
+	local out4 = {}
+	for k = 1, #out3 do
+		local ln = out3[k]
+		local assignInd, lhs, rhs = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a_][%w_]*_result%d*)%s*$")
+		if assignInd and rhs then
+			-- Check if rhs is declared anywhere before this line
+			local declared = false
+			for prev = 1, k - 1 do
+				if out3[prev]:match("%f[%a_]local%s+" .. rhs .. "%f[^%a_%d]")
+					or out3[prev]:match("%f[%a_]" .. rhs .. "%s*=")
+					or out3[prev]:match(",%s*" .. rhs .. "%f[^%a_%d]")
+				then
+					declared = true; break
+				end
+			end
+			if not declared then
+				-- Skip this dead assignment line
+			else
+				out4[#out4+1] = ln
+			end
+		else
+			out4[#out4+1] = ln
+		end
+	end
+	return out4
 end
 
 local function fixInvertedIsaGuard(lines)
