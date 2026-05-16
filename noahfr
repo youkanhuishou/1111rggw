@@ -17,8 +17,6 @@ local LBC_CONSTANT_VECTOR = 7
 local LBC_CONSTANT_TABLE_WITH_CONSTANTS = 8
 local LBC_CONSTANT_INTEGER = 9
 
--- Pass dispatch table (used to add new transform passes without bumping the
--- module-level local count past 200).
 local PASSES = {}
 
 local ROBLOX_OPCODES = {
@@ -1658,6 +1656,7 @@ local function analyzeProtoFlow(p, bc)
 		concatPhiHints = {},
 		orDefaultHints = { jumps = {}, fallbacks = {}, uses = {} },
 		counterHints = { initializers = {}, increments = {} },
+		backEdgeMutationHints = {},
 		regVersionsByPc = {},
 		regWrites = {},
 		regWritesByBlock = {},
@@ -2810,6 +2809,70 @@ local function analyzeProtoFlow(p, bc)
 			end
 		end
 	end
+	-- Detect back-edge counter mutations (generic): a SUBK/ADDK/MULK/etc. inside a
+	-- loop body whose destination register R has a read of R earlier in the same
+	-- loop body. This means R carries state across iterations and must be
+	-- materialized as an explicit assignment (R = R - K) instead of being inlined
+	-- as an expression (regs[R] = "(R - K)"), otherwise the loop body would
+	-- contain no mutation visible to subsequent comparisons.
+	local arithKOps = {
+		ADDK = true, SUBK = true, MULK = true, DIVK = true,
+		MODK = true, POWK = true, IDIVK = true,
+	}
+	for _, edge in ipairs(cfg.backEdges or {}) do
+		local headBlock = cfg.blocks[edge.to]
+		local tailBlock = cfg.blocks[edge.from]
+		if headBlock and tailBlock and headBlock.startPc <= tailBlock.lastPc then
+			local loopStart = headBlock.startPc
+			local loopEnd = tailBlock.lastPc
+			local scanPc = loopStart
+			while scanPc <= loopEnd and scanPc < #p.code do
+				local info = cfg.instructions[scanPc] or decodedInsnAt(p, scanPc)
+				if arithKOps[info.opName] then
+					local destReg = info.a
+					-- Check: is destReg read at some pc' in [loopStart, scanPc) inside this loop body?
+					local readBefore = false
+					local probe = loopStart
+					while probe < scanPc do
+						local pi = cfg.instructions[probe] or decodedInsnAt(p, probe)
+						if instrReadsReg(pi, destReg) then
+							readBefore = true
+							break
+						end
+						probe = probe + pi.len
+					end
+					if readBefore then
+						-- Find the initializer write before the loop (most recent write)
+						local initWrite = lastWriteBefore(destReg, loopStart)
+						local initPc = initWrite and initWrite.pc or nil
+						-- Choose a stable target name: prefer existing locvar, else generated
+						local targetName
+						local lv = locvarAt(p, destReg, scanPc)
+						if lv and isValidIdent(lv.name) then
+							targetName = lv.name
+						else
+							targetName = stableGeneratedTempName(destReg, "_value_")
+						end
+						analysis.backEdgeMutationHints[scanPc] = {
+							reg = destReg,
+							targetName = targetName,
+							initPc = initPc,
+						}
+						-- Mark the initializer write so it materializes a local
+						-- declaration of TARGETNAME with the appropriate initial value.
+						if initPc and not analysis.backEdgeMutationHints[initPc] then
+							analysis.backEdgeMutationHints[initPc] = {
+								reg = destReg,
+								targetName = targetName,
+								isInit = true,
+							}
+						end
+					end
+				end
+				scanPc = scanPc + info.len
+			end
+		end
+	end
 	return analysis
 end
 
@@ -3616,6 +3679,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "LOADN" then
+		local backEdgeInit = flowAnalysis and flowAnalysis.backEdgeMutationHints and flowAnalysis.backEdgeMutationHints[pc] or nil
+		if backEdgeInit and backEdgeInit.isInit and backEdgeInit.reg == a and backEdgeInit.targetName and isValidIdent(backEdgeInit.targetName) then
+			local targetName = sanitizeLocalName(backEdgeInit.targetName, a)
+			regs[a] = targetName
+			return indent .. "local " .. targetName .. " = " .. tostring(d), 0
+		end
 		local counterName = flowAnalysis and flowAnalysis.counterHints and flowAnalysis.counterHints.initializers and flowAnalysis.counterHints.initializers[pc] or nil
 		if counterName and isValidIdent(counterName) then
 			regs[a] = counterName
@@ -3627,6 +3696,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "LOADK" or opName == "LOADKC" or opName == "LOADKX" then
 		local idx = opName == "LOADKC" and c or (opName == "LOADK" and d or aux)
+		local backEdgeInit = flowAnalysis and flowAnalysis.backEdgeMutationHints and flowAnalysis.backEdgeMutationHints[pc] or nil
+		if backEdgeInit and backEdgeInit.isInit and backEdgeInit.reg == a and backEdgeInit.targetName and isValidIdent(backEdgeInit.targetName) then
+			local targetName = sanitizeLocalName(backEdgeInit.targetName, a)
+			regs[a] = targetName
+			return indent .. "local " .. targetName .. " = " .. kvalLua(p, idx), 0
+		end
 		regs[a] = kvalLua(p, idx)
 		return assignLocalOrExisting(a, regs[a]), 0
 	end
@@ -4461,7 +4536,14 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			POW = "^",
 			IDIV = "//",
 		}
-		regs[a] = "(" .. rname(b) .. " " .. symbols[opName] .. " " .. rname(c) .. ")"
+		local expr = "(" .. rname(b) .. " " .. symbols[opName] .. " " .. rname(c) .. ")"
+		local backEdgeInit = flowAnalysis and flowAnalysis.backEdgeMutationHints and flowAnalysis.backEdgeMutationHints[pc] or nil
+		if backEdgeInit and backEdgeInit.isInit and backEdgeInit.reg == a and backEdgeInit.targetName and isValidIdent(backEdgeInit.targetName) then
+			local targetName = sanitizeLocalName(backEdgeInit.targetName, a)
+			regs[a] = targetName
+			return indent .. "local " .. targetName .. " = " .. expr, 0
+		end
+		regs[a] = expr
 		return nil, 0
 	end
 
@@ -4480,6 +4562,23 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			POWK = "^",
 			IDIVK = "//",
 		}
+		local backEdgeHint = flowAnalysis and flowAnalysis.backEdgeMutationHints and flowAnalysis.backEdgeMutationHints[pc] or nil
+		if backEdgeHint and backEdgeHint.reg == a and backEdgeHint.targetName and isValidIdent(backEdgeHint.targetName) then
+			-- Materialize as explicit assignment: R = R - K (force LHS/RHS to use the same target name).
+			local lhsName = sanitizeLocalName(backEdgeHint.targetName, a)
+			local rhsName
+			if b == a then
+				-- Self-mutation: RHS reads the same logical local as LHS.
+				rhsName = lhsName
+			else
+				rhsName = rname(b)
+			end
+			local rhs = rhsName .. " " .. symbols[opName] .. " " .. kvalLua(p, c)
+			regs[a] = lhsName
+			-- The init-write before the loop was responsible for the `local lhsName = INITVAL`
+			-- declaration; the loop body just emits assignments.
+			return indent .. lhsName .. " = " .. rhs, 0
+		end
 		regs[a] = "(" .. rname(b) .. " " .. symbols[opName] .. " " .. kvalLua(p, c) .. ")"
 		return nil, 0
 	end
@@ -5132,6 +5231,7 @@ local function liftAngleNormalizationArtifacts(lines, indentUnit)
 	end
 	return out
 end
+
 
 -- Lift numeric for: FORNPREP/FORNLOOP comments -> `for i = init, limit, step do`
 local function liftNumericFor(lines, indentUnit)
@@ -6299,6 +6399,162 @@ PASSES.fixCapturedUpvalueLocal = function(lines)
 		fixOne(i)
 	end
 	return out
+end
+
+-- Inline single-use anonymous function declarations.
+-- Pattern:
+--     local function anonN(args) ...
+--         BODY
+--     end
+--     SOME_EXPR(... anonN ...)        -- single reference
+-- Becomes:
+--     SOME_EXPR(... function(args)
+--         BODY
+--     end ...)
+PASSES.inlineSingleUseAnonFunctions = function(lines)
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	local explicitlyEmptied = {}
+	-- Helper: drop anonymous function declarations with ZERO references.
+	-- These come from source code where a closure was created but never called.
+	local function tryDropDead(i)
+		local fnInd, fnName, fnArgs = out[i]:match("^(%s*)local%s+function%s+([%a_][%w_]*)%s*(%b())")
+		if not fnInd or not fnName or not fnArgs then return end
+		if not fnName:match("^anon%d+$") then return end
+		local fnEnd = nil
+		for j = i + 1, #out do
+			local jInd = out[j]:match("^(%s*)") or ""
+			local jText = out[j]:match("^%s*(.-)%s*$") or ""
+			if jInd == fnInd and jText == "end" then
+				fnEnd = j
+				break
+			end
+		end
+		if not fnEnd then return end
+		local pat = "%f[%a_]" .. luaPE(fnName) .. "%f[^%a_%d]"
+		for j = 1, #out do
+			if j < i or j > fnEnd then
+				local lineText = out[j]:match("^%s*(.-)%s*$") or ""
+				if lineText:sub(1, 2) ~= "--" and out[j]:find(pat) then
+					return  -- has a real reference, keep
+				end
+			end
+		end
+		-- Zero refs: drop the whole declaration
+		for j = i, fnEnd do
+			out[j] = ""
+			explicitlyEmptied[j] = true
+		end
+	end
+	local function tryInline(i)
+		local fnInd, fnName, fnArgs = out[i]:match("^(%s*)local%s+function%s+([%a_][%w_]*)%s*(%b())")
+		if not fnInd or not fnName or not fnArgs then return end
+		if not fnName:match("^anon%d+$") then return end
+		-- Find matching `end` at same indent
+		local fnEnd = nil
+		for j = i + 1, #out do
+			local jInd = out[j]:match("^(%s*)") or ""
+			local jText = out[j]:match("^%s*(.-)%s*$") or ""
+			if jInd == fnInd and jText == "end" then
+				fnEnd = j
+				break
+			end
+		end
+		if not fnEnd then return end
+		-- Count references to NAME outside the declaration block
+		local refLine = nil
+		local refCount = 0
+		local pat = "%f[%a_]" .. luaPE(fnName) .. "%f[^%a_%d]"
+		for j = 1, #out do
+			if j < i or j > fnEnd then
+				local lineText = out[j]:match("^%s*(.-)%s*$") or ""
+				-- Skip comment-only lines (start with --)
+				if lineText:sub(1, 2) ~= "--" then
+					if out[j]:find(pat) then
+						refCount = refCount + 1
+						refLine = j
+						if refCount > 1 then return end
+					end
+				end
+			end
+		end
+		if refCount ~= 1 or not refLine then return end
+		-- Reference must be after declaration end and within reasonable range
+		-- (we still want to inline cross-scope cases, just not when very far)
+		if refLine < fnEnd then return end
+		-- The reference line must contain `anonN` in argument position
+		local refInd = out[refLine]:match("^(%s*)") or ""
+		if #refInd < #fnInd then return end
+		local s, e = out[refLine]:find(pat)
+		if not s then return end
+		local before = out[refLine]:sub(1, s - 1)
+		local after = out[refLine]:sub(e + 1)
+		if not before:match("[(,]%s*$") then return end
+		if not after:match("^%s*[%),]") then return end
+		-- Build inline form
+		local origBodyInd = fnInd .. "\t"
+		local newBodyInd = refInd .. "\t"
+		local bodyLines = {}
+		for j = i + 1, fnEnd - 1 do
+			local bl = out[j]
+			if bl:sub(1, #origBodyInd) == origBodyInd then
+				bodyLines[#bodyLines + 1] = newBodyInd .. bl:sub(#origBodyInd + 1)
+			else
+				bodyLines[#bodyLines + 1] = bl
+			end
+		end
+		local newLines = {}
+		newLines[#newLines + 1] = before .. "function" .. fnArgs
+		for _, bl in ipairs(bodyLines) do newLines[#newLines + 1] = bl end
+		newLines[#newLines + 1] = refInd .. "end" .. after
+		for j = i, fnEnd do
+			out[j] = ""
+			explicitlyEmptied[j] = true
+		end
+		for j = fnEnd + 1, refLine - 1 do
+			if not out[j]:match("%S") then
+				out[j] = ""
+				explicitlyEmptied[j] = true
+			end
+		end
+		out[refLine] = table.concat(newLines, "\n")
+	end
+	local i = #out
+	while i >= 1 do
+		if out[i]:find("local%s+function%s+anon%d+") then
+			tryInline(i)
+			-- After tryInline (which may have done nothing), also try dropping dead.
+			-- Re-check the line still has the declaration (tryInline may have emptied it).
+			if out[i]:find("local%s+function%s+anon%d+") then
+				tryDropDead(i)
+			end
+		end
+		i = i - 1
+	end
+	-- Split multi-line out entries and drop the explicitly emptied ones.
+	-- Also collapse runs of blank lines (>1 consecutive blank) introduced by drops.
+	local final = {}
+	local prevBlank = false
+	for idx, ln in ipairs(out) do
+		if explicitlyEmptied[idx] then
+			-- skip
+		elseif ln:find("\n", 1, true) then
+			for sub in (ln .. "\n"):gmatch("([^\n]*)\n") do
+				local isBlank = sub == "" or not sub:match("%S")
+				if not (isBlank and prevBlank) then
+					final[#final + 1] = sub
+				end
+				prevBlank = isBlank
+			end
+		else
+			local isBlank = ln == "" or not ln:match("%S")
+			if not (isBlank and prevBlank) then
+				final[#final + 1] = ln
+			end
+			prevBlank = isBlank
+		end
+	end
+	return final
 end
 
 PASSES.fixSelfReferentialReassignment = function(lines)
@@ -13255,6 +13511,8 @@ local function renderSource(bc)
 	-- Fix captured upvalue locals: when a closure captures NAME but NAME is
 	-- never assigned, find the loop-local that should be assigned to NAME.
 	lines = PASSES.fixCapturedUpvalueLocal(lines)
+	-- Inline single-use anonymous functions: `local function anonN() ... end; X(anonN)` -> `X(function() ... end)`
+	lines = PASSES.inlineSingleUseAnonFunctions(lines)
 	-- Drop duplicate `local NAME` declarations introduced by multiple hoist passes.
 	lines = PASSES.dropDuplicateLocalForwardDecls(lines)
 	return table.concat(lines, "\n")
