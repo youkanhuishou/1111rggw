@@ -17,6 +17,10 @@ local LBC_CONSTANT_VECTOR = 7
 local LBC_CONSTANT_TABLE_WITH_CONSTANTS = 8
 local LBC_CONSTANT_INTEGER = 9
 
+-- Pass dispatch table (used to add new transform passes without bumping the
+-- module-level local count past 200).
+local PASSES = {}
+
 local ROBLOX_OPCODES = {
 	[4] = "POWK",
 	[9] = "MUL",
@@ -36,6 +40,7 @@ local ROBLOX_OPCODES = {
 	[62] = "DIVK",
 	[67] = "ADD",
 	[71] = "JUMPXEQKNIL",
+	[72] = "JUMPBACK",
 	[76] = "FASTCALL1",
 	[77] = "GETTABLEKS",
 	[81] = "FORGPREP_NEXT",
@@ -58,7 +63,7 @@ local ROBLOX_OPCODES = {
 	[140] = "LOADN",
 	[144] = "ORK",
 	[149] = "ADDK",
-	[154] = "JUMPIFEQ",
+	[154] = "JUMPIFNOTEQ",
 	[158] = "FASTCALL2K",
 	[159] = "CALL",
 	[163] = "PREPVARARGS",
@@ -1329,11 +1334,6 @@ local function isReturnInsn(opName)
 	return opName == "RETURN"
 end
 
-local function setHasAny(s)
-	for _ in pairs(s or {}) do return true end
-	return false
-end
-
 local function setEquals(a, b)
 	for k in pairs(a or {}) do
 		if not b or not b[k] then return false end
@@ -1354,14 +1354,6 @@ local function intersectSets(a, b)
 	local out = {}
 	for k in pairs(a or {}) do
 		if b and b[k] then out[k] = true end
-	end
-	return out
-end
-
-local function allBlockSet(blocks)
-	local out = {}
-	for _, block in ipairs(blocks or {}) do
-		out[block.id] = true
 	end
 	return out
 end
@@ -2407,9 +2399,19 @@ local function analyzeProtoFlow(p, bc)
 				if info.opName == "JUMPIF"
 					and preWrite
 					and fallbackWrite
-					and preWrite.opName == "MOVE"
-					and (fallbackWrite.opName == "NEWTABLE" or fallbackWrite.opName == "DUPTABLE")
+					and preWrite.expr
 					and fallbackWrite.expr
+					and (preWrite.opName == "MOVE" or preWrite.opName == "GETTABLEKS"
+						or preWrite.opName == "GETTABLE" or preWrite.opName == "GETTABLEN"
+						or preWrite.opName == "GETIMPORT" or preWrite.opName == "GETUPVAL"
+						or preWrite.opName == "GETGLOBAL")
+					and (fallbackWrite.opName == "NEWTABLE" or fallbackWrite.opName == "DUPTABLE"
+						or fallbackWrite.opName == "GETTABLEKS" or fallbackWrite.opName == "GETTABLE"
+						or fallbackWrite.opName == "GETTABLEN" or fallbackWrite.opName == "GETIMPORT"
+						or fallbackWrite.opName == "GETUPVAL" or fallbackWrite.opName == "GETGLOBAL"
+						or fallbackWrite.opName == "MOVE" or fallbackWrite.opName == "LOADK"
+						or fallbackWrite.opName == "LOADN" or fallbackWrite.opName == "LOADKX"
+						or fallbackWrite.opName == "LOADB" or fallbackWrite.opName == "LOADNIL")
 					and onlyFallbackWriteBetween(info.pc + info.len, target, fallbackWrite.pc)
 				then
 					local sourceExpr = preWrite.sourceName or preWrite.expr
@@ -3695,6 +3697,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "GETIMPORT" then
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return nil, 0
+		end
 		local parts = decodeImportId(aux or 0, p)
 		local resolved = parts
 		local path = #resolved > 0 and table.concat(resolved, ".") or ("import(" .. tostring(d) .. ")")
@@ -3709,6 +3716,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "GETUPVAL" then
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return nil, 0
+		end
 		local upvalueName = p.upvalues[b + 1] or ("U" .. tostring(b))
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
@@ -3838,6 +3850,11 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 	end
 
 	if opName == "GETTABLEKS" then
+		local orHint = flowAnalysis and flowAnalysis.orDefaultHints and flowAnalysis.orDefaultHints.fallbacks and flowAnalysis.orDefaultHints.fallbacks[pc] or nil
+		if orHint and orHint.reg == a and orHint.expr then
+			regs[a] = orHint.expr
+			return nil, 0
+		end
 		local idx = aux ~= nil and aux or d
 		local keyConst = constantAt(p, idx)
 		local key = keyConst and keyConst.kind == "string" and keyConst.value or ("K[" .. tostring(idx) .. "]")
@@ -4890,9 +4907,6 @@ local function matchReturn(s)
 end
 
 -- Check if string s matches for-open ^(\s*)for\b.*\bdo\s*$
-local function matchForOpen(s)
-	return s:match("^(%s*)for%s.+%sdo%s*$")
-end
 
 -- Check if string s matches loop-open (for/while/repeat)
 local function matchLoopOpen(s)
@@ -5490,6 +5504,66 @@ local function collapseSingleIfChain(lines)
 end
 
 -- Drop empty `if cond then end` blocks
+-- Drop dead else-clobber: `if COND then X = E end / else X = E end` where the
+-- same X is assigned to the same expression E in both branches (and X was
+-- assigned before the if). The else branch is dead because the truthy path
+-- preserves X's prior value; the else's clobber would overwrite it.
+-- This handles the bytecode pattern from `or` short-circuit fallback that
+-- was over-decoded into both branches.
+local function dropDeadElseClobber(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local handled = false
+		if i + 4 <= #lines then
+			local ifInd, ifCond = lines[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+			local thenLine = lines[i + 1]
+			local elseInd = lines[i + 2]:match("^(%s*)else%s*$")
+			local elseLine = lines[i + 3]
+			local endInd = lines[i + 4]:match("^(%s*)end%s*$")
+			if ifInd and elseInd == ifInd and endInd == ifInd then
+				local thenLineInd = thenLine:match("^(%s*)") or ""
+				local elseLineInd = elseLine:match("^(%s*)") or ""
+				if thenLineInd == elseLineInd and #thenLineInd > #ifInd then
+					local thenAssign = thenLine:sub(#thenLineInd + 1)
+					local elseAssign = elseLine:sub(#elseLineInd + 1)
+					if thenAssign == elseAssign then
+						local lhs, rhs = thenAssign:match("^([%a_][%w_.%[%]]*)%s*=%s*(.+)$")
+						if lhs and rhs and not lhs:find("(", 1, true) then
+							local xBase = lhs:match("^([%a_][%w_]*)") or lhs
+							local assignedBefore = false
+							local scanStart = math.max(1, i - 12)
+							for k = scanStart, i - 1 do
+								local kInd = lines[k]:match("^(%s*)") or ""
+								if #kInd <= #thenLineInd then
+									if lines[k]:match("^" .. luaPE(kInd) .. luaPE(lhs) .. "%s*=") then
+										assignedBefore = true; break
+									end
+									if lines[k]:match("^" .. luaPE(kInd) .. "local%s+" .. luaPE(xBase) .. "%s*=") then
+										assignedBefore = true; break
+									end
+								end
+							end
+							if assignedBefore then
+								out[#out+1] = ifInd .. "if " .. ifCond .. " then"
+								out[#out+1] = thenLine
+								out[#out+1] = ifInd .. "end"
+								i = i + 5
+								handled = true
+							end
+						end
+					end
+				end
+			end
+		end
+		if not handled then
+			out[#out+1] = lines[i]
+			i = i + 1
+		end
+	end
+	return out
+end
+
 local function dropEmptyIfBlocks(lines)
 	local changed = true
 	local out = {}
@@ -5768,14 +5842,15 @@ local function fixInvertedFalseyGuard(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
-		-- Match simple identifier guard: `if NAME then`
-		-- OR field-access guard: `if NAME.field then` / `if NAME.field.field then`
-		local ind, condExpr = lines[i]:match("^(%s*)if%s+([%a_][%w_.]*[%w_])%s+then%s*$")
+		-- Match SIMPLE IDENTIFIER guard ONLY: `if NAME then`
+		-- (NOT field access like `if X.field then` — that would be too aggressive
+		-- because using `X.other_field` after the guard is normal, not an inversion signal.)
+		local ind, condExpr = lines[i]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
 		if not ind then
-			-- Also try with parens: `if (NAME.field) then`
-			ind, condExpr = lines[i]:match("^(%s*)if%s+%(([%a_][%w_.]*[%w_])%)%s+then%s*$")
+			-- Try with parens: `if (NAME) then`
+			ind, condExpr = lines[i]:match("^(%s*)if%s+%(([%a_][%w_]*)%)%s+then%s*$")
 		end
-		local name = condExpr and condExpr:match("^([%a_][%w_]*)") or nil
+		local name = condExpr
 		if ind and name and condExpr then
 			-- Locate the matching `end` at the same indent.
 			local endIdx = nil
@@ -5851,23 +5926,116 @@ local function fixInvertedFalseyGuard(lines)
 			out1b[#out1b+1] = out[j1b]; j1b = j1b + 1
 		end
 	end
+	-- Pass 1c: fix `if not X.field then return end; X.field = value` to
+	-- `if X.field then return end; X.field = value`.
+	-- This appears when the bytecode does `if X.field then goto exit end; X.field = true`.
+	-- The reversed guard means "if already in this state, exit" not "if not yet in this state, exit".
+	local out1c = {}
+	local jc = 1
+	while jc <= #out1b do
+		local cInd, cExpr = out1b[jc]:match("^(%s*)if%s+not%s+([%a_][%w_.]*[%w_])%s+then%s+return%s+end%s*$")
+		if not cInd then
+			cInd, cExpr = out1b[jc]:match("^(%s*)if%s+not%s+%(([%a_][%w_.]*[%w_])%)%s+then%s+return%s+end%s*$")
+		end
+		-- Also handle multi-line: if not X.field then\n\treturn\nend
+		local multiLine = false
+		if not cInd and jc + 2 <= #out1b then
+			cInd, cExpr = out1b[jc]:match("^(%s*)if%s+not%s+([%a_][%w_.]*[%w_])%s+then%s*$")
+			if not cInd then
+				cInd, cExpr = out1b[jc]:match("^(%s*)if%s+not%s+%(([%a_][%w_.]*[%w_])%)%s+then%s*$")
+			end
+			if cInd and cExpr then
+				local ret = out1b[jc + 1]:match("^%s*(return)%s*$")
+				local en = out1b[jc + 2]:match("^(%s*)end%s*$")
+				if ret and en == cInd then
+					multiLine = true
+				else
+					cInd, cExpr = nil, nil
+				end
+			end
+		end
+		if cInd and cExpr and cExpr:find(".", 1, true) then
+			-- Extract base var (e.g. "v1_e" from "v1_e.IsDying")
+			local baseVar = cExpr:match("^([%a_][%w_]*)%.")
+			-- Look ahead for `X.SAME_FIELD = value` (highest priority — same field assignment indicates state-transition pattern)
+			local skipLines = multiLine and 3 or 1
+			local nextIdx = jc + skipLines
+			while nextIdx <= #out1b and not out1b[nextIdx]:match("%S") do nextIdx = nextIdx + 1 end
+			local shouldReverse = false
+			if nextIdx <= #out1b then
+				-- Strong signal A: same field assigned right after (e.g. v1_e.IsDying = true)
+				-- BUT only if the assigned value is TRUTHY (true / non-false / non-nil).
+				-- Pattern `if not X.field then return end ... X.field = false` is a legitimate
+				-- "cleanup-when-set" pattern (e.g. StopConeSound: only stop if currently playing).
+				local sameFieldPat = "^" .. luaPE(cInd) .. luaPE(cExpr) .. "%s*=%s*"
+				local immediateAssignVal = out1b[nextIdx]:match(sameFieldPat .. "(.+)$")
+				if immediateAssignVal then
+					local valTrim = immediateAssignVal:match("^%s*(.-)%s*$")
+					-- Only reverse when assigned value is "true" or anything non-falsy.
+					-- Reverse when value is `true` literal — explicit state-set.
+					-- Don't reverse when value is `false` or `nil` (cleanup pattern).
+					if valTrim == "true" or (valTrim ~= "false" and valTrim ~= "nil" and not valTrim:match("^false%s")) then
+						shouldReverse = true
+					end
+				elseif baseVar then
+					-- Strong signal B: somewhere in the next ~12 lines at same indent,
+					-- the SAME field is assigned a boolean literal.  Reverse only when
+					-- the assigned value is `true` (set-state pattern), not `false`
+					-- (clear-state / cleanup pattern, where the early-return is correct).
+					local readsField = false
+					local foundTrueAssign = false
+					local foundFalseAssign = false
+					for sc = nextIdx, math.min(#out1b, nextIdx + 12) do
+						local scInd = out1b[sc]:match("^(%s*)") or ""
+						-- Check if this line reads cExpr (not assign)
+						if not out1b[sc]:match(sameFieldPat) then
+							if out1b[sc]:find(luaPE(cExpr), 1, true) then
+								readsField = true; break
+							end
+						end
+						if scInd == cInd and out1b[sc]:match("^" .. luaPE(cInd) .. luaPE(cExpr) .. "%s*=%s*true%s*$") then
+							foundTrueAssign = true
+						elseif scInd == cInd and out1b[sc]:match("^" .. luaPE(cInd) .. luaPE(cExpr) .. "%s*=%s*false%s*$") then
+							foundFalseAssign = true
+						end
+					end
+					if foundTrueAssign and not foundFalseAssign and not readsField then shouldReverse = true end
+				end
+			end
+			if shouldReverse then
+				if multiLine then
+					out1c[#out1c+1] = cInd .. "if " .. cExpr .. " then"
+					out1c[#out1c+1] = out1b[jc + 1]
+					out1c[#out1c+1] = out1b[jc + 2]
+					jc = jc + 3
+				else
+					out1c[#out1c+1] = cInd .. "if " .. cExpr .. " then return end"
+					jc = jc + 1
+				end
+			else
+				out1c[#out1c+1] = out1b[jc]; jc = jc + 1
+			end
+		else
+			out1c[#out1c+1] = out1b[jc]; jc = jc + 1
+		end
+	end
 	-- Second pass: remove dead code after guard blocks that always return.
 	-- Pattern: if NAME then ... return ... end; DEAD_LINE (dead)
 	-- DEAD_LINE references guard var or a var only assigned inside the guard.
 	local out2 = {}
 	local j = 1
-	while j <= #out1b do
-		local gInd, gName = out1b[j]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
+	while j <= #out1c do
+		local gInd, gName = out1c[j]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
 		if not gInd then
-			out2[#out2+1] = out1b[j]; j = j + 1
+			out2[#out2+1] = out1c[j]; j = j + 1
 		else
 			local gEnd = nil
 			local gHasReturn = false
 			local gDepth = 0
 			local innerAssigned = {}
-			for k = j + 1, math.min(#out1b, j + 30) do
-				local kText = out1b[k]:match("^%s*(.-)%s*$")
-				local kInd = out1b[k]:match("^(%s*)") or ""
+			for k = j + 1, math.min(#out1c, j + 30) do
+				local kText = out1c[k]:match("^%s*(.-)%s*$")
+				local kInd = out1c[k]:match("^(%s*)") or ""
 				if kInd == gInd and kText == "end" and gDepth == 0 then
 					gEnd = k; break
 				end
@@ -5880,17 +6048,17 @@ local function fixInvertedFalseyGuard(lines)
 					gHasReturn = true
 				end
 				-- Collect variables assigned inside the guard block
-				local assignedVar = out1b[k]:match("^%s*([%a_][%w_]*)%s*=")
+				local assignedVar = out1c[k]:match("^%s*([%a_][%w_]*)%s*=")
 				if assignedVar and assignedVar ~= "local" then
 					innerAssigned[assignedVar] = true
 				end
 			end
 			if gEnd and gHasReturn then
 				local nxt = gEnd + 1
-				while nxt <= #out1b and not out1b[nxt]:match("%S") do nxt = nxt + 1 end
+				while nxt <= #out1c and not out1c[nxt]:match("%S") do nxt = nxt + 1 end
 				local deadLine = false
-				if nxt <= #out1b then
-					local nInd = out1b[nxt]:match("^(%s*)") or ""
+				if nxt <= #out1c then
+					local nInd = out1c[nxt]:match("^(%s*)") or ""
 					if nInd == gInd then
 						-- Check if dead line references guard var or any inner-assigned var
 						local checkNames = {gName}
@@ -5898,12 +6066,12 @@ local function fixInvertedFalseyGuard(lines)
 						for _, chkName in ipairs(checkNames) do
 							if deadLine then break end
 							local ni = 1
-							local nLen = #out1b[nxt]
+							local nLen = #out1c[nxt]
 							while ni <= nLen do
-								local s, e2 = out1b[nxt]:find(chkName, ni, true)
+								local s, e2 = out1c[nxt]:find(chkName, ni, true)
 								if not s then break end
-								local prev = s > 1 and out1b[nxt]:sub(s-1,s-1) or ""
-								local nx = e2+1 <= nLen and out1b[nxt]:sub(e2+1,e2+1) or ""
+								local prev = s > 1 and out1c[nxt]:sub(s-1,s-1) or ""
+								local nx = e2+1 <= nLen and out1c[nxt]:sub(e2+1,e2+1) or ""
 								if not prev:match("[%w_]") and (nx == "." or nx == ":" or nx == "[") then
 									deadLine = true; break
 								end
@@ -5913,13 +6081,13 @@ local function fixInvertedFalseyGuard(lines)
 					end
 				end
 				if deadLine then
-					for k = j, gEnd do out2[#out2+1] = out1b[k] end
+					for k = j, gEnd do out2[#out2+1] = out1c[k] end
 					j = nxt + 1
 				else
-					out2[#out2+1] = out1b[j]; j = j + 1
+					out2[#out2+1] = out1c[j]; j = j + 1
 				end
 			else
-				out2[#out2+1] = out1b[j]; j = j + 1
+				out2[#out2+1] = out1c[j]; j = j + 1
 			end
 		end
 	end
@@ -5975,6 +6143,710 @@ local function fixInvertedFalseyGuard(lines)
 		end
 	end
 	return out4
+end
+
+-- Fix the `if not X then X = X:METHOD(...) end` (or `X = X.FIELD`) anti-pattern.
+-- This is always wrong: when X is nil, `X:METHOD()` would error.  The source
+-- must have been `if X then X = X:METHOD() end` (chained-find pattern).
+-- Bytecode: JUMPIFNOT R -> skip; R = R:Method(...); ::skip:: — we mis-lifted
+-- the skip-if-not as `if not X then BODY end` instead of `if X then BODY end`.
+PASSES.fixSelfReferentialNotGuard = function(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		-- Inline form: `if not X then X = X:M(...) end` or `if not X then X = X.F end`
+		local inlInd, inlVar, inlRhs = lines[i]:match("^(%s*)if%s+not%s+([%a_][%w_]*)%s+then%s+([%a_][%w_]*)%s*=%s*(.+)%s+end%s*$")
+		if not inlInd then
+			inlInd, inlVar, inlRhs = lines[i]:match("^(%s*)if%s+not%s+%(([%a_][%w_]*)%)%s+then%s+([%a_][%w_]*)%s*=%s*(.+)%s+end%s*$")
+		end
+		if inlInd and inlVar and inlRhs then
+			local lhsName, restRhs = lines[i]:match("then%s+([%a_][%w_]*)%s*=%s*(.+)%s+end%s*$")
+			if lhsName == inlVar and restRhs and (restRhs:find("^" .. luaPE(inlVar) .. "[:%.]")) then
+				out[#out+1] = inlInd .. "if " .. inlVar .. " then " .. lhsName .. " = " .. restRhs .. " end"
+				i = i + 1
+			else
+				out[#out+1] = lines[i]; i = i + 1
+			end
+		else
+			-- Multi-line form:
+			-- if not X then
+			--     X = X:M(...)
+			-- end
+			local mlInd, mlVar = lines[i]:match("^(%s*)if%s+not%s+([%a_][%w_]*)%s+then%s*$")
+			if not mlInd then
+				mlInd, mlVar = lines[i]:match("^(%s*)if%s+not%s+%(([%a_][%w_]*)%)%s+then%s*$")
+			end
+			if mlInd and mlVar and i + 2 <= #lines then
+				local bodyLine = lines[i + 1]
+				local endLine = lines[i + 2]
+				local endInd = endLine and endLine:match("^(%s*)end%s*$")
+				local bLhs, bRhs = bodyLine:match("^%s*([%a_][%w_]*)%s*=%s*(.+)%s*$")
+				if endInd == mlInd and bLhs == mlVar and bRhs and bRhs:find("^" .. luaPE(mlVar) .. "[:%.]") then
+					out[#out+1] = mlInd .. "if " .. mlVar .. " then"
+					out[#out+1] = bodyLine
+					out[#out+1] = endLine
+					i = i + 3
+				else
+					out[#out+1] = lines[i]; i = i + 1
+				end
+			else
+				out[#out+1] = lines[i]; i = i + 1
+			end
+		end
+	end
+	return out
+end
+
+-- Drop dead local declarations: `local X = side_effect_free_expr` where X is never
+-- read after this point.  Conservative: only drops when RHS is a side-effect-free
+-- pattern (field access chain or simple identifier or short `(... or default)`).
+-- Fix CAPTURE REF closures whose captured upvalue isn't assigned in the enclosing
+-- scope.  The pattern:
+--     local NAME                                   -- forward decl, never assigned
+--     for ... do
+--         ...
+--         local TEMP = ...                          -- TEMP is what should be Animation
+--         local function anon() -- upvalues: ..., NAME
+--             ... uses NAME ...
+--         end
+--         pcall(anon, ...)                          -- TEMP is implicit in the call
+--     end
+-- Fix: rename TEMP -> NAME (and drop the redundant `local` so it assigns the outer NAME).
+PASSES.fixCapturedUpvalueLocal = function(lines)
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	-- Find function-level `local NAME` (no init) declarations
+	-- Then look inside any inner closure body for `upvalues: ..., NAME`.
+	-- Heuristic: for each `local function ANON() -- upvalues: ..., NAME`, check
+	-- the closure's body for usage of NAME.  Look BEFORE the closure declaration
+	-- for `local TEMP = ...` at the same indent (one level deeper than the
+	-- forward decl), where TEMP is the most recent unassigned local that the
+	-- closure call uses.  Rename TEMP -> NAME and drop the `local`.
+	local function fixOne(idx)
+		-- Match: `local function NAME() -- upvalues: ..., UPV_NAME`
+		local closureLine = out[idx]
+		if not closureLine then return end
+		local closureInd = closureLine:match("^(%s*)") or ""
+		local upvalueList = closureLine:match("%-%-%s*upvalues:%s*(.+)$")
+		if not upvalueList then return end
+		-- Extract upvalue names
+		local upvNames = {}
+		for u in upvalueList:gmatch("([%a_][%w_]*)") do upvNames[#upvNames+1] = u end
+		if #upvNames == 0 then return end
+		-- For each upvalue, check if it has a function-level `local UPV` (no init)
+		-- and is NEVER assigned, but is USED inside the closure body.
+		for _, upv in ipairs(upvNames) do
+			-- Find function-level `local UPV` declaration before idx, at indent
+			-- shallower than closureInd.
+			local declIdx = nil
+			local declInd = nil
+			for k = idx - 1, 1, -1 do
+				local kInd, kName = out[k]:match("^(%s*)local%s+([%a_][%w_]*)%s*$")
+				if kInd and kName == upv and #kInd < #closureInd then
+					declIdx = k; declInd = kInd; break
+				end
+				-- Stop at function boundary
+				local fnInd = out[k]:match("^(%s*)") or ""
+				if out[k]:match("^%s*function%s") or out[k]:match("^%s*local%s+function%s") then
+					if #fnInd < #closureInd then break end
+				end
+			end
+			if declIdx then
+				-- Check no assignment to UPV between declIdx and idx (other than at
+				-- closureInd or deeper).
+				local assigned = false
+				for k = declIdx + 1, idx - 1 do
+					if out[k]:match("^%s*" .. luaPE(upv) .. "%s*=") then
+						assigned = true; break
+					end
+				end
+				if not assigned then
+					-- Find the most recent `local TEMP = X` at closureInd before idx
+					local tempIdx = nil
+					local tempName = nil
+					local tempRhs = nil
+					for k = idx - 1, math.max(declIdx + 1, idx - 30), -1 do
+						local kInd, kName, kRhs = out[k]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+)%s*$")
+						if kInd == closureInd and kName and kRhs then
+							-- Skip if kName is itself a captured upvalue
+							local isUpv = false
+							for _, u2 in ipairs(upvNames) do if u2 == kName then isUpv = true break end end
+							if not isUpv and kName ~= upv then
+								tempIdx = k; tempName = kName; tempRhs = kRhs
+								break
+							end
+						end
+					end
+					if tempIdx and tempName then
+						-- Replace `local TEMP = X` with `UPV = X`
+						out[tempIdx] = closureInd .. upv .. " = " .. tempRhs
+						-- Rename all references to TEMP within the closure's enclosing
+						-- block (between tempIdx and the function-end) to UPV.
+						local pat = "%f[%a_]" .. luaPE(tempName) .. "%f[^%a_%d]"
+						for k = tempIdx + 1, #out do
+							local kInd = out[k]:match("^(%s*)") or ""
+							-- Stop when we exit the enclosing block (indent < closureInd)
+							if out[k]:match("%S") and #kInd < #closureInd then break end
+							out[k] = out[k]:gsub(pat, upv)
+						end
+						return
+					end
+				end
+			end
+		end
+	end
+	for i = 1, #out do
+		fixOne(i)
+	end
+	return out
+end
+
+PASSES.fixSelfReferentialReassignment = function(lines)
+	-- Pattern: within a single block (typically a for-loop body):
+	--   NAME = INSTANCE_EXPR              -- keeps NAME = instance
+	--   ... (some operations on NAME) ...
+	--   NAME = OTHER_EXPR                 -- ❌ overwrites NAME, name conflict
+	--   local NAME_val = NAME.FIELD       -- now refers to OTHER, not instance
+	--   table.insert(NAME_val, NAME)      -- inserts OTHER into NAME_val (= OTHER.FIELD)
+	-- We rewrite by substituting OTHER_EXPR's value for NAME_val, and dropping
+	-- the `NAME = OTHER_EXPR` line so NAME keeps its original instance value.
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	local function tryFix(i)
+		-- Match: `<ind>NAME = SAFE_EXPR` (assignment, not declaration)
+		local ind, name, rhs = out[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+)%s*$")
+		if not ind or not name or not rhs then return end
+		if out[i]:match("^%s*local%s") then return end
+		-- RHS must be a pure field access (no calls)
+		local rt = rhs:match("^%s*(.-)%s*$") or ""
+		if rt:find("[(:]") or rt:find("[[]", 1, true) then return end
+		if not rt:match("^[%a_][%w_]*[%.%w_]*$") then return end
+		-- Next line must be `<ind>local NAME_val = NAME.FIELD`
+		local nl = out[i + 1]
+		if not nl then return end
+		local n2Ind, valName, valRhs = nl:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+)%s*$")
+		if n2Ind ~= ind then return end
+		if not valName or not valRhs then return end
+		-- valName should contain NAME (heuristic for derived name)
+		if not valName:find(name, 1, true) then return end
+		-- valRhs should reference NAME
+		local fieldRhs = valRhs:match("^" .. luaPE(name) .. "%.([%a_][%w_]*)%s*$")
+		if not fieldRhs then return end
+		-- Third line: should READ NAME (the original instance) — typically table.insert
+		local tl = out[i + 2]
+		if not tl then return end
+		if not tl:find("%f[%a_]" .. luaPE(name) .. "%f[^%a_%d]") then return end
+		-- Look back for original `NAME = INSTANCE_EXPR` or `local NAME = INSTANCE_EXPR`
+		local origRhs = nil
+		for k = i - 1, math.max(1, i - 50), -1 do
+			local origInd, origName, origR = out[k]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+)%s*$")
+			if origInd and origName == name and origR and #origInd <= #ind and not out[k]:match("^%s*local%s") then
+				origRhs = origR
+				break
+			end
+			origInd, origName, origR = out[k]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+)%s*$")
+			if origInd and origName == name and origR and #origInd <= #ind then
+				origRhs = origR
+				break
+			end
+		end
+		if not origRhs then return end
+		-- Rewrite: drop line i, replace line i+1 with `local NAME_val = SAFE_EXPR.FIELD`.
+		out[i] = ""
+		out[i + 1] = n2Ind .. "local " .. valName .. " = " .. rt .. "." .. fieldRhs
+	end
+	for i = 1, #out - 2 do
+		tryFix(i)
+	end
+	-- Compact blank lines
+	local final = {}
+	for _, ln in ipairs(out) do
+		if ln ~= "" then final[#final + 1] = ln end
+	end
+	return final
+end
+
+-- Drop empty `else` clauses: `if X then Y else end` -> `if X then Y end`.
+PASSES.dropEmptyElseClauses = function(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local elseInd = lines[i]:match("^(%s*)else%s*$")
+		if elseInd then
+			-- Find the matching `end` at same indent
+			local nextNonBlank = i + 1
+			while nextNonBlank <= #lines and not lines[nextNonBlank]:match("%S") do
+				nextNonBlank = nextNonBlank + 1
+			end
+			if nextNonBlank <= #lines then
+				local endInd = lines[nextNonBlank]:match("^(%s*)end%s*$")
+				if endInd == elseInd then
+					-- Drop the `else` line; keep the `end`
+					i = nextNonBlank
+					out[#out + 1] = lines[i]
+					i = i + 1
+				else
+					out[#out + 1] = lines[i]
+					i = i + 1
+				end
+			else
+				out[#out + 1] = lines[i]
+				i = i + 1
+			end
+		else
+			out[#out + 1] = lines[i]
+			i = i + 1
+		end
+	end
+	return out
+end
+
+-- Simplify `if COND then X = false else X = true end` to `X = not COND`.
+-- Also `if COND then X = true else X = false end` to `X = COND` (or wrapped).
+-- Conservative: only handle multi-line form, and only when X is a simple identifier
+-- (not a field access).  Also handles preceding `local X` -> `local X = expr`.
+PASSES.simplifyBoolLoadbSkip = function(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		-- Match: `<ind>if COND then`
+		local ind, cond = lines[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+		if ind and cond and i + 4 <= #lines then
+			-- Match: `<ind+>X = LIT`
+			local thenLine = lines[i + 1]
+			local elseLine = lines[i + 2]
+			local elseBody = lines[i + 3]
+			local endLine = lines[i + 4]
+			local thenInd, thenName, thenLit = thenLine:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a]+)%s*$")
+			local elseInd2 = elseLine and elseLine:match("^(%s*)else%s*$")
+			local elseInd3, elseName, elseLit = nil, nil, nil
+			if elseBody then
+				elseInd3, elseName, elseLit = elseBody:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a]+)%s*$")
+			end
+			local endInd = endLine and endLine:match("^(%s*)end%s*$")
+			if thenInd and elseInd2 and elseInd3 and endInd
+				and thenInd == elseInd3 and elseInd2 == ind and endInd == ind
+				and thenName == elseName and thenLit ~= elseLit
+				and (thenLit == "true" or thenLit == "false")
+				and (elseLit == "true" or elseLit == "false")
+			then
+				-- Build expression
+				local expr
+				if thenLit == "true" and elseLit == "false" then
+					expr = cond
+				else
+					-- thenLit == "false", elseLit == "true"
+					expr = "not " .. wrapForAnd(cond)
+				end
+				-- Check if previous line is `local X` (forward decl) — merge.
+				local mergedDecl = false
+				if #out > 0 then
+					local prev = out[#out]
+					local prevInd, prevName = prev:match("^(%s*)local%s+([%a_][%w_]*)%s*$")
+					if prevInd and prevName == thenName and prevInd == ind then
+						out[#out] = ind .. "local " .. thenName .. " = " .. expr
+						mergedDecl = true
+					end
+				end
+				if not mergedDecl then
+					out[#out + 1] = ind .. thenName .. " = " .. expr
+				end
+				i = i + 5
+			else
+				out[#out + 1] = lines[i]; i = i + 1
+			end
+		else
+			out[#out + 1] = lines[i]; i = i + 1
+		end
+	end
+	return out
+end
+
+-- Drop redundant parens around table literals: `({})` -> `{}`, `({ ... })` -> `{ ... }`
+PASSES.dropRedundantParensAroundTables = function(lines)
+	local out = {}
+	for _, ln in ipairs(lines) do
+		-- Only fix safe contexts: inside a table key=value entry, list element, or
+		-- as a top-level RHS of `local X = ...` or assignment.
+		local new = ln
+		-- `= ({...})` -> `= {...}`
+		new = new:gsub("(=%s*)%((%b{})%)", "%1%2")
+		-- `, ({...})` -> `, {...}` (table list elements)
+		new = new:gsub("(,%s*)%((%b{})%)", "%1%2")
+		-- `{ ({...})` -> `{ {...}` (first list element)
+		new = new:gsub("({%s*)%((%b{})%)", "%1%2")
+		-- `return ({...})` -> `return {...}`
+		new = new:gsub("(return%s+)%((%b{})%)", "%1%2")
+		-- Double parens around simple expression: `((NAME.FIELD))` -> `(NAME.FIELD)`
+		-- Apply repeatedly to handle deeply nested doubles.
+		for _ = 1, 4 do
+			local prev = new
+			new = new:gsub("%(%(([^()]+)%)%)", "(%1)")
+			if new == prev then break end
+		end
+		out[#out+1] = new
+	end
+	return out
+end
+
+-- Fix bare-forward declarations that erroneously got initialized from a loop-local.
+-- Pattern: `local NAME = V` at function scope where V is declared inside a loop later.
+-- Replace with bare `local NAME` (closure will get nil; later assignments inside loop
+-- update the upvalue properly via CAPTURE REF mechanics).
+PASSES.fixForwardDeclFromLoopLocal = function(lines)
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	-- For each `local NAME = OTHER` at function level (immediately after a function header),
+	-- check if OTHER is declared *after* this line at deeper indent. If so, the init is invalid.
+	for i = 2, #out - 1 do
+		local ind, name, rhs = out[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+		if ind and name and rhs and name ~= rhs then
+			-- Check the previous non-blank line is a function header
+			local prevText = nil
+			for k = i - 1, math.max(1, i - 4), -1 do
+				if out[k]:match("%S") then
+					prevText = out[k]:match("^%s*(.-)%s*$") or ""
+					break
+				end
+			end
+			local isAfterFnHeader = prevText and (
+				prevText:match("^function%f[^%w_]")
+				or prevText:match("^local%s+function%f[^%w_]")
+				or prevText:match("=%s*function%(")
+				or prevText:match("=%s*function%s+%(")
+			)
+			if isAfterFnHeader then
+				-- Look for `local OTHER` declaration AFTER line i, at deeper indent
+				local foundDeeper = false
+				for j = i + 1, #out do
+					local jInd, jName = out[j]:match("^(%s*)local%s+([%a_][%w_]*)%s*=?")
+					if jInd and jName == rhs and #jInd > #ind then
+						foundDeeper = true; break
+					end
+				end
+				-- Also, check that OTHER is NOT declared at the same or shallower indent
+				-- before line i
+				local foundEarlierShallow = false
+				for j = i - 1, 1, -1 do
+					local jInd, jName = out[j]:match("^(%s*)local%s+([%a_][%w_]*)")
+					if jInd and jName == rhs and #jInd <= #ind then
+						foundEarlierShallow = true; break
+					end
+				end
+				if foundDeeper and not foundEarlierShallow then
+					out[i] = ind .. "local " .. name
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- Drop duplicate `local NAME` declarations within the same function scope.
+-- Multiple hoist passes can introduce duplicate forward declarations.
+-- We use indent-tracking: a duplicate `local NAME` (no init value) at the same
+-- indentation as a previous one (without an intervening function boundary or
+-- end-of-block popping back to shallower indent) is dropped.
+PASSES.dropDuplicateLocalForwardDecls = function(lines)
+	local out = {}
+	-- Per-function-scope set of declared bare names. The function-scope stack
+	-- is keyed by `local function` / `function` openings.  We approximate scope
+	-- pop using indent: whenever we encounter a line at a SHALLOWER indent than
+	-- the function-open line + 1 tab (i.e., the function's `end`), we pop.
+	local fnStack = { { ind = "", names = {} } }  -- stack entries: {ind, names}
+	for _, line in ipairs(lines) do
+		local lineInd = line:match("^(%s*)") or ""
+		local text = line:match("^%s*(.-)%s*$") or ""
+		-- Pop scopes when we see `end` at the function's open-indent
+		while #fnStack > 1 do
+			local top = fnStack[#fnStack]
+			if #lineInd < #top.ind then
+				table.remove(fnStack)
+			else
+				break
+			end
+		end
+		-- Open new scope on `function` / `local function` / `= function(`
+		local isFnOpen = text:match("^function%f[^%w_]")
+			or text:match("^local%s+function%f[^%w_]")
+			or text:match("=%s*function%(")
+			or text:match("=%s*function%s+%(")
+		-- The new function body's indent is lineInd + "\t"
+		if isFnOpen then
+			fnStack[#fnStack + 1] = { ind = lineInd .. "\t", names = {} }
+		end
+		-- Bare `local NAME` (no init)
+		local declName = line:match("^%s*local%s+([%a_][%w_]*)%s*$")
+		local isDup = false
+		if declName then
+			local cur = fnStack[#fnStack]
+			if cur.names[declName] then isDup = true else cur.names[declName] = true end
+		end
+		if not isDup then out[#out + 1] = line end
+	end
+	return out
+end
+
+PASSES.dropDeadUnusedLocals = function(lines)
+	-- Build list of (i, name, ind) of `local X = EXPR` where X is a generated
+	-- temp name (e.g., arg0_val_3, _value_8_val) and EXPR is a simple field chain
+	-- like `EXPR.field` / `(EXPR.field or N)`. Then drop those whose name has no
+	-- subsequent reads in the file.
+	local function isSafeRhs(rhs)
+		rhs = rhs:match("^%s*(.-)%s*$") or ""
+		-- `IDENT(.IDENT)+` pattern (no calls, no method invocations)
+		if rhs:match("^[%a_][%w_]*$") then return true end
+		if rhs:match("^[%a_][%w_]*%.[%a_][%w_%.]*$") then return true end
+		-- `(EXPR or N)` simple
+		local inner = rhs:match("^%((.+)%)$")
+		if inner then return isSafeRhs(inner) end
+		-- `X or Y` where X and Y are both safe-rhs
+		local lhs, rhs2 = rhs:match("^(.+)%s+or%s+(.+)$")
+		if lhs and rhs2 then
+			-- recursively check both halves (only one level)
+			-- accept if both are simple field access or literals
+			local function simpleHalf(s)
+				s = s:match("^%s*(.-)%s*$") or ""
+				if s:match("^[%a_][%w_]*$") then return true end
+				if s:match("^[%a_][%w_]*%.[%a_][%w_%.]*$") then return true end
+				if s:match("^%-?%d+%.?%d*$") then return true end
+				if s:match("^\".-\"$") then return true end
+				if s:match("^'.-'$") then return true end
+				return false
+			end
+			if simpleHalf(lhs) and simpleHalf(rhs2) then return true end
+		end
+		-- Side-effect-free expression: contains only IDENT + literals + operators (..,+,-,*,/,%,^,#),
+		-- no calls (no `(` followed by something that's not a number) and no `:` (method).
+		-- Conservatively, accept when there's no `(` not paired with a closing `)` of an
+		-- enclosing literal structure, no `:` (method/colon), and no string with parens.
+		-- For simplicity: scan character-by-character outside strings; reject `(` not part of
+		-- `(EXPR)` grouping (which would mean a call). Also reject `:`.
+		do
+			local i = 1
+			local n = #rhs
+			local inq = nil
+			local hasCall = false
+			local hasColonCall = false
+			while i <= n do
+				local c = rhs:sub(i, i)
+				if inq then
+					if c == "\\" and i + 1 <= n then i = i + 2
+					elseif c == inq then inq = nil; i = i + 1
+					else i = i + 1
+					end
+				elseif c == '"' or c == "'" then
+					inq = c; i = i + 1
+				elseif c == "(" then
+					-- Could be a call OR a grouping. Check what's before.
+					local prev = i > 1 and rhs:sub(i - 1, i - 1) or ""
+					if prev:match("[%w_%]%)]") then hasCall = true; break end
+					i = i + 1
+				elseif c == ":" then
+					-- not allowed (method call or unexpected)
+					hasColonCall = true; break
+				else
+					i = i + 1
+				end
+			end
+			if not hasCall and not hasColonCall then return true end
+		end
+		return false
+	end
+	-- generated temp name patterns (be conservative)
+	local function isGeneratedName(name)
+		if not name then return false end
+		return name:match("_val$") ~= nil
+			or name:match("_val_%d+$") ~= nil
+			or name:match("_result$") ~= nil
+			or name:match("_result_%d+$") ~= nil
+			or name:match("_val_val") ~= nil
+	end
+	-- scan for `local NAME = RHS` and check usage
+	local out = {}
+	for i, line in ipairs(lines) do
+		local ind, name, rhs = line:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+)%s*$")
+		local dropped = false
+		if ind and name and rhs and isGeneratedName(name) and isSafeRhs(rhs) then
+			-- Check if name is referenced after this line
+			local pat = identPat(name)
+			local usedLater = false
+			for j = i + 1, #lines do
+				if lines[j]:find(pat) then
+					usedLater = true
+					break
+				end
+			end
+			if not usedLater then dropped = true end
+		end
+		-- Variant 2: `local TEMP = RCVR:METHOD(...)` immediately preceded by
+		-- `if RCVR then return ... end` (so RCVR is nil here, line is unreachable).
+		if not dropped and ind and name and rhs and isGeneratedName(name) then
+			local rcvr = rhs:match("^([%a_][%w_]*):[%a_][%w_]*%(.*%)%s*$")
+			if rcvr then
+				local pat = identPat(name)
+				local usedLater = false
+				for j = i + 1, #lines do
+					if lines[j]:find(pat) then
+						usedLater = true
+						break
+					end
+				end
+				if not usedLater then
+					for j = i - 1, math.max(1, i - 6), -1 do
+						if lines[j]:match("%S") then
+							local jInd = lines[j]:match("^(%s*)") or ""
+							local prevPat = "^" .. luaPE(jInd) .. "if%s+" .. luaPE(rcvr) .. "%s+then%s+return%s.+%s+end%s*$"
+							if #jInd <= #ind and lines[j]:match(prevPat) then
+								dropped = true
+							end
+							break
+						end
+					end
+				end
+			end
+		end
+		if not dropped then out[#out+1] = line end
+	end
+	return out
+end
+
+-- Fix CSE'd loads that ended up only inside a branch but are used outside.
+-- Pattern:
+--   function ...
+--       local X
+--       ...
+--       if COND then
+--           X = SAFE_EXPR        -- only assignment to X
+--           ... return ...
+--       end
+--       USE X here               -- ❌ X is nil if COND was false
+-- 
+-- If SAFE_EXPR is a pure field-access expression (no calls, only param/upvalue/self
+-- field reads), the bytecode likely loaded X unconditionally before the branch.
+-- We hoist `X = SAFE_EXPR` to right after `local X` declaration.
+PASSES.hoistBranchOnlyAssignmentsToFnStart = function(lines)
+	local function isPureFieldExpr(rhs)
+		rhs = rhs:match("^%s*(.-)%s*$") or ""
+		-- Strip surrounding parens
+		while rhs:sub(1, 1) == "(" and rhs:sub(-1) == ")" do
+			rhs = rhs:sub(2, -2):match("^%s*(.-)%s*$")
+		end
+		-- ident
+		if rhs:match("^[%a_][%w_]*$") then return true end
+		-- ident.field.field...
+		if rhs:match("^[%a_][%w_]*[%.%[][%w_%.%[%]\"']*$") and not rhs:find("[(:]") then return true end
+		-- (X or N) where X and N are simple
+		local lhs, rhs2 = rhs:match("^(.-)%s+or%s+(.+)$")
+		if lhs and rhs2 then
+			local function simpleHalf(s)
+				s = s:match("^%s*(.-)%s*$") or ""
+				while s:sub(1, 1) == "(" and s:sub(-1) == ")" do
+					s = s:sub(2, -2):match("^%s*(.-)%s*$")
+				end
+				if s:match("^[%a_][%w_]*$") then return true end
+				if s:match("^[%a_][%w_]*[%.%[][%w_%.%[%]\"']*$") and not s:find("[(:]") then return true end
+				if s:match("^%-?%d+%.?%d*$") then return true end
+				if s:match("^\".-\"$") then return true end
+				if s:match("^'.-'$") then return true end
+				return false
+			end
+			if simpleHalf(lhs) and simpleHalf(rhs2) then return true end
+		end
+		return false
+	end
+	-- find all function bodies and process each
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	-- Iterate to find `function` lines
+	for fnStart = 1, #out do
+		local text = out[fnStart] and out[fnStart]:match("^%s*(.-)%s*$") or ""
+		if text:match("^function%f[^%w_]")
+			or text:match("^local%s+function%f[^%w_]")
+			or text:match("=%s*function%(")
+			or text:match("=%s*function%s+%(")
+		then
+			-- find matching `end`
+			local fnInd = out[fnStart]:match("^(%s*)") or ""
+			local fnEnd = nil
+			for j = fnStart + 1, #out do
+				local jInd = out[j]:match("^(%s*)") or ""
+				local jText = out[j]:match("^%s*(.-)%s*$") or ""
+				if jInd == fnInd and jText == "end" then fnEnd = j; break end
+			end
+			if fnEnd then
+				-- Find `local X` declarations at top of function body.
+				-- Determine actual body indent from the first non-blank line after fnStart.
+				local bodyInd = nil
+				for j = fnStart + 1, fnEnd - 1 do
+					if out[j]:match("%S") then
+						bodyInd = out[j]:match("^(%s*)") or ""
+						break
+					end
+				end
+				if not bodyInd or #bodyInd <= #fnInd then bodyInd = fnInd .. "\t" end
+				-- Collect uninitialized `local X` declarations (no `= EXPR`)
+				local declLocals = {}  -- name -> idx
+				for j = fnStart + 1, fnEnd - 1 do
+					local d = out[j]:match("^" .. luaPE(bodyInd) .. "local%s+([%a_][%w_]*)%s*$")
+					if d then declLocals[d] = j
+					elseif out[j]:match("%S") then
+						-- stop scanning at the first non-blank, non-decl line
+						-- (only declarations clustered at top are eligible)
+						break
+					end
+				end
+				-- For each declared local, find single assignment in branch
+				for name, declIdx in pairs(declLocals) do
+					-- Find all assignments `<ind>NAME = RHS`
+					local assigns = {}
+					for j = declIdx + 1, fnEnd - 1 do
+						local aInd, aRhs = out[j]:match("^(%s*)" .. luaPE(name) .. "%s*=%s*(.+)%s*$")
+						if aInd and not out[j]:match("^%s*local%s") then
+							assigns[#assigns + 1] = { idx = j, ind = aInd, rhs = aRhs }
+						end
+					end
+					if #assigns >= 1 then
+						-- Is the FIRST assignment inside a branch (deeper than bodyInd)?
+						local first = assigns[1]
+						if #first.ind > #bodyInd and isPureFieldExpr(first.rhs) then
+							-- Check: is name used at bodyInd-level (or shallower than first.ind) AFTER first.idx?
+							local usedShallower = false
+							for j = first.idx + 1, fnEnd - 1 do
+								if out[j]:find(identPat(name)) then
+									local jInd = out[j]:match("^(%s*)") or ""
+									if #jInd <= #bodyInd then
+										usedShallower = true
+										break
+									end
+								end
+							end
+							if usedShallower then
+								-- Check: are all assignments to `name` the SAME pure expression?
+								local rhsTrim = first.rhs:match("^%s*(.-)%s*$")
+								local sameExpr = true
+								for _, a in ipairs(assigns) do
+									local aTrim = a.rhs:match("^%s*(.-)%s*$")
+									if aTrim ~= rhsTrim then sameExpr = false; break end
+								end
+								if sameExpr then
+									-- Hoist: replace `local X` with `local X = RHS` and remove the in-branch assignment.
+									out[declIdx] = bodyInd .. "local " .. name .. " = " .. first.rhs
+									out[first.idx] = ""
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	-- Compact blank lines we may have inserted
+	local final = {}
+	for _, ln in ipairs(out) do
+		if ln ~= "" then final[#final+1] = ln end
+	end
+	return final
 end
 
 local function fixInvertedIsaGuard(lines)
@@ -6069,6 +6941,37 @@ local function rewriteGotoToReturn(lines)
 			else
 				out[#out+1] = ln
 			end
+		end
+	end
+	return out
+end
+
+-- Rewrite `if NOT COND then goto T end\n return\n ::T::` to `if COND then return end`.
+-- The pattern: an if-goto immediately followed by `return` and the goto's target
+-- label points at the line right after the return. This is the bytecode pattern
+-- "JUMPIFNOT R -> skip_over_return; RETURN; ::skip_over_return::" which means
+-- "if R is truthy, execute the return".
+local function rewriteSkipReturnAsTruthyReturn(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local ii, icond, itgt = matchIfGoto(lines[i])
+		if ii and i + 2 <= #lines then
+			local retInd, retText = lines[i + 1]:match("^(%s*)(return)%s*$")
+			if not retInd then retInd, retText = lines[i + 1]:match("^(%s*)(return%s.+)%s*$") end
+			-- The label must be on line i+2 (after the return)
+			local _, lbl = matchLbl(lines[i + 2])
+			if retInd and lbl == itgt then
+				-- Match: `if not X then goto T end / return / ::T::`
+				-- Convert to: `if X then return end` (and drop the original goto + return + label)
+				local newCond = negateCond(icond)
+				out[#out+1] = ii .. "if " .. newCond .. " then " .. retText .. " end"
+				i = i + 3
+			else
+				out[#out+1] = lines[i]; i = i + 1
+			end
+		else
+			out[#out+1] = lines[i]; i = i + 1
 		end
 	end
 	return out
@@ -7086,6 +7989,41 @@ end
 
 local function hoistRepeatedLocals(lines)
 	if #lines == 0 then return lines end
+	-- Helper: find the start/end of the smallest enclosing function block at line idx.
+	-- Returns startIdx (idx of `function ...`) + 1, endIdx (idx of matching `end`).
+	-- Returns 1, #lines for module-level scope.
+	local function enclosingFnRange(idx)
+		local depth = 0
+		local startIdx = nil
+		-- Scan backward for the nearest unmatched `function`
+		for i = idx - 1, 1, -1 do
+			local text = lines[i]:match("^%s*(.-)%s*$") or ""
+			if text == "end" then
+				depth = depth + 1
+			elseif text:match("^function%f[^%w_]")
+				or text:match("^local%s+function%f[^%w_]")
+				or text:match("=%s*function%(")
+				or text:match("=%s*function%s+%(")
+			then
+				if depth == 0 then
+					startIdx = i
+					break
+				end
+				depth = depth - 1
+			end
+		end
+		if not startIdx then return 1, #lines end
+		-- Scan forward from startIdx for matching `end`
+		local fnInd = lines[startIdx]:match("^(%s*)") or ""
+		for j = startIdx + 1, #lines do
+			local jInd = lines[j]:match("^(%s*)") or ""
+			local jText = lines[j]:match("^%s*(.-)%s*$") or ""
+			if jInd == fnInd and jText == "end" then
+				return startIdx + 1, j - 1
+			end
+		end
+		return startIdx + 1, #lines
+	end
 	local bodyStart = 1
 	for i, line in ipairs(lines) do
 		if line:match("%S") then
@@ -7113,72 +8051,106 @@ local function hoistRepeatedLocals(lines)
 		end
 	end
 	if bodyEnd < bodyStart then return lines end
-	local declarations = {}
-	local order = {}
+	-- Group declarations by function-scope: each declaration belongs to its
+	-- nearest enclosing function (or the module body if none).
+	-- For each scope, hoist same-name locals declared in different branches
+	-- to the start of THAT scope, not the module top.
+	-- Build a per-scope declarations map.
+	local scopeKey = function(s, e) return tostring(s) .. ":" .. tostring(e) end
+	local scopeRanges = {}  -- scopeKey -> {startIdx=, endIdx=, declarations={name->[{idx,indent,expr}]}, order={}}
 	for i = bodyStart, bodyEnd do
 		local ind, name, expr = lines[i]:match("^(%s*)local%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)%s*$")
 		if ind and name and not lines[i]:match("^%s*local%s+function%f[^%w_]") then
-			if not declarations[name] then
-				declarations[name] = {}
-				order[#order+1] = name
+			local s, e = enclosingFnRange(i)
+			local key = scopeKey(s, e)
+			local sc = scopeRanges[key]
+			if not sc then
+				sc = { startIdx = s, endIdx = e, declarations = {}, order = {} }
+				scopeRanges[key] = sc
 			end
-			declarations[name][#declarations[name]+1] = { idx = i, indent = ind, expr = expr }
+			if not sc.declarations[name] then
+				sc.declarations[name] = {}
+				sc.order[#sc.order+1] = name
+			end
+			sc.declarations[name][#sc.declarations[name]+1] = { idx = i, indent = ind, expr = expr }
 		end
 	end
-	local toHoist = {}
-	for name, items in pairs(declarations) do
-		if #items > 1 then
-			toHoist[name] = true
+	-- Determine what to hoist per scope (using original indices into `lines`)
+	local hoistsByScope = {}  -- list of { startIdx, names, indent, declToReassign={idx,indent,name,expr}}
+	for _, sc in pairs(scopeRanges) do
+		local toHoist = {}
+		for name, items in pairs(sc.declarations) do
+			if #items > 1 then toHoist[name] = true end
 		end
-	end
-	for name, items in pairs(declarations) do
-		if not toHoist[name] and #items == 1 then
-			local decl = items[1]
-			local declIndent = #decl.indent
-			local blockEnd = bodyEnd + 1
-			for j = decl.idx + 1, bodyEnd do
-				if lines[j]:match("%S") then
-					local ind = lines[j]:match("^(%s*)") or ""
-					if #ind < declIndent then
-						blockEnd = j
-						break
+		for name, items in pairs(sc.declarations) do
+			if not toHoist[name] and #items == 1 then
+				local decl = items[1]
+				local declIndent = #decl.indent
+				local blockEnd = sc.endIdx + 1
+				for j = decl.idx + 1, sc.endIdx do
+					if lines[j]:match("%S") then
+						local ind = lines[j]:match("^(%s*)") or ""
+						if #ind < declIndent then
+							blockEnd = j
+							break
+						end
+					end
+				end
+				if blockEnd <= sc.endIdx then
+					local pat = identPat(name)
+					for j = blockEnd, sc.endIdx do
+						if lines[j]:find(pat) then
+							toHoist[name] = true
+							break
+						end
 					end
 				end
 			end
-			if blockEnd <= bodyEnd then
-				local pat = identPat(name)
-				for j = blockEnd, bodyEnd do
-					if lines[j]:find(pat) then
-						toHoist[name] = true
-						break
+		end
+		if next(toHoist) ~= nil then
+			-- Determine indent at the start of this scope
+			local scopeIndent = ""
+			for i = sc.startIdx, sc.endIdx do
+				if lines[i]:match("%S") then
+					scopeIndent = lines[i]:match("^(%s*)") or ""
+					break
+				end
+			end
+			local hoistNames = {}
+			for _, name in ipairs(sc.order) do
+				if toHoist[name] then hoistNames[#hoistNames+1] = name end
+			end
+			local reassignDecls = {}
+			for name, items in pairs(sc.declarations) do
+				if toHoist[name] then
+					for _, decl in ipairs(items) do
+						reassignDecls[#reassignDecls+1] = { idx = decl.idx, line = decl.indent .. name .. " = " .. decl.expr }
 					end
 				end
 			end
+			hoistsByScope[#hoistsByScope+1] = {
+				startIdx = sc.startIdx,
+				names = hoistNames,
+				indent = scopeIndent,
+				reassign = reassignDecls,
+			}
 		end
 	end
-	if next(toHoist) == nil then return lines end
+	if #hoistsByScope == 0 then return lines end
+	-- Apply: first replace all `local X = E` with `X = E` (same index space).
 	local out = {}
 	for i, line in ipairs(lines) do out[i] = line end
-	for name, items in pairs(declarations) do
-		if toHoist[name] then
-			for _, decl in ipairs(items) do
-				out[decl.idx] = decl.indent .. name .. " = " .. decl.expr
-			end
+	for _, h in ipairs(hoistsByScope) do
+		for _, r in ipairs(h.reassign) do
+			out[r.idx] = r.line
 		end
 	end
-	local bodyIndent = ""
-	for i = bodyStart, bodyEnd do
-		if out[i]:match("%S") then
-			bodyIndent = out[i]:match("^(%s*)") or ""
-			break
+	-- Then insert hoisted declarations in descending startIdx order to keep indices valid.
+	table.sort(hoistsByScope, function(a, b) return a.startIdx > b.startIdx end)
+	for _, h in ipairs(hoistsByScope) do
+		for i = #h.names, 1, -1 do
+			table.insert(out, h.startIdx, h.indent .. "local " .. h.names[i])
 		end
-	end
-	local declLines = {}
-	for _, name in ipairs(order) do
-		if toHoist[name] then declLines[#declLines+1] = bodyIndent .. "local " .. name end
-	end
-	for i = #declLines, 1, -1 do
-		table.insert(out, bodyStart, declLines[i])
 	end
 	return out
 end
@@ -8181,6 +9153,110 @@ local function dropGotoToImmediatePostIfLabel(lines)
 	return lines, false
 end
 
+-- Find label index in lines starting from `startI` (1-based)
+local function findLabelIndex(lines, target, startI)
+	local pat = "^%s*::" .. luaPE(target) .. "::%s*$"
+	for i = startI, #lines do
+		if lines[i]:match(pat) then return i end
+	end
+	return nil
+end
+
+-- Lift complementary guard pair pattern (handles cross-block guards):
+--   if A then goto T1 end
+--   if B then goto T2 end
+--   ::T1::
+--   GUARD_BODY (e.g. return)
+--   ::T2::
+-- The semantic is: GUARD_BODY runs when A is true OR B is false.
+-- Equivalent to: `if A or not B then GUARD_BODY end` (T2 dropped if only ref is line 2).
+local liftComplementaryGuardPair
+do
+	liftComplementaryGuardPair = function(lines)
+	local i = 1
+	while i + 1 <= #lines do
+		local ind1, cond1, tgt1 = matchIfGoto(lines[i])
+		local ind2, cond2, tgt2 = matchIfGoto(lines[i + 1])
+		if ind1 and ind2 and ind1 == ind2 and tgt1 ~= tgt2 then
+			-- ::T1:: must immediately follow line i+1 (possibly after blanks)
+			local t1Idx = i + 2
+			while t1Idx <= #lines and not lines[t1Idx]:match("%S") do t1Idx = t1Idx + 1 end
+			local t1Lbl = nil
+			if t1Idx <= #lines then
+				local _, lbl = matchLbl(lines[t1Idx])
+				t1Lbl = lbl
+			end
+			if t1Lbl == tgt1 then
+				-- Find ::T2::
+				local t2Idx = findLabelIndex(lines, tgt2, t1Idx + 1)
+				if t2Idx then
+					-- GUARD_BODY = lines between ::T1:: and ::T2::
+					local guardBody = {}
+					local bodyOk = true
+					for k = t1Idx + 1, t2Idx - 1 do
+						guardBody[#guardBody+1] = lines[k]
+						local _, innerLbl = matchLbl(lines[k])
+						if innerLbl then bodyOk = false; break end
+						-- Allow goto whose target is OUTSIDE the lifted region
+						-- (typically loop-end labels for `continue`/`break`).
+						-- Reject only goto targets INSIDE [i, t2Idx] (would create internal cycle).
+						local _, gTgt = matchGoto(lines[k])
+						if gTgt then
+							local gLblIdx = findLabelIndex(lines, gTgt, 1)
+							if gLblIdx and gLblIdx >= i and gLblIdx <= t2Idx then
+								bodyOk = false; break
+							end
+						end
+						local _, _, ifgTgt = matchIfGoto(lines[k])
+						if ifgTgt then
+							local ifgLblIdx = findLabelIndex(lines, ifgTgt, 1)
+							if ifgLblIdx and ifgLblIdx >= i and ifgLblIdx <= t2Idx then
+								bodyOk = false; break
+							end
+						end
+					end
+					if bodyOk and #guardBody > 0 then
+						-- Check ref counts: T1 only from line i, T2 only from line i+1
+						local refs1 = labelRefs(lines, tgt1)
+						local refs2 = labelRefs(lines, tgt2)
+						local refs1Ok = #refs1 == 1 and refs1[1] == i
+						local refs2Ok = #refs2 == 1 and refs2[1] == i + 1
+						if refs1Ok and refs2Ok then
+							-- Build: if cond1 or not cond2 then BODY end
+							-- Simplification: emit two separate guards for clarity
+							-- `if cond1 then BODY end; if not cond2 then BODY end`
+							-- only works if BODY has no side effects that should run once.
+							-- Safer to merge: `if A or not B then BODY end`.
+							local result = {}
+							for k = 1, i - 1 do result[#result+1] = lines[k] end
+							-- Emit two separate guards (cleaner output, common idiom)
+							for _, bl in ipairs(guardBody) do
+								-- only safe if guardBody is a simple `return` / `continue` / `break` / `return EXPR`
+							end
+							-- Use single combined form
+							local combined = wrapForAnd(cond1) .. " or " .. wrapForAnd(negateCond(cond2))
+							result[#result+1] = ind1 .. "if " .. combined .. " then"
+							for _, bl in ipairs(guardBody) do
+								if bl:match("%S") then
+									result[#result+1] = "\t" .. bl
+								else
+									result[#result+1] = bl
+								end
+							end
+							result[#result+1] = ind1 .. "end"
+							for k = t2Idx + 1, #lines do result[#result+1] = lines[k] end
+							return result, true
+						end
+					end
+				end
+			end
+		end
+		i = i + 1
+	end
+	return lines, false
+end
+end
+
 local function wrapOrphanIfGotosAsGuards(lines, indentUnit)
 	local labels = {}
 	for _, ln in ipairs(lines) do
@@ -8253,15 +9329,6 @@ local function fixInvalidGenericForHeaders(lines)
 		end
 	end
 	return out
-end
-
--- Find label index in lines starting from `startI` (1-based)
-local function findLabelIndex(lines, target, startI)
-	local pat = "^%s*::" .. luaPE(target) .. "::%s*$"
-	for i = startI, #lines do
-		if lines[i]:match(pat) then return i end
-	end
-	return nil
 end
 
 -- Last non-blank index
@@ -8593,6 +9660,28 @@ local function liftIfGotoBody(lines, indentUnit)
 			else
 				local body = {}
 				for k = i + 1, labelIdx - 1 do body[#body+1] = lines[k] end
+				-- Check: does body contain an inner `if X then goto T2 end` where
+				-- T2 is OUTSIDE the body (i.e., T2's label appears AFTER labelIdx)?
+				-- If so, this is a "complementary guard" pattern and the body
+				-- spans into the post-target region. Mishandling this produces
+				-- inverted conditions like `if not IsDying then return end` when
+				-- the source intended `if IsDying then return end`.
+				local hasOuterGoto = false
+				for _, bl in ipairs(body) do
+					local _, _, innerTarget = matchIfGoto(bl)
+					if innerTarget and innerTarget ~= target then
+						-- Check if this target is past labelIdx
+						local outerLabelIdx = findLabelIndex(lines, innerTarget, labelIdx + 1)
+						if outerLabelIdx then
+							hasOuterGoto = true
+							break
+						end
+					end
+				end
+				if hasOuterGoto then
+					-- Skip; let liftComplementaryGuardPair or other passes handle it
+					i = i + 1
+				else
 				local bodyHasGoto = false
 				for _, bl in ipairs(body) do
 					if bl:find("%f[%a_]goto%s+" .. luaPE(target) .. "%f[^%a_%d]") then
@@ -8686,6 +9775,7 @@ local function liftIfGotoBody(lines, indentUnit)
 					for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
 				end
 				return result, true
+				end -- hasOuterGoto check
 			end
 		end
 	end
@@ -8735,50 +9825,6 @@ local function liftSimpleGuardChains(lines, indentUnit)
 					for _, bl in ipairs(newBlock) do result[#result+1] = bl end
 					for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
 					return result, true
-				end
-			end
-			i = i + 1
-		end
-	end
-	return lines, false
-end
-
-local function liftParentClosingGuards(lines, indentUnit)
-	local i = 1
-	while i <= #lines do
-		local ind, cond, target = matchIfGoto(lines[i])
-		if not ind then
-			i = i + 1
-		else
-			local labelIdx = findLabelIndex(lines, target, i + 1)
-			if labelIdx and labelIdx > i + 2 then
-				local labelInd = lines[labelIdx]:match("^(%s*)") or ""
-				local endIdx = labelIdx - 1
-				local endInd = matchEnd(lines[endIdx])
-				if endInd and #endInd == #labelInd and #labelInd < #ind then
-					local refs = labelRefs(lines, target)
-					local bodyOk = #refs == 1 and refs[1] == i
-					if bodyOk then
-						for k = i + 1, endIdx - 1 do
-							local bi = lines[k]:match("^(%s*)") or ""
-							local _, lbl = matchLbl(lines[k])
-							if #bi < #ind or lbl or matchGoto(lines[k]) or matchIfGoto(lines[k]) then bodyOk = false break end
-						end
-					end
-					if bodyOk then
-						local newBlock = {ind .. "if " .. negateCond(cond) .. " then"}
-						for k = i + 1, endIdx - 1 do
-							local bl = lines[k]
-							if bl:match("%S") then newBlock[#newBlock+1] = indentUnit .. bl else newBlock[#newBlock+1] = bl end
-						end
-						newBlock[#newBlock+1] = ind .. "end"
-						local result = {}
-						for k = 1, i - 1 do result[#result+1] = lines[k] end
-						for _, bl in ipairs(newBlock) do result[#result+1] = bl end
-						result[#result+1] = lines[endIdx]
-						for k = labelIdx + 1, #lines do result[#result+1] = lines[k] end
-						return result, true
-					end
 				end
 			end
 			i = i + 1
@@ -8939,9 +9985,12 @@ local function gotosToContinue(lines)
 			if openIdx then
 				local tgtIdxs = labelIdx[target] or {}
 				local convert = false
-				if #tgtIdxs == 0 then
-					convert = true
-				else
+				-- Convert to `continue` when target is INSIDE the loop body and at
+				-- the end (next iteration), OR when the target was consumed (orphan)
+				-- AND the goto is followed only by other simple statements before
+				-- the loop's `end` (suggesting the original target was at the end
+				-- of the iteration, i.e., a `continue`).
+				if #tgtIdxs > 0 then
 					for _, li in ipairs(tgtIdxs) do
 						if openIdx < li and li < closeIdx then
 							local tailBlank = true
@@ -8954,6 +10003,17 @@ local function gotosToContinue(lines)
 								break
 							end
 						end
+					end
+				else
+					-- Orphaned goto: target label was consumed (e.g. by a previous
+					-- lift pass).  Treat as `continue` ONLY if the enclosing loop
+					-- is a `for ... do` (where the original semantic of a forward
+					-- goto matching FORGLOOP target is "skip to next iteration").
+					-- For `while true do ... end` (lifted from JUMPBACK), the orphan
+					-- goto is a forward escape -> `break`, handled by gotosToBreak.
+					local openLine = newLines[openIdx] or ""
+					if openLine:match("^%s*for%s") then
+						convert = true
 					end
 				end
 				if convert then
@@ -9025,7 +10085,19 @@ local function gotosToBreak(lines)
 					if lbl == target then
 						newLines[i] = inlineInd and (indent2 .. "if " .. inlineCond .. " then break end") or (indent2 .. "break")
 						convertedTargets[target] = true
+						converted = true
 					end
+				end
+			end
+			-- Orphaned goto (target label doesn't exist anywhere): convert to break.
+			-- This happens when the target label was consumed by a previous lift
+			-- (e.g. liftWhileTrueFromJumpback consumed `::pcN::` along with its
+			-- back-edge `goto pcN`).  The original semantic was a forward escape
+			-- out of the enclosing loop.
+			if not converted and openIdx then
+				local tgtIdxs2 = labelIdx[target] or {}
+				if #tgtIdxs2 == 0 then
+					newLines[i] = inlineInd and (indent2 .. "if " .. inlineCond .. " then break end") or (indent2 .. "break")
 				end
 			end
 		end
@@ -9107,10 +10179,23 @@ local function liftWhileTrueFromJumpback(lines, loopHeaderPcs)
 		local lind, lbl = matchLbl(lines[i])
 		if lbl and (not loopHeaderPcs or headerSet[lbl]) then
 			local lastJ = nil
+			-- Also detect the case where the back-jump is wrapped in `if COND then goto LBL end`.
+			-- In that case the loop body is empty (a `while not COND do end` no-op) — we
+			-- should NOT lift because the result would be useless.  But we DO want to
+			-- lift the bare `goto LBL` form below.
 			for j = i + 1, #lines do
 				local gi, gTgt = matchGoto(lines[j])
 				if gi and gTgt == lbl then
-					if #gi <= #lind then break end
+					if #gi < #lind then break end
+					lastJ = j
+					break
+				end
+				-- inline if-goto with same target counts too, but we need to handle
+				-- it specifically: if the if-goto is at j (deeper or equal indent),
+				-- it's the back-edge.  We treat j as lastJ in that case.
+				local ifInd, _, ifTgt = matchIfGoto(lines[j])
+				if ifInd and ifTgt == lbl then
+					if #ifInd < #lind then break end
 					lastJ = j
 					break
 				end
@@ -9123,20 +10208,52 @@ local function liftWhileTrueFromJumpback(lines, loopHeaderPcs)
 					elseif s == "end" and depth > 0 then depth = depth - 1 end
 				end
 				if depth == 0 then
+					-- Count references to `lbl` ignoring forward refs (refs that are
+					-- BEFORE the label).  Forward refs from earlier blocks (e.g. a
+					-- previously-lifted while-true containing `goto LBL`) get
+					-- converted to `break` by `gotosToBreak` later, so they don't
+					-- prevent us from lifting the back-edge here.
 					local extraRefs = false
 					for _, r in ipairs(labelRefs(lines, lbl)) do
-						if r ~= lastJ then extraRefs = true break end
+						if r ~= lastJ and r >= i then extraRefs = true break end
 					end
 					if not extraRefs then
 						local whileInd = lind
+						-- Check if lastJ is bare `goto LBL` or inline `if COND then goto LBL end`
+						local isBareGoto = matchGoto(lines[lastJ]) ~= nil
 						local bodyLines = {}
 						for j = i + 1, lastJ - 1 do bodyLines[#bodyLines+1] = lines[j] end
 						local lastB = #bodyLines
 						while lastB > 0 and not bodyLines[lastB]:match("%S") do lastB = lastB - 1 end
 						while #bodyLines > lastB do table.remove(bodyLines) end
-						local newBlock = {whileInd .. "while true do"}
-						for _, bl in ipairs(bodyLines) do newBlock[#newBlock+1] = bl end
-						newBlock[#newBlock+1] = whileInd .. "end"
+						local newBlock
+						if isBareGoto then
+							-- `::LBL:: BODY goto LBL` -> `while true do BODY end`
+							newBlock = {whileInd .. "while true do"}
+							for _, bl in ipairs(bodyLines) do newBlock[#newBlock+1] = bl end
+							newBlock[#newBlock+1] = whileInd .. "end"
+						else
+							-- `::LBL:: BODY if COND then goto LBL end` -> `repeat BODY until not COND`
+							-- Lua doesn't have `until not COND` syntax issues, but we'll use
+							-- `while COND do BODY end` instead (semantically equivalent when BODY
+							-- doesn't have side-effects that depend on COND being false).
+							-- Actually the precise semantic is:
+							--   repeat BODY until not COND
+							-- which executes BODY at least once.  If BODY is empty, it becomes
+							-- `while COND do end` (no-op-spinning, identical to source).
+							-- For safety, use `repeat BODY until not COND` form.
+							local _, ifCond = matchIfGoto(lines[lastJ])
+							if ifCond then
+								newBlock = {whileInd .. "repeat"}
+								for _, bl in ipairs(bodyLines) do newBlock[#newBlock+1] = bl end
+								newBlock[#newBlock+1] = whileInd .. "until not (" .. ifCond .. ")"
+							else
+								-- Fallback: shouldn't happen
+								newBlock = {whileInd .. "while true do"}
+								for _, bl in ipairs(bodyLines) do newBlock[#newBlock+1] = bl end
+								newBlock[#newBlock+1] = whileInd .. "end"
+							end
+						end
 						local result = {}
 						for k = 1, i - 1 do result[#result+1] = lines[k] end
 						for _, bl in ipairs(newBlock) do result[#result+1] = bl end
@@ -9152,15 +10269,6 @@ local function liftWhileTrueFromJumpback(lines, loopHeaderPcs)
 		end
 	end
 	return lines
-end
-
--- helper: get assignation info from a line: returns indent, varname, expr or nil
-local function assignLineVar(line)
-	local ind, nm, rhs = line:match("^(%s*)local%s+([%a_][%a_%d%.]*)%s*=%s*(.+)%s*$")
-	if nm then return ind, nm, rhs end
-	ind, nm, rhs = line:match("^(%s*)([%a_][%a_%d%.:%[%]]*)%s*=%s*(.+)%s*$")
-	if nm then return ind, nm, rhs end
-	return nil
 end
 
 -- Lift `if COND then return EXPR1 else return EXPR2 end` -> `return COND and EXPR1 or EXPR2`
@@ -9229,10 +10337,38 @@ local function liftMixedGuardOrPair(lines, indentUnit)
 					local varPat, rhs = dv:match("^([%a_][%a_%d%.]*)%s*=%s*(.+)$")
 					local trimmedRhs = rhs and rhs:match("^%s*(.-)%s*$") or nil
 					if varPat and rhs and trimmedRhs ~= "nil" then
-						out[#out+1] = gi .. varPat .. " = " .. negCond .. " and " .. varPat .. " or " .. rhs
-						i = i + 3
-						changed = true
-						folded = true
+						-- Pattern: `if not COND then VARPAT = RHS end`
+						-- Transform to: `VARPAT = COND or RHS`
+						-- (when COND is truthy, VARPAT keeps COND's value; when falsy, RHS).
+						-- Safety: VARPAT must be declared `local VARPAT = nil` somewhere earlier
+						-- in the same/enclosing scope, and not assigned between the decl and here.
+						local prevDecl = false
+						local declIdx = nil
+						for k = i - 1, math.max(1, i - 30), -1 do
+							if out[k] then
+								if out[k]:match("^%s*local%s+" .. luaPE(varPat) .. "%s*=%s*nil%s*$") then
+									prevDecl = true
+									declIdx = k
+									break
+								end
+							end
+						end
+						-- Also check: VARPAT is not assigned between declIdx and i.
+						local notAssignedBetween = true
+						if prevDecl and declIdx then
+							for k = declIdx + 1, i - 1 do
+								if out[k] and out[k]:match("^%s*" .. luaPE(varPat) .. "%s*=%s*") then
+									notAssignedBetween = false
+									break
+								end
+							end
+						end
+						if prevDecl and notAssignedBetween then
+							out[#out+1] = gi .. varPat .. " = " .. negCond .. " or " .. rhs
+							i = i + 3
+							changed = true
+							folded = true
+						end
 					end
 				end
 			end
@@ -9440,8 +10576,10 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 
 	-- Pass 1: basic single-line structural passes
 	lines = rewriteGotoToReturn(lines)
+	lines = rewriteSkipReturnAsTruthyReturn(lines)
 	lines = collapseTrivialIf(lines)
 	lines = rewriteGotoToReturn(lines)
+	lines = rewriteSkipReturnAsTruthyReturn(lines)
 	lines = normalizeNegativeAddk(lines)
 	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = removeUnreachableAfterReturn(lines)
@@ -9467,6 +10605,12 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 					lines = newLines
 					changed = true
 				else
+					local changedComp = false
+					newLines, changedComp = liftComplementaryGuardPair(lines)
+					if changedComp then
+						lines = newLines
+						changed = true
+					else
 					local changedMixed = false
 					newLines, changedMixed = liftMixedGuardOrPair(lines, indentUnit)
 					if changedMixed then
@@ -9486,6 +10630,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 								changed = true
 							end
 						end
+					end
 					end
 				end
 			end
@@ -9518,8 +10663,10 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 		local prev = lines
 		lines = collapseTrivialIf(lines)
 		lines = rewriteGotoToReturn(lines)
+		lines = rewriteSkipReturnAsTruthyReturn(lines)
 		local changedInline = false
 		lines, changedInline = inlineLocalIntoIfGoto(lines, indentUnit)
+		lines = rewriteSkipReturnAsTruthyReturn(lines)
 		local changed1 = false
 		lines, changed1 = liftGuardChainElse(lines, indentUnit)
 		local changed2 = false
@@ -9534,11 +10681,13 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 		lines, changed5 = liftSimpleGuardChains(lines, indentUnit)
 		local changed6 = false
 		lines, changed6 = dropGotoToImmediatePostIfLabel(lines)
+		local changedComp = false
+		lines, changedComp = liftComplementaryGuardPair(lines)
 		local changed4 = false
 		lines, changed4 = liftIfGotoBody(lines, indentUnit)
 		local changed0 = false
 		lines, changed0 = liftGuardToSkipLabel(lines, indentUnit)
-		local same = (not changedInline) and (not changed0) and (not changed1) and (not changed2) and (not changed3) and (not changed4) and (not changed5) and (not changed6)
+		local same = (not changedInline) and (not changed0) and (not changed1) and (not changed2) and (not changed3) and (not changed4) and (not changed5) and (not changed6) and (not changedComp)
 		if same then
 			local eq = #lines == #prev
 			if eq then for k = 1, #lines do if lines[k] ~= prev[k] then eq = false; break end end end
@@ -9578,6 +10727,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = collapseSingleIfChain(lines)
 	lines = recoverEmptyFieldGuards(lines)
 	lines = dropEmptyIfBlocks(lines)
+	lines = dropDeadElseClobber(lines)
 
 	-- Pass 9: register temp cleanup
 	lines = splitRegisterLifetimes(lines)
@@ -9601,6 +10751,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = fixFindBasePartFallbackReturns(lines)
 	lines = fixInvertedIsaGuard(lines)
 	lines = fixInvertedFalseyGuard(lines)
+	lines = PASSES.fixSelfReferentialNotGuard(lines)
 	lines = hoistRepeatedLocals(lines)
 	lines = coalesceAlternativeFinds(lines)
 	lines = fixBareMethodReferences(lines)
@@ -9648,6 +10799,9 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = dropUnmatchedEndLines(lines)
 	lines = normalizeLuaIndentation(lines, indentUnit)
 	lines = fixInvertedFalseyGuard(lines)
+	lines = PASSES.fixSelfReferentialNotGuard(lines)
+	lines = PASSES.dropDeadUnusedLocals(lines)
+	lines = dropDeadElseClobber(lines)
 	lines = dropUnknownOpArtifacts(lines)
 	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
@@ -12083,6 +13237,26 @@ local function renderSource(bc)
 			lines = out
 		end
 	end
+	-- Hoist branch-only assignments of pure field expressions to function start.
+	-- Must run after the rename pass so we operate on user-facing names like
+	-- `arg0_val` rather than internal `_value_3`.
+	lines = PASSES.hoistBranchOnlyAssignmentsToFnStart(lines)
+	-- Strip redundant parens around table literals.
+	lines = PASSES.dropRedundantParensAroundTables(lines)
+	-- Drop empty `else` clauses.
+	lines = PASSES.dropEmptyElseClauses(lines)
+	-- Simplify `if COND then X = true/false else X = !LIT end` to a single assignment.
+	lines = PASSES.simplifyBoolLoadbSkip(lines)
+	-- Fix self-referential reassignment within blocks.
+	lines = PASSES.fixSelfReferentialReassignment(lines)
+	-- Fix `local NAME = LOOPVAR` at function scope (LOOPVAR not in scope yet).
+	-- Must run BEFORE fixCapturedUpvalueLocal so we see `local NAME` (no init).
+	lines = PASSES.fixForwardDeclFromLoopLocal(lines)
+	-- Fix captured upvalue locals: when a closure captures NAME but NAME is
+	-- never assigned, find the loop-local that should be assigned to NAME.
+	lines = PASSES.fixCapturedUpvalueLocal(lines)
+	-- Drop duplicate `local NAME` declarations introduced by multiple hoist passes.
+	lines = PASSES.dropDuplicateLocalForwardDecls(lines)
 	return table.concat(lines, "\n")
 end
 
