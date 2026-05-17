@@ -1657,6 +1657,7 @@ local function analyzeProtoFlow(p, bc)
 		orDefaultHints = { jumps = {}, fallbacks = {}, uses = {} },
 		counterHints = { initializers = {}, increments = {} },
 		backEdgeMutationHints = {},
+		staleSnapshotHints = {},
 		regVersionsByPc = {},
 		regWrites = {},
 		regWritesByBlock = {},
@@ -1848,6 +1849,7 @@ local function analyzeProtoFlow(p, bc)
 			writeReg(pc, a, kvalLua(p, d), localAt(p, a, pc), opName)
 		elseif opName == "FORNPREP" then
 			local loopName = localAt(p, a + 2, pc + 1) or "_i"
+			loopName = uniqueAnalysisName(loopName, a + 2)
 			writeReg(pc, a + 2, loopName, loopName, opName)
 		elseif opName == "CONCAT" then
 			local parts = {}
@@ -2873,6 +2875,96 @@ local function analyzeProtoFlow(p, bc)
 			end
 		end
 	end
+	-- Detect stale-snapshot-after-field-write pattern (generic):
+	-- At each SETTABLEKS T.K = V, find registers R whose write produced an
+	-- expression that "depends on" T.K (directly or indirectly through a chain).
+	-- If R is read after the SETTABLEKS AND R's expression hasn't been
+	-- re-materialized as a real local, mark R's defining write for materialization.
+	-- This preserves snapshot semantics.
+	for pcKey, info in pairs(cfg.instructions) do
+		if info.opName == "SETTABLEKS" then
+			local mutatedSrcReg = info.b
+			local keyConst = info.aux ~= nil and constantAt(p, info.aux) or nil
+			local key = keyConst and keyConst.kind == "string" and keyConst.value or nil
+			if key then
+				-- Build the "field path" string representing the mutated location:
+				-- the source's expression at this pc + ".key".
+				-- We approximate via the register's last write.
+				local srcWrite = lastWriteBefore(mutatedSrcReg, pcKey)
+				if srcWrite and srcWrite.expr then
+					local srcExpr = srcWrite.expr
+					-- The concrete field expression that's been mutated
+					local fieldExpr1 = srcExpr .. "." .. key
+					local fieldExpr2 = srcExpr .. "[\"" .. key .. "\"]"
+					-- For each register R that has a write before pcKey whose
+					-- expression contains fieldExpr1 or fieldExpr2, AND R is
+					-- read after pcKey, mark R's write for materialization.
+					for reg, writes in pairs(analysis.regWrites) do
+						if reg ~= mutatedSrcReg then
+							-- Find the LATEST write to reg before pcKey
+							local lastWrite = nil
+							for _, w in ipairs(writes) do
+								if w.pc < pcKey then
+									lastWrite = w
+								else
+									break
+								end
+							end
+							if lastWrite and lastWrite.expr then
+								local exprStr = lastWrite.expr
+								local depends = false
+								if exprStr == fieldExpr1 or exprStr == fieldExpr2 then
+									depends = true
+								-- Also check for CHAIN access: lastWrite.expr starts with fieldExpr1
+								elseif exprStr:sub(1, #fieldExpr1) == fieldExpr1
+									and #exprStr > #fieldExpr1
+									and not exprStr:sub(#fieldExpr1 + 1, #fieldExpr1 + 1):match("[%w_]")
+								then
+									depends = true
+								end
+								if depends and not analysis.staleSnapshotHints[lastWrite.pc] then
+									-- Check if reg is read after pcKey before being rewritten
+									local nextWrite = nil
+									for _, w in ipairs(writes) do
+										if w.pc > pcKey then
+											nextWrite = w
+											break
+										end
+									end
+									local readEnd = nextWrite and nextWrite.pc or #p.code
+									local readAfter = false
+									local probe = pcKey + info.len
+									while probe < readEnd and probe < #p.code do
+										local pi = cfg.instructions[probe] or decodedInsnAt(p, probe)
+										if instrReadsReg(pi, reg) then
+											readAfter = true
+											break
+										end
+										probe = probe + pi.len
+									end
+									if readAfter then
+										local lv = locvarAt(p, reg, lastWrite.pc)
+										local targetName
+										if lv and isValidIdent(lv.name) then
+											targetName = lv.name
+										elseif lastWrite.name and isValidIdent(lastWrite.name) and not lastWrite.name:match("^R%d+$") then
+											targetName = lastWrite.name
+										else
+											targetName = stableGeneratedTempName(reg, "_value_")
+										end
+										analysis.staleSnapshotHints[lastWrite.pc] = {
+											reg = reg,
+											targetName = targetName,
+										}
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
 	return analysis
 end
 
@@ -3744,8 +3836,17 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			and isValidIdent(aliasHint.targetName)
 			and isValidIdent(aliasHint.sourceName)
 		then
-			regs[a] = aliasHint.targetName
-			return indent .. aliasHint.targetName .. " = " .. aliasHint.sourceName, 0
+			-- Validate sourceName actually refers to a live local. If `regs[b]` doesn't
+			-- match sourceName, the source local was never declared (e.g. because a
+			-- callInlineHint replaced the prior CALL's destination), and emitting
+			-- `target = sourceName` would reference an undefined identifier.
+			local liveSrc = regs[b]
+			if liveSrc == aliasHint.sourceName then
+				regs[a] = aliasHint.targetName
+				return indent .. aliasHint.targetName .. " = " .. aliasHint.sourceName, 0
+			end
+			-- Source name is stale; fall through to normal MOVE handling so we use
+			-- the live regs[b] expression instead.
 		end
 		local targetLocal = localAt(p, a, pc)
 		if targetLocal then
@@ -4226,6 +4327,17 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			regs[a] = trackedNilPhi
 			return indent .. trackedNilPhi .. " = " .. expr, 0
 		end
+		-- Stale snapshot: this GETTABLEKS captures a snapshot that's later
+		-- invalidated by a SETTABLEKS to the same field. Materialize as a real
+		-- local to preserve the snapshot value.
+		local staleHint = flowAnalysis and flowAnalysis.staleSnapshotHints and flowAnalysis.staleSnapshotHints[pc] or nil
+		if staleHint and staleHint.reg == a and staleHint.targetName and isValidIdent(staleHint.targetName) then
+			local targetName = sanitizeLocalName(staleHint.targetName, a, pc)
+			regs[a] = targetName
+			regs.__materialized = regs.__materialized or {}
+			regs.__materialized[targetName] = true
+			return indent .. "local " .. targetName .. " = " .. expr, 0
+		end
 		regs[a] = expr
 		return nil, 0
 	end
@@ -4334,7 +4446,28 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			local destName = regs[destReg]
 			if destName and isValidIdent(destName) and not destName:match("^R%d+$") then
 				regs[a] = destName
-				return indent .. destName .. " = " .. callExpr, 0
+				-- Determine whether `destName` has been declared as a local before
+				-- this point. Generated names (_r<N>, _r<N>_<M>, _value_<N>,
+				-- _flag<N>, etc.) created by the analysis pass are never
+				-- pre-declared, so they need a `local` prefix on first use.
+				-- Names that match a debug locvar OR a parameter are already in
+				-- scope.
+				local needLocal = false
+				if not localAt(p, destReg, pc) and destReg >= (p.numparams or 0) then
+					-- No debug locvar AND not a parameter: was the name declared
+					-- by an earlier rendered statement? Use a per-scope marker
+					-- to track this.
+					regs.__callInlineDeclared = regs.__callInlineDeclared or {}
+					if not regs.__callInlineDeclared[destName] then
+						-- Only emit `local` for names that look generated
+						if destName:match("^_r%d+") or destName:match("^_value_") or destName:match("^_flag") then
+							needLocal = true
+						end
+						regs.__callInlineDeclared[destName] = true
+					end
+				end
+				local prefix = needLocal and "local " or ""
+				return indent .. prefix .. destName .. " = " .. callExpr, 0
 			end
 		end
 		local guardedFallbackTarget = regs.__guardedFallbackTargets and regs.__guardedFallbackTargets[a] or nil
@@ -4381,6 +4514,57 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			regs[a + k] = name
 		end
 		return indent .. "local " .. table.concat(names, ", ") .. " = " .. callExpr, 0
+	end
+
+	-- Detect the boolean-skip-LOADB-pair-feeding-JUMPIF[NOT] pattern:
+	--   <COND_JUMP> -> pcT       ; conditional jump
+	--   pc_skip = pc + len_cond  ; LOADB Ra = X, skip 1
+	--   pcT     = pc_skip + 1    ; LOADB Ra = !X
+	--   pc_use  = pcT + 1        ; JUMPIF/JUMPIFNOT Ra -> pcE
+	-- Net semantics: the JUMPIF[NOT] will jump to pcE iff the original COND_JUMP
+	-- did/didn't take. We can collapse 4 instructions into a single
+	-- `if [appropriate cond] then goto pcE end` and skip past the boolean
+	-- machinery. This is the encoding the compiler emits when the source
+	-- `if EXPR then XXX end` was complex enough to require a temporary boolean.
+	-- Returns: { pcE = N, invertCond = bool, extraConsume = N } or nil.
+	local function detectBoolSkipPattern(condJumpInfo)
+		if not condJumpInfo then return nil end
+		local condTarget = jumpTargetForInsn(condJumpInfo)
+		if not condTarget then return nil end
+		local pcSkip = condJumpInfo.pc + condJumpInfo.len
+		if pcSkip >= #p.code then return nil end
+		local skipInfo = decodedInsnAt(p, pcSkip)
+		if skipInfo.opName ~= "LOADB" or skipInfo.c ~= 1 then return nil end
+		local pcT = pcSkip + skipInfo.len
+		if pcT ~= condTarget then return nil end
+		if pcT >= #p.code then return nil end
+		local tInfo = decodedInsnAt(p, pcT)
+		if tInfo.opName ~= "LOADB" or tInfo.a ~= skipInfo.a then return nil end
+		-- The two LOADBs must store opposite values
+		if (skipInfo.b ~= 0) == (tInfo.b ~= 0) then return nil end
+		local pcUse = pcT + tInfo.len
+		if pcUse >= #p.code then return nil end
+		local useInfo = decodedInsnAt(p, pcUse)
+		if useInfo.opName ~= "JUMPIF" and useInfo.opName ~= "JUMPIFNOT" then return nil end
+		if useInfo.a ~= skipInfo.a then return nil end
+		local pcE = jumpTargetForInsn(useInfo)
+		if not pcE then return nil end
+		-- Determine: when does Ra trigger JUMPIF[NOT] to jump?
+		--   skipInfo.b : value of Ra when cond_jump did NOT take (fall-through to pc_skip)
+		--   tInfo.b    : value of Ra when cond_jump TOOK (jumped to pcT)
+		local fallthroughVal = skipInfo.b ~= 0
+		local takenVal = tInfo.b ~= 0
+		-- JUMPIF triggers when Ra is true; JUMPIFNOT triggers when Ra is false.
+		local triggerVal = useInfo.opName == "JUMPIF"
+		-- Jump to pcE iff Ra == triggerVal. Ra equals triggerVal in exactly one of
+		-- the two paths (taken vs fall-through) since takenVal != fallthroughVal.
+		local jumpToEWhenTaken = (takenVal == triggerVal)
+		local totalExtraConsume = skipInfo.len + tInfo.len + useInfo.len
+		return {
+			pcE = pcE,
+			invertCond = not jumpToEWhenTaken,
+			extraConsume = totalExtraConsume,
+		}
 	end
 
 	if opName == "RETURN" then
@@ -4682,6 +4866,78 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 					return nil, 0
 				end
 			end
+			-- Extended: JUMPIFNOT Ra → Fb; GETTABLEKS chain Rx; JUMPIF Rx → Mg; (LOADN|LOADK|LOADB) Rx (at Fb); merge=Mg
+			-- Pattern: Rx = ((Ra) and (chain_expr)) or LITERAL
+			if fallbackInfo and (fallbackInfo.opName == "LOADN" or fallbackInfo.opName == "LOADK" or fallbackInfo.opName == "LOADKX" or fallbackInfo.opName == "LOADB") then
+				local chainPc3 = nextPc
+				local chainReg3 = nil
+				local foundJumpIfLit = false
+				while chainPc3 < fallbackPc do
+					local si3 = decodedInsnAt(p, chainPc3)
+					if si3.opName == "GETTABLEKS" then
+						if chainReg3 == nil then
+							if si3.b ~= a then break end
+							chainReg3 = si3.a
+						else
+							if si3.b ~= chainReg3 or si3.a ~= chainReg3 then break end
+						end
+						chainPc3 = chainPc3 + si3.len
+					elseif si3.opName == "JUMPIF" and chainReg3 and si3.a == chainReg3 then
+						local jumpMerge3 = jumpTargetForInsn(si3)
+						if jumpMerge3
+							and chainPc3 + si3.len == fallbackPc
+							and fallbackInfo.a == chainReg3
+							and fallbackPc + fallbackInfo.len == jumpMerge3
+						then
+							foundJumpIfLit = true
+						end
+						break
+					else
+						break
+					end
+				end
+				if foundJumpIfLit then
+					-- Build the or-expression: ((Ra) and chain.field.path) or LITERAL.
+					-- We let the regs[] tracking already accumulate the chain; the literal
+					-- fallback will overwrite it. Then on the use site (typically SETTABLEKS
+					-- or SETUPVAL or another consumer), regs[chainReg] will reflect the
+					-- final literal which loses the chain. Patch via orDefaultHints-like
+					-- mechanism: emit nothing here; let GETTABLEKS-chain accumulate, the
+					-- LOADN at fallbackPc will replace regs but we need to merge as
+					-- "(chain or literal)" expression.
+					-- Build the chain expression by walking once more
+					local chainExpr = rname(a)
+					local cp = nextPc
+					local last = chainReg3
+					while cp < fallbackPc do
+						local si4 = decodedInsnAt(p, cp)
+						if si4.opName == "GETTABLEKS" then
+							local kc = constantAt(p, si4.aux ~= nil and si4.aux or si4.d)
+							local key = kc and kc.kind == "string" and kc.value or nil
+							if key then
+								chainExpr = chainExpr .. luaIndexSuffix(key)
+							end
+							cp = cp + si4.len
+						else
+							break
+						end
+					end
+					-- Compute literal expression
+					local litExpr
+					if fallbackInfo.opName == "LOADN" then
+						litExpr = tostring(fallbackInfo.d)
+					elseif fallbackInfo.opName == "LOADB" then
+						litExpr = fallbackInfo.b ~= 0 and "true" or "false"
+					else
+						local idx = fallbackInfo.opName == "LOADKX" and fallbackInfo.aux or fallbackInfo.d
+						litExpr = kvalLua(p, idx)
+					end
+					regs[chainReg3] = "(" .. rname(a) .. " and " .. chainExpr .. ") or " .. litExpr
+					-- Skip past the entire pattern (JUMPIFNOT + GETTABLEKS chain + JUMPIF + fallback)
+					local totalSkip = (fallbackPc + fallbackInfo.len) - (pc + getOpLength(opName))
+					return nil, totalSkip
+				end
+			end
 			-- Extended: JUMPIFNOT Ra → Mg; GETTABLEKS chain Rx; JUMPIF Rx → Mg; LOADNIL Rx; Mg
 			-- Pattern: Rx = ((Ra) and (chain_expr)) or nil  (both guards target same merge)
 			do
@@ -4722,6 +4978,19 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		end
 		local rawCond = rname(a)
 		local cond = opName == "JUMPIF" and rawCond or ("not " .. rawCond)
+		local condJumpInfo = { pc = pc, opName = opName, a = a, b = b, d = b, len = getOpLength(opName) }
+		local boolSkip = detectBoolSkipPattern(condJumpInfo)
+		if boolSkip then
+			-- For JUMPIF/JUMPIFNOT, the "natural" cond is `Ra` / `not Ra`.
+			-- If invertCond is true, flip it.
+			local effCond
+			if boolSkip.invertCond then
+				effCond = opName == "JUMPIF" and ("not " .. rawCond) or rawCond
+			else
+				effCond = cond
+			end
+			return indent .. "if " .. effCond .. " then goto pc" .. tostring(boolSkip.pcE) .. " end", boolSkip.extraConsume
+		end
 		return indent .. "if " .. cond .. " then goto pc" .. tostring(pc + b + 1) .. " end", 0
 	end
 
@@ -4744,6 +5013,12 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			[">="] = "<",
 		}
 		local symbol = baseSymbols[opName]
+		local condJumpInfo = { pc = pc, opName = opName, a = a, aux = aux, d = d, len = getOpLength(opName) }
+		local boolSkip = detectBoolSkipPattern(condJumpInfo)
+		if boolSkip then
+			local effSymbol = boolSkip.invertCond and negate[symbol] or symbol
+			return indent .. "if " .. rname(a) .. " " .. effSymbol .. " " .. rname(rb) .. " then goto pc" .. tostring(boolSkip.pcE) .. " end", boolSkip.extraConsume
+		end
 		return indent .. "if " .. rname(a) .. " " .. symbol .. " " .. rname(rb) .. " then goto pc" .. tostring(pc + d + 1) .. " end", 0
 	end
 
@@ -4751,6 +5026,16 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local notFlag = bit32_band(bit32_rshift(aux or 0, 31), 1)
 		local kidx = bit32_band(aux or 0, 0x7FFFFFFF)
 		local symbol = notFlag ~= 0 and ">" or "<="
+		local condJumpInfo = { pc = pc, opName = opName, a = a, aux = aux, d = d, len = getOpLength(opName) }
+		local boolSkip = detectBoolSkipPattern(condJumpInfo)
+		if boolSkip then
+			local effSymbol = symbol
+			if boolSkip.invertCond then
+				local invMap = { ["<="] = ">", [">"] = "<=" }
+				effSymbol = invMap[symbol]
+			end
+			return indent .. "if " .. rname(a) .. " " .. effSymbol .. " " .. kvalLua(p, kidx) .. " then goto pc" .. tostring(boolSkip.pcE) .. " end", boolSkip.extraConsume
+		end
 		return indent .. "if " .. rname(a) .. " " .. symbol .. " " .. kvalLua(p, kidx) .. " then goto pc" .. tostring(pc + d + 1) .. " end", 0
 	end
 
@@ -4770,6 +5055,15 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 			local kidx = bit32_band(aux or 0, 0xFFFFFF)
 			rhs = kvalLua(p, kidx)
 		end
+		local condJumpInfo = { pc = pc, opName = opName, a = a, aux = aux, d = d, len = getOpLength(opName) }
+		local boolSkip = detectBoolSkipPattern(condJumpInfo)
+		if boolSkip then
+			local effOp = cmpOp
+			if boolSkip.invertCond then
+				effOp = cmpOp == "==" and "~=" or "=="
+			end
+			return indent .. "if " .. rname(a) .. " " .. effOp .. " " .. rhs .. " then goto pc" .. tostring(boolSkip.pcE) .. " end", boolSkip.extraConsume
+		end
 		return indent .. "if " .. rname(a) .. " " .. cmpOp .. " " .. rhs .. " then goto pc" .. tostring(pc + d + 1) .. " end", 0
 	end
 
@@ -4787,11 +5081,26 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		local limit = regs[a] or ("R" .. tostring(a))
 		local step = regs[a + 1] or ("R" .. tostring(a + 1))
 		local loopName = localAt(p, a + 2, pc + 1)
+		-- Prefer the analysis-assigned name (which may have a uniqueness suffix
+		-- to avoid nested-loop collisions like `_i` vs `_i_2`).
+		local analysisLoopName = nil
+		if flowAnalysis and flowAnalysis.regWrites and flowAnalysis.regWrites[a + 2] then
+			for _, w in ipairs(flowAnalysis.regWrites[a + 2]) do
+				if w.pc == pc and w.opName == "FORNPREP" and w.name and isValidIdent(w.name) then
+					analysisLoopName = w.name
+					break
+				end
+			end
+		end
+		if not loopName then
+			loopName = analysisLoopName
+		end
 		if not loopName and generatedNameFor then
 			loopName = generatedNameFor("_i", "_i")
 		end
-		regs[a + 2] = loopName or "_i"
-		return indent .. "-- FORNPREP R" .. tostring(a) .. " init=" .. init .. " limit=" .. limit .. " step=" .. step .. " -> pc" .. tostring(pc + d + 1), 0
+		loopName = loopName or "_i"
+		regs[a + 2] = loopName
+		return indent .. "-- FORNPREP R" .. tostring(a) .. " init=" .. init .. " limit=" .. limit .. " step=" .. step .. " name=" .. loopName .. " -> pc" .. tostring(pc + d + 1), 0
 	end
 
 	if opName == "FORNLOOP" then
@@ -5149,98 +5458,20 @@ local function normalizeNegativeAddk(lines)
 	return out
 end
 
-local function liftAngleNormalizationArtifacts(lines, indentUnit)
-	local function trim(s)
-		return s:match("^%s*(.-)%s*$")
-	end
-	local function stripOuterParens(expr)
-		expr = trim(expr)
-		while expr:sub(1, 1) == "(" and expr:sub(-1) == ")" do
-			local depth = 0
-			local ok = true
-			for i = 1, #expr do
-				local ch = expr:sub(i, i)
-				if ch == "(" then
-					depth = depth + 1
-				elseif ch == ")" then
-					depth = depth - 1
-					if depth == 0 and i < #expr then
-						ok = false
-						break
-					end
-				end
-			end
-			if not ok then break end
-			expr = trim(expr:sub(2, -2))
-		end
-		return expr
-	end
-	local function replacePlain(s, old, new)
-		return (s:gsub(luaPE(old), (new:gsub("%%", "%%%%"))))
-	end
-	local out = {}
-	local i = 1
-	local counter = 0
-	while i <= #lines do
-		if i + 5 <= #lines then
-			local ind1, expr1 = lines[i]:match("^(%s*)if%s+3%.1415926535897931?%s*<%s*(.-)%s+then%s*$")
-			local comment1 = lines[i + 1]:match("^%s*%-%-%s+ROBLOX_OP_72")
-			local end1 = ind1 and lines[i + 2]:match("^" .. luaPE(ind1) .. "end%s*$")
-			local ind2, expr2 = lines[i + 3]:match("^(%s*)if%s+%((.-)%s*%-%s*6%.2831853071795862?%)%s*<%s*%-3%.1415926535897931?%s+then%s*$")
-			local comment2 = lines[i + 4]:match("^%s*%-%-%s+ROBLOX_OP_72")
-			local end2 = ind1 and lines[i + 5]:match("^" .. luaPE(ind1) .. "end%s*$")
-			if ind1 and ind2 == ind1 and comment1 and end1 and comment2 and end2 and stripOuterParens(expr1) == stripOuterParens(expr2) then
-				counter = counter + 1
-				local var = counter == 1 and "_angle_delta" or ("_angle_delta_" .. tostring(counter))
-				local expr = stripOuterParens(expr1)
-				out[#out+1] = ind1 .. "local " .. var .. " = " .. expr
-				out[#out+1] = ind1 .. "while 3.1415926535897931 < " .. var .. " do"
-				out[#out+1] = ind1 .. indentUnit .. var .. " = (" .. var .. " - 6.2831853071795862)"
-				out[#out+1] = ind1 .. "end"
-				out[#out+1] = ind1 .. "while " .. var .. " < -3.1415926535897931 do"
-				out[#out+1] = ind1 .. indentUnit .. var .. " = (" .. var .. " + 6.2831853071795862)"
-				out[#out+1] = ind1 .. "end"
-				local artifacts = {
-					"(((" .. expr .. ") - 6.2831853071795862) + 6.2831853071795862)",
-					"((" .. expr .. " - 6.2831853071795862) + 6.2831853071795862)",
-					"(((" .. expr1 .. ") - 6.2831853071795862) + 6.2831853071795862)",
-				}
-				i = i + 6
-				local lookahead = 0
-				while i <= #lines and lookahead < 20 do
-					local ln = lines[i]
-					local curInd = ln:match("^(%s*)") or ""
-					if ln:match("%S") and #curInd < #ind1 then break end
-					if ln:find("math.abs", 1, true) or ln:find("math.sign", 1, true) or ln:find("CurrentYaw", 1, true) or ln:find("CurrentRotation", 1, true) then
-						for _, artifact in ipairs(artifacts) do
-							ln = replacePlain(ln, artifact, var)
-						end
-					end
-					out[#out+1] = ln
-					i = i + 1
-					lookahead = lookahead + 1
-				end
-			else
-				out[#out+1] = lines[i]
-				i = i + 1
-			end
-		else
-			out[#out+1] = lines[i]
-			i = i + 1
-		end
-	end
-	return out
-end
-
 
 -- Lift numeric for: FORNPREP/FORNLOOP comments -> `for i = init, limit, step do`
 local function liftNumericFor(lines, indentUnit)
-	local FORNPREP_PAT = "^(%s*)%-%- FORNPREP R(%d+) init=(.+) limit=(.+) step=(.+) %-> pc(%d+)%s*$"
+	local FORNPREP_PAT = "^(%s*)%-%- FORNPREP R(%d+) init=(.+) limit=(.+) step=(.+) name=([%a_][%w_]*) %-> pc(%d+)%s*$"
+	local FORNPREP_PAT_LEGACY = "^(%s*)%-%- FORNPREP R(%d+) init=(.+) limit=(.+) step=(.+) %-> pc(%d+)%s*$"
 	local FORNLOOP_PAT = "^(%s*)%-%- FORNLOOP R(%d+) %-> pc(%d+)%s*$"
 	local out = {}
 	local i = 1
 	while i <= #lines do
-		local ind, base, initE, limitE, stepE, _tgt = lines[i]:match(FORNPREP_PAT)
+		local ind, base, initE, limitE, stepE, nameE, _tgt = lines[i]:match(FORNPREP_PAT)
+		if not ind then
+			ind, base, initE, limitE, stepE, _tgt = lines[i]:match(FORNPREP_PAT_LEGACY)
+			nameE = nil
+		end
 		if ind then
 			base = tonumber(base)
 			-- find matching FORNLOOP
@@ -5255,18 +5486,23 @@ local function liftNumericFor(lines, indentUnit)
 			if loopIdx then
 				local body = {}
 				for k = i + 1, loopIdx - 1 do body[#body+1] = lines[k] end
-				local loopVar = "_i"
-				local bodyText = table.concat(body, "\n")
-				local best, bestCount = "_i", 0
-				for nm in bodyText:gmatch("(_i[_%d]*)") do
-					local cnt = 0
-					for _ in bodyText:gmatch("%f[%a_]" .. luaPE(nm) .. "%f[^%a_%d]") do cnt = cnt + 1 end
-					if cnt > bestCount then
-						best = nm
-						bestCount = cnt
+				local loopVar
+				if nameE and nameE ~= "" then
+					loopVar = nameE
+				else
+					loopVar = "_i"
+					local bodyText = table.concat(body, "\n")
+					local best, bestCount = "_i", 0
+					for nm in bodyText:gmatch("(_i[_%d]*)") do
+						local cnt = 0
+						for _ in bodyText:gmatch("%f[%a_]" .. luaPE(nm) .. "%f[^%a_%d]") do cnt = cnt + 1 end
+						if cnt > bestCount then
+							best = nm
+							bestCount = cnt
+						end
 					end
+					if bestCount > 0 then loopVar = best end
 				end
-				if bestCount > 0 then loopVar = best end
 				local renamed = {}
 				for _, bl in ipairs(body) do
 					renamed[#renamed+1] = bl:gsub("%f[%a_R]R" .. tostring(base+2) .. "%f[^%a_%d]", loopVar)
@@ -5777,6 +6013,34 @@ local function dropSelfAssignmentNoops(lines)
 	return out
 end
 
+-- Drop duplicate consecutive assignments: `local X = Y` followed by `X = Y` (same RHS).
+-- Arises when the bytecode has both an analysis-driven local declaration and a
+-- subsequent MOVE that re-asserts the same value. The second assignment is
+-- always a no-op since it copies from itself.
+local function dropDuplicateConsecutiveAssignments(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		out[#out + 1] = lines[i]
+		if i + 1 <= #lines then
+			local ind1, name1, rhs1 = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+			local ind2, name2, rhs2 = lines[i + 1]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+)$")
+			if ind1 and name1 and ind2 and name2 and rhs1 and rhs2
+				and ind1 == ind2 and name1 == name2 and rhs1 == rhs2
+				and not lines[i + 1]:match("^%s*local%s")
+			then
+				-- Skip the duplicate
+				i = i + 2
+			else
+				i = i + 1
+			end
+		else
+			i = i + 1
+		end
+	end
+	return out
+end
+
 local function dropUnusedGetAttributesLocals(lines)
 	local out = {}
 	for i, line in ipairs(lines) do
@@ -5920,7 +6184,7 @@ end
 -- two-jump chain can be collapsed into `if NAME then warn(...); return end`
 -- where the `then` branch is supposed to be the FAILURE branch.  The clear
 -- signal of this bug is that code after the `end` reads `NAME` (via field or
--- method) while a successful entry into the `then` branch always returns —
+-- method) while a successful entry into the `then` branch always returns 鈥?
 -- so the post-`end` use is unreachable unless the condition is inverted.
 local function fixInvertedFalseyGuard(lines)
 	local function isFieldUse(line, name)
@@ -5943,7 +6207,7 @@ local function fixInvertedFalseyGuard(lines)
 	local i = 1
 	while i <= #lines do
 		-- Match SIMPLE IDENTIFIER guard ONLY: `if NAME then`
-		-- (NOT field access like `if X.field then` — that would be too aggressive
+		-- (NOT field access like `if X.field then` 鈥?that would be too aggressive
 		-- because using `X.other_field` after the guard is normal, not an inversion signal.)
 		local ind, condExpr = lines[i]:match("^(%s*)if%s+([%a_][%w_]*)%s+then%s*$")
 		if not ind then
@@ -6057,7 +6321,7 @@ local function fixInvertedFalseyGuard(lines)
 		if cInd and cExpr and cExpr:find(".", 1, true) then
 			-- Extract base var (e.g. "v1_e" from "v1_e.IsDying")
 			local baseVar = cExpr:match("^([%a_][%w_]*)%.")
-			-- Look ahead for `X.SAME_FIELD = value` (highest priority — same field assignment indicates state-transition pattern)
+			-- Look ahead for `X.SAME_FIELD = value` (highest priority 鈥?same field assignment indicates state-transition pattern)
 			local skipLines = multiLine and 3 or 1
 			local nextIdx = jc + skipLines
 			while nextIdx <= #out1b and not out1b[nextIdx]:match("%S") do nextIdx = nextIdx + 1 end
@@ -6072,7 +6336,7 @@ local function fixInvertedFalseyGuard(lines)
 				if immediateAssignVal then
 					local valTrim = immediateAssignVal:match("^%s*(.-)%s*$")
 					-- Only reverse when assigned value is "true" or anything non-falsy.
-					-- Reverse when value is `true` literal — explicit state-set.
+					-- Reverse when value is `true` literal 鈥?explicit state-set.
 					-- Don't reverse when value is `false` or `nil` (cleanup pattern).
 					if valTrim == "true" or (valTrim ~= "false" and valTrim ~= "nil" and not valTrim:match("^false%s")) then
 						shouldReverse = true
@@ -6248,7 +6512,7 @@ end
 -- Fix the `if not X then X = X:METHOD(...) end` (or `X = X.FIELD`) anti-pattern.
 -- This is always wrong: when X is nil, `X:METHOD()` would error.  The source
 -- must have been `if X then X = X:METHOD() end` (chained-find pattern).
--- Bytecode: JUMPIFNOT R -> skip; R = R:Method(...); ::skip:: — we mis-lifted
+-- Bytecode: JUMPIFNOT R -> skip; R = R:Method(...); ::skip:: 鈥?we mis-lifted
 -- the skip-if-not as `if not X then BODY end` instead of `if X then BODY end`.
 PASSES.fixSelfReferentialNotGuard = function(lines)
 	local out = {}
@@ -6561,7 +6825,7 @@ PASSES.fixSelfReferentialReassignment = function(lines)
 	-- Pattern: within a single block (typically a for-loop body):
 	--   NAME = INSTANCE_EXPR              -- keeps NAME = instance
 	--   ... (some operations on NAME) ...
-	--   NAME = OTHER_EXPR                 -- ❌ overwrites NAME, name conflict
+	--   NAME = OTHER_EXPR                 -- 鉂?overwrites NAME, name conflict
 	--   local NAME_val = NAME.FIELD       -- now refers to OTHER, not instance
 	--   table.insert(NAME_val, NAME)      -- inserts OTHER into NAME_val (= OTHER.FIELD)
 	-- We rewrite by substituting OTHER_EXPR's value for NAME_val, and dropping
@@ -6588,7 +6852,7 @@ PASSES.fixSelfReferentialReassignment = function(lines)
 		-- valRhs should reference NAME
 		local fieldRhs = valRhs:match("^" .. luaPE(name) .. "%.([%a_][%w_]*)%s*$")
 		if not fieldRhs then return end
-		-- Third line: should READ NAME (the original instance) — typically table.insert
+		-- Third line: should READ NAME (the original instance) 鈥?typically table.insert
 		local tl = out[i + 2]
 		if not tl then return end
 		if not tl:find("%f[%a_]" .. luaPE(name) .. "%f[^%a_%d]") then return end
@@ -6657,6 +6921,164 @@ PASSES.dropEmptyElseClauses = function(lines)
 	return out
 end
 
+-- Flip `if COND then [empty] else BODY end` -> `if not (COND) then BODY end`.
+-- The empty-then with non-empty-else pattern arises after passes lift inner gotos
+-- and leaves a degenerate if-block. The semantics are equivalent to a negated
+-- guard.
+PASSES.flipEmptyThenWithElse = function(lines)
+	-- Run multiple passes until no more changes; flipping outer blocks may
+	-- expose nested blocks that also become eligible.
+	local maxIter = 10
+	for _ = 1, maxIter do
+		local prev = lines
+		lines = (function(lines)
+			local out = {}
+			local i = 1
+			while i <= #lines do
+				local ifInd, cond = lines[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+				if ifInd and cond then
+					-- Find the matching `else` at same indent and `end` at same indent
+					local depth = 0
+					local elseIdx = nil
+					local endIdx = nil
+					for j = i + 1, #lines do
+						local ln = lines[j]
+						local jInd = ln:match("^(%s*)") or ""
+						if #jInd == #ifInd and ln:match("^%s*else%s*$") and depth == 0 then
+							elseIdx = j
+						elseif #jInd == #ifInd and ln:match("^%s*end%s*$") and depth == 0 then
+							endIdx = j
+							break
+						elseif ln:match("^%s*if%s") and ln:match("then%s*$") then
+							depth = depth + 1
+						elseif ln:match("^%s*end%s*$") then
+							depth = depth - 1
+						end
+					end
+					if elseIdx and endIdx then
+						-- Check if the THEN-body (between i+1 and elseIdx-1) is empty (only blanks)
+						local thenEmpty = true
+						for j = i + 1, elseIdx - 1 do
+							if lines[j]:match("%S") then thenEmpty = false; break end
+						end
+						-- Check the ELSE-body has at least one non-blank line
+						local elseHasContent = false
+						for j = elseIdx + 1, endIdx - 1 do
+							if lines[j]:match("%S") then elseHasContent = true; break end
+						end
+						if thenEmpty and elseHasContent then
+							-- Build inverted if
+							local invertedCond
+							if cond:match("^not%s+") then
+								invertedCond = cond:gsub("^not%s+", "")
+								local inner = invertedCond:match("^%((.-)%)$")
+								if inner then invertedCond = inner end
+							else
+								invertedCond = "not (" .. cond .. ")"
+							end
+							out[#out + 1] = ifInd .. "if " .. invertedCond .. " then"
+							for j = elseIdx + 1, endIdx - 1 do
+								out[#out + 1] = lines[j]
+							end
+							out[#out + 1] = lines[endIdx]
+							i = endIdx + 1
+						else
+							out[#out + 1] = lines[i]
+							i = i + 1
+						end
+					else
+						out[#out + 1] = lines[i]
+						i = i + 1
+					end
+				else
+					out[#out + 1] = lines[i]
+					i = i + 1
+				end
+			end
+			return out
+		end)(lines)
+		-- Check if anything changed
+		local changed = (#prev ~= #lines)
+		if not changed then
+			for k = 1, #lines do
+				if prev[k] ~= lines[k] then changed = true; break end
+			end
+		end
+		if not changed then break end
+	end
+	return lines
+end
+
+-- Collapse multi-guard "(A and A.B and ... and X.Y) or D" pattern that compiled
+-- as nested ifs:
+--   if COND_chain then
+--       NAME = CHAIN
+--       if not NAME then NAME = FALLBACK end
+--   end
+-- Detect when NAME is forward-declared earlier (via `local NAME` or `local NAME = nil`)
+-- and used after the block. Convert the entire structure to:
+--   NAME = (COND_chain and CHAIN) or FALLBACK
+-- This corrects the semantic bug where NAME stays nil if COND_chain is false,
+-- causing later `string.format(NAME, ...)` to crash.
+PASSES.collapseMultiGuardOrDefault = function(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		-- Match: `<ind>if COND then`
+		local ifInd, cond = lines[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+		if ifInd and cond and i + 5 <= #lines then
+			local innerInd = ifInd .. "\t"
+			-- Match: `<innerInd>NAME = CHAIN_EXPR`
+			local assignName, assignRhs = lines[i + 1]:match("^" .. luaPE(innerInd) .. "([%a_][%w_]*)%s*=%s*(.+)$")
+			if assignName and assignRhs and not lines[i + 1]:match("^%s*local%s") then
+				-- Match: `<innerInd>if not (NAME) then` OR `<innerInd>if not NAME then`
+				local guardLine = lines[i + 2]
+				local guardCond = guardLine and (guardLine:match("^" .. luaPE(innerInd) .. "if%s+not%s+%(?(.-)%)?%s+then%s*$"))
+				if guardCond and guardCond == assignName then
+					-- Match: `<inner+inner>NAME = FALLBACK`
+					local innerInd2 = innerInd .. "\t"
+					local fbName, fbRhs = lines[i + 3]:match("^" .. luaPE(innerInd2) .. "([%a_][%w_]*)%s*=%s*(.+)$")
+					if fbName == assignName and fbRhs then
+						-- Match: `<innerInd>end` and `<ifInd>end`
+						local innerEnd = lines[i + 4] and lines[i + 4]:match("^" .. luaPE(innerInd) .. "end%s*$")
+						local outerEnd = lines[i + 5] and lines[i + 5]:match("^" .. luaPE(ifInd) .. "end%s*$")
+						if innerEnd and outerEnd then
+							-- Build collapsed expression: `NAME = (cond and chain) or fallback`
+							-- Wrap cond in parens if it contains "and"/"or" at outer level.
+							local wrappedCond = cond
+							if cond:find(" and ", 1, true) or cond:find(" or ", 1, true) then
+								wrappedCond = "(" .. cond .. ")"
+							end
+							-- Wrap chain similarly
+							local wrappedChain = assignRhs
+							-- If chain contains operators that have lower precedence than `and`,
+							-- wrap. For safety, wrap when it contains spaces with operators.
+							if assignRhs:find(" and ", 1, true) or assignRhs:find(" or ", 1, true) then
+								wrappedChain = "(" .. assignRhs .. ")"
+							end
+							local wrappedFb = fbRhs
+							-- Emit: `NAME = (COND and CHAIN) or FALLBACK`
+							out[#out + 1] = ifInd .. assignName .. " = (" .. wrappedCond .. " and " .. wrappedChain .. ") or " .. wrappedFb
+							i = i + 6
+						else
+							out[#out + 1] = lines[i]; i = i + 1
+						end
+					else
+						out[#out + 1] = lines[i]; i = i + 1
+					end
+				else
+					out[#out + 1] = lines[i]; i = i + 1
+				end
+			else
+				out[#out + 1] = lines[i]; i = i + 1
+			end
+		else
+			out[#out + 1] = lines[i]; i = i + 1
+		end
+	end
+	return out
+end
+
 -- Simplify `if COND then X = false else X = true end` to `X = not COND`.
 -- Also `if COND then X = true else X = false end` to `X = COND` (or wrapped).
 -- Conservative: only handle multi-line form, and only when X is a simple identifier
@@ -6694,7 +7116,7 @@ PASSES.simplifyBoolLoadbSkip = function(lines)
 					-- thenLit == "false", elseLit == "true"
 					expr = "not " .. wrapForAnd(cond)
 				end
-				-- Check if previous line is `local X` (forward decl) — merge.
+				-- Check if previous line is `local X` (forward decl) 鈥?merge.
 				local mergedDecl = false
 				if #out > 0 then
 					local prev = out[#out]
@@ -6976,7 +7398,7 @@ end
 --           X = SAFE_EXPR        -- only assignment to X
 --           ... return ...
 --       end
---       USE X here               -- ❌ X is nil if COND was false
+--       USE X here               -- 鉂?X is nil if COND was false
 -- 
 -- If SAFE_EXPR is a pure field-access expression (no calls, only param/upvalue/self
 -- field reads), the bytecode likely loaded X unconditionally before the branch.
@@ -10436,7 +10858,7 @@ local function liftWhileTrueFromJumpback(lines, loopHeaderPcs)
 		if lbl and (not loopHeaderPcs or headerSet[lbl]) then
 			local lastJ = nil
 			-- Also detect the case where the back-jump is wrapped in `if COND then goto LBL end`.
-			-- In that case the loop body is empty (a `while not COND do end` no-op) — we
+			-- In that case the loop body is empty (a `while not COND do end` no-op) 鈥?we
 			-- should NOT lift because the result would be useless.  But we DO want to
 			-- lift the bare `goto LBL` form below.
 			for j = i + 1, #lines do
@@ -10837,7 +11259,6 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = rewriteGotoToReturn(lines)
 	lines = rewriteSkipReturnAsTruthyReturn(lines)
 	lines = normalizeNegativeAddk(lines)
-	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = removeUnreachableAfterReturn(lines)
 	lines = dropOrphanLabels(lines)
 
@@ -11016,7 +11437,6 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = repairInvalidElseClauses(lines)
 	lines = restoreFirstMatchLoopBreaks(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
-	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = dropLoadbArtifacts(lines)
 	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
@@ -11046,7 +11466,6 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = repairInvalidElseClauses(lines)
 	lines = restoreFirstMatchLoopBreaks(lines)
 	lines = foldConstantConditionBlocks(lines, indentUnit)
-	lines = liftAngleNormalizationArtifacts(lines, indentUnit)
 	lines = dropLoadbArtifacts(lines)
 	lines = dropUnusedGetAttributesLocals(lines)
 	lines = dropEmptyIfBlocks(lines)
@@ -13501,6 +13920,12 @@ local function renderSource(bc)
 	lines = PASSES.dropRedundantParensAroundTables(lines)
 	-- Drop empty `else` clauses.
 	lines = PASSES.dropEmptyElseClauses(lines)
+	lines = PASSES.flipEmptyThenWithElse(lines)
+	lines = dropEmptyIfBlocks(lines)
+	-- Collapse `if COND then X = chain; if not X then X = fallback end end` to
+	-- `X = (COND and chain) or fallback`. Fixes multi-guard fallback bugs where
+	-- X stays nil when COND is false.
+	lines = PASSES.collapseMultiGuardOrDefault(lines)
 	-- Simplify `if COND then X = true/false else X = !LIT end` to a single assignment.
 	lines = PASSES.simplifyBoolLoadbSkip(lines)
 	-- Fix self-referential reassignment within blocks.
@@ -13515,6 +13940,15 @@ local function renderSource(bc)
 	lines = PASSES.inlineSingleUseAnonFunctions(lines)
 	-- Drop duplicate `local NAME` declarations introduced by multiple hoist passes.
 	lines = PASSES.dropDuplicateLocalForwardDecls(lines)
+	-- Final cleanup: remove self-assignment no-ops that may have been introduced
+	-- by earlier transformations (e.g. flipped empty-then blocks producing X = X).
+	lines = dropSelfAssignmentNoops(lines)
+	-- Drop duplicate consecutive assignments: `local X = Y; X = Y`.
+	lines = dropDuplicateConsecutiveAssignments(lines)
+	-- Re-run the flip pass: dropping self-assignments may have made then-bodies
+	-- empty, exposing more `if X then else BODY end` patterns to flip.
+	lines = PASSES.flipEmptyThenWithElse(lines)
+	lines = dropEmptyIfBlocks(lines)
 	return table.concat(lines, "\n")
 end
 
