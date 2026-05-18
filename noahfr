@@ -249,7 +249,23 @@ local function cleanGeneratedIdent(s)
 		cleaned = "_" .. cleaned
 	end
 	if #cleaned > 48 then
-		cleaned = cleaned:sub(1, 48):gsub("_$", "")
+		-- Preserve common semantic suffixes (_result, _result_N, _val, _val_N) so
+		-- the downstream rename pass can still recognize them and shorten to short
+		-- forms like `r1`, `w1`. Without this, a 60+ char name like
+		-- `GetAutoAimTargetRect_result` would truncate to `GetAutoAimTargetRect_res`
+		-- which is no longer recognizable as a `_result` pattern.
+		local suffix = cleaned:match("(_result_%d+)$") or cleaned:match("(_result)$")
+			or cleaned:match("(_val_%d+)$") or cleaned:match("(_val)$")
+		if suffix and #suffix < 24 then
+			local prefixCap = 48 - #suffix
+			local prefix = cleaned:sub(1, #cleaned - #suffix)
+			if #prefix > prefixCap then
+				prefix = prefix:sub(1, prefixCap):gsub("_$", "")
+			end
+			cleaned = prefix .. suffix
+		else
+			cleaned = cleaned:sub(1, 48):gsub("_$", "")
+		end
 	end
 	if LUA_KEYWORDS[cleaned] then
 		cleaned = cleaned .. "_value"
@@ -13852,6 +13868,10 @@ local function renderSource(bc)
 	--   state, state_2, state_N    -> s1,  s2,  ... (by first appearance order)
 	--   flag,  flag_2,  _flagN     -> f1,  f2,  ...
 	--   _value, _value_N           -> v_u1, v_u2, ...
+	--   *_result, *_result_N       -> r1,  r2,  ... (volume reduction)
+	--   *_val, *_val_N             -> w1,  w2,  ... (volume reduction)
+	--   *_str, *_str_N             -> t1,  t2,  ... (tostring results)
+	--   *_num, *_num_N             -> n1,  n2,  ... (tonumber results)
 	--   *_entry                    -> v<K>_e  (K by distinct base order)
 	--   argN inside function FOO   -> v<K>    (K assigned by function-scope walk,
 	--                                          so each parameter gets a unique number
@@ -13862,6 +13882,8 @@ local function renderSource(bc)
 	do
 		local renames = {}
 		local stateOrder, flagOrder, valueOrder, entryOrder = {}, {}, {}, {}
+		local resultOrder, valOrder = {}, {}
+		local strOrder, numOrder = {}, {}
 		local function classify(tok)
 			if tok == "state" or tok:match("^state_%d+$") then return "state" end
 			if tok == "flag" or tok:match("^flag_%d+$") or tok:match("^_flag%d+$") then return "flag" end
@@ -13872,6 +13894,27 @@ local function renderSource(bc)
 			if base then return "entry", base, "" end
 			local base2, suf = tok:match("^(.+)_entry(_%d+)$")
 			if base2 then return "entry", base2, suf end
+			-- *_result and *_result_N (e.g., InvokeServer_result, Clone_result_2).
+			-- Volume reduction: rename to short r1, r2, ... by first appearance.
+			if tok:match("^[%a_][%w_]*_result$") or tok:match("^[%a_][%w_]*_result_%d+$") then
+				return "result"
+			end
+			-- *_val and *_val_N (e.g., arg1_val, _value_5_val).
+			-- Common artifacts of value-phi naming. Rename to short w1, w2, ...
+			-- (avoid "v" since user already uses v<N> for params).
+			if tok:match("^[%a_][%w_]*_val$") or tok:match("^[%a_][%w_]*_val_%d+$") then
+				-- Skip if it matches an _value_<N> pattern that's already been
+				-- reclassified to "value" above.
+				return "val"
+			end
+			-- *_str and *_str_N from tostring() hints, *_num from tonumber().
+			-- Rename to short t1, t2, ... (string-cast results).
+			if tok:match("^[%a_][%w_]*_str$") or tok:match("^[%a_][%w_]*_str_%d+$") then
+				return "str"
+			end
+			if tok:match("^[%a_][%w_]*_num$") or tok:match("^[%a_][%w_]*_num_%d+$") then
+				return "num"
+			end
 			return nil
 		end
 		local function scanTokens(line, cb)
@@ -13914,6 +13957,14 @@ local function renderSource(bc)
 						flagOrder[#flagOrder + 1] = tok
 					elseif kind == "value" then
 						valueOrder[#valueOrder + 1] = tok
+					elseif kind == "result" then
+						resultOrder[#resultOrder + 1] = tok
+					elseif kind == "val" then
+						valOrder[#valOrder + 1] = tok
+					elseif kind == "str" then
+						strOrder[#strOrder + 1] = tok
+					elseif kind == "num" then
+						numOrder[#numOrder + 1] = tok
 					else
 						-- entry: number by distinct base.  Carry the optional
 						-- `_N` index suffix through so `arg1_entry_2` becomes
@@ -13930,6 +13981,10 @@ local function renderSource(bc)
 		for idx, name in ipairs(stateOrder) do renames[name] = "s" .. idx end
 		for idx, name in ipairs(flagOrder) do renames[name] = "f" .. idx end
 		for idx, name in ipairs(valueOrder) do renames[name] = "v_u" .. idx end
+		for idx, name in ipairs(resultOrder) do renames[name] = "r" .. idx end
+		for idx, name in ipairs(valOrder) do renames[name] = "w" .. idx end
+		for idx, name in ipairs(strOrder) do renames[name] = "t" .. idx end
+		for idx, name in ipairs(numOrder) do renames[name] = "n" .. idx end
 		-- Bytecode pre-scan: find function params that are captured by a child
 		-- closure under the name `self`.  The Roblox Luau compiler records the
 		-- captured upvalue's locvar name (in the CHILD proto's upvalue list),
