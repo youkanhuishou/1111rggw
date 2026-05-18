@@ -3800,6 +3800,47 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 
 	if opName == "MOVE" then
 		local src = rname(b)
+		-- Detect FASTCALL arg-prep MOVE: MOVE Rb=Ra preceded by FASTCALL/FASTCALL2/FASTCALL2K
+		-- targeting Rb-N (where N is arg count). Such a MOVE is the slow-path arg-prep
+		-- and shouldn't materialize as a separate `targetLocal = src` assignment;
+		-- the subsequent CALL will inline `src` as an argument expression.
+		-- Pattern: FASTCALL Rdest skip=K; ...; MOVE Rb=Ra; ...; GETIMPORT/MOVE Rcall=fn; CALL Rcall(N args)
+		-- where Rb >= Rcall+1 and Rb <= Rcall+argcount.
+		do
+			local scanPc = pc + getOpLength(opName)
+			while scanPc < #p.code do
+				local si = decodedInsnAt(p, scanPc)
+				if si.opName == "CALL" and si.a < a and si.b > 0 and a >= si.a + 1 and a <= si.a + si.b - 1 then
+					-- Look back from MOVE to find a FASTCALL whose skip reaches the CALL.
+					local probePc = 0
+					local lastFastcallPc = nil
+					local lastFastcallInfo = nil
+					while probePc < pc do
+						local pi = decodedInsnAt(p, probePc)
+						if pi.opName == "FASTCALL" or pi.opName == "FASTCALL1"
+							or pi.opName == "FASTCALL2" or pi.opName == "FASTCALL2K"
+							or pi.opName == "FASTCALL3"
+						then
+							lastFastcallPc = probePc
+							lastFastcallInfo = pi
+						end
+						probePc = probePc + pi.len
+					end
+					if lastFastcallPc and lastFastcallInfo then
+						local fcSkip = lastFastcallInfo.c or 0
+						-- skip semantics: PC + 1 + skip lands at the CALL pc when this is arg-prep.
+						if lastFastcallPc + fcSkip + 1 == scanPc then
+							regs[a] = src
+							return nil, 0
+						end
+					end
+					break
+				end
+				if instrWritesReg(si, a) then break end
+				if instrReadsReg(si, a) then break end
+				scanPc = scanPc + si.len
+			end
+		end
 		local valuePhiHint = flowAnalysis and flowAnalysis.valuePhiHints and flowAnalysis.valuePhiHints[pc] or nil
 		local valuePhiAssigned = assignHintedValue(a, src, valuePhiHint)
 		if valuePhiAssigned then
@@ -4994,6 +5035,7 @@ local function emitDecompileLine(pc, opName, a, b, c, d, e, aux, p, bc, regs, in
 		return indent .. "if " .. cond .. " then goto pc" .. tostring(pc + b + 1) .. " end", 0
 	end
 
+
 	if opName == "JUMPIFEQ" or opName == "JUMPIFLE" or opName == "JUMPIFLT" or opName == "JUMPIFNOTEQ" or opName == "JUMPIFNOTLE" or opName == "JUMPIFNOTLT" then
 		local rb = bit32_band(aux or 0, 0x7FFFFFFF)
 		local baseSymbols = {
@@ -5770,6 +5812,74 @@ local function liftElseifPatterns(lines)
 end
 
 -- `if A then if B then BODY end end` -> `if A and B then BODY end`
+-- Drop redundant nested `if X then if X then BODY end end` (same condition)
+-- to `if X then BODY end`. Useful when lift passes produce duplicates.
+local function dropRedundantNestedSameCond(lines)
+	local changed = true
+	while changed do
+		changed = false
+		local out = {}
+		for _, ln in ipairs(lines) do out[#out+1] = ln end
+		local i = 1
+		while i <= #out - 1 do
+			local outerInd, outerCond = out[i]:match("^(%s*)if%s+(.+)%s+then%s*$")
+			local innerInd, innerCond = (out[i + 1] or ""):match("^(%s*)if%s+(.+)%s+then%s*$")
+			if outerInd and innerInd and outerCond and innerCond
+				and innerInd == outerInd .. "\t"
+				and outerCond == innerCond
+			then
+				-- Find matching inner `end` at innerInd
+				local depth = 1
+				local innerEnd = nil
+				for j = i + 2, #out do
+					local jInd = out[j]:match("^(%s*)") or ""
+					local jText = out[j]:match("^%s*(.-)%s*$") or ""
+					if #jInd == #innerInd then
+						if jText == "end" then
+							depth = depth - 1
+							if depth == 0 then innerEnd = j; break end
+						elseif jText:sub(1, 3) == "if " and jText:sub(-5) == " then" then
+							depth = depth + 1
+						elseif jText == "else" or jText:sub(1, 7) == "elseif " then
+							-- Has branch; not a simple single-if
+							depth = -1; break
+						end
+					end
+				end
+				if innerEnd and depth == 0 then
+					-- Verify next line after innerEnd is the outer `end` at outerInd
+					local outerEnd = innerEnd + 1
+					if outerEnd <= #out then
+						local oText = out[outerEnd]:match("^%s*(.-)%s*$") or ""
+						local oInd = out[outerEnd]:match("^(%s*)") or ""
+						if oText == "end" and oInd == outerInd then
+							-- Replace: drop the inner `if X then` and inner `end`,
+							-- de-indent the body lines once.
+							local newLines = {}
+							for k = 1, i do newLines[#newLines+1] = out[k] end
+							for k = i + 2, innerEnd - 1 do
+								local bl = out[k]
+								if bl:sub(1, 1) == "\t" then
+									newLines[#newLines+1] = bl:sub(2)
+								else
+									newLines[#newLines+1] = bl
+								end
+							end
+							for k = outerEnd, #out do newLines[#newLines+1] = out[k] end
+							out = newLines
+							lines = out
+							changed = true
+						end
+					end
+				end
+			end
+			i = i + 1
+		end
+		lines = out
+	end
+	return lines
+end
+
 local function collapseSingleIfChain(lines)
 	local changed = true
 	while changed do
@@ -5811,7 +5921,14 @@ local function collapseSingleIfChain(lines)
 							end
 						end
 						if not outerHasBranch then
-							local combined = wrapForAnd(outerCond) .. " and " .. wrapForAnd(innerCond)
+							-- If inner cond matches outer cond exactly, drop the redundant
+							-- inner `if X then ... end` wrapper (semantically equivalent).
+							local combined
+							if outerCond == innerCond then
+								combined = outerCond
+							else
+								combined = wrapForAnd(outerCond) .. " and " .. wrapForAnd(innerCond)
+							end
 							local newBlock = {outerInd .. "if " .. combined .. " then"}
 							for k = i + 2, j - 1 do
 								local bl = out[k]
@@ -6663,6 +6780,91 @@ PASSES.fixCapturedUpvalueLocal = function(lines)
 		fixOne(i)
 	end
 	return out
+end
+
+-- Fix forward-decl-from-loop-local where the function body starts with
+--   local NAME = TEMP        <- TEMP not yet declared
+--   local TEMP                <- forward decl
+-- This is a degenerate variant of the captured-upvalue pattern: the
+-- semantic-naming layer chose `TEMP` for register R while a child closure
+-- captured R by REF and named the upvalue `NAME` (e.g. derived from
+-- Instance.new("Animation") -> "Animation"). Both names refer to the same
+-- variable; they must be unified.
+-- Fix: drop the `local NAME = TEMP` line, drop the `local TEMP` forward decl,
+-- insert `local NAME` (no init) at function scope, and rename TEMP -> NAME
+-- across the function body.
+PASSES.unifyForwardDeclWithCapturedName = function(lines)
+	local out = {}
+	for i, line in ipairs(lines) do out[i] = line end
+	local i = 1
+	while i <= #out do
+		-- Look for function header (function ... or local function ... or = function( etc.)
+		local headerInd = out[i]:match("^(%s*)") or ""
+		local headerText = out[i]:match("^%s*(.-)%s*$") or ""
+		local isFnHeader = headerText:match("^function%f[^%w_]")
+			or headerText:match("^local%s+function%f[^%w_]")
+			or headerText:match("=%s*function%(")
+			or headerText:match("=%s*function%s+%(")
+		if isFnHeader then
+			-- Look for the first non-blank line after the header
+			local j = i + 1
+			while j <= #out and not out[j]:match("%S") do j = j + 1 end
+			if j <= #out then
+				local jInd, jName, jRhs = out[j]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+				if jInd and jName and jRhs and jName ~= jRhs then
+					-- Look for next non-blank
+					local k = j + 1
+					while k <= #out and not out[k]:match("%S") do k = k + 1 end
+					if k <= #out then
+						local kInd, kName = out[k]:match("^(%s*)local%s+([%a_][%w_]*)%s*$")
+						if kInd and kName == jRhs and kInd == jInd then
+							-- Match: `local NAME = TEMP; local TEMP` at function start.
+							-- Look for inner closure within the function body that
+							-- captures NAME via `-- upvalues:` comment.
+							local fnIndPlus = headerInd .. "\t"
+							local fnEnd = #out
+							for m = j + 1, #out do
+								local mInd = out[m]:match("^(%s*)") or ""
+								local mText = out[m]:match("^%s*(.-)%s*$") or ""
+								if mInd == headerInd and mText == "end" then
+									fnEnd = m - 1
+									break
+								end
+							end
+							local capturesName = false
+							for m = j, fnEnd do
+								local upvList = out[m]:match("%-%-%s*upvalues:%s*(.+)$")
+								if upvList then
+									for u in upvList:gmatch("([%a_][%w_]*)") do
+										if u == jName then capturesName = true break end
+									end
+								end
+								if capturesName then break end
+							end
+							if capturesName then
+								-- Apply: drop the `local NAME = TEMP` line (jIdx),
+								-- replace `local TEMP` (kIdx) with `local NAME`,
+								-- rename TEMP -> NAME everywhere within fn body.
+								out[j] = jInd .. "local " .. jName
+								out[k] = ""
+								local pat = "%f[%a_]" .. luaPE(kName) .. "%f[^%a_%d]"
+								for m = j + 1, fnEnd do
+									out[m] = out[m]:gsub(pat, jName)
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		i = i + 1
+	end
+	-- Filter out empty lines we created
+	local filtered = {}
+	for _, ln in ipairs(out) do
+		filtered[#filtered+1] = ln
+	end
+	return filtered
 end
 
 -- Inline single-use anonymous function declarations.
@@ -11350,6 +11552,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 		lines, changed2 = liftMultilineIfGotoElse(lines, indentUnit)
 		lines = liftElseifPatterns(lines)
 		lines = collapseSingleIfChain(lines)
+		lines = dropRedundantNestedSameCond(lines)
 		lines = recoverEmptyFieldGuards(lines)
 		lines = dropEmptyIfBlocks(lines)
 		local changed3 = false
@@ -11402,6 +11605,7 @@ local function liftControlFlow(lines, indentUnit, loopHeaderPcs)
 	lines = dropEmptyGotoForLoops(lines)
 	lines = liftElseifPatterns(lines)
 	lines = collapseSingleIfChain(lines)
+	lines = dropRedundantNestedSameCond(lines)
 	lines = recoverEmptyFieldGuards(lines)
 	lines = dropEmptyIfBlocks(lines)
 	lines = dropDeadElseClobber(lines)
@@ -13936,6 +14140,9 @@ local function renderSource(bc)
 	-- Fix captured upvalue locals: when a closure captures NAME but NAME is
 	-- never assigned, find the loop-local that should be assigned to NAME.
 	lines = PASSES.fixCapturedUpvalueLocal(lines)
+	-- Unify `local NAME = TEMP; local TEMP` at function start when an inner
+	-- closure captures NAME (the two names refer to the same register).
+	lines = PASSES.unifyForwardDeclWithCapturedName(lines)
 	-- Inline single-use anonymous functions: `local function anonN() ... end; X(anonN)` -> `X(function() ... end)`
 	lines = PASSES.inlineSingleUseAnonFunctions(lines)
 	-- Drop duplicate `local NAME` declarations introduced by multiple hoist passes.
@@ -13949,6 +14156,8 @@ local function renderSource(bc)
 	-- empty, exposing more `if X then else BODY end` patterns to flip.
 	lines = PASSES.flipEmptyThenWithElse(lines)
 	lines = dropEmptyIfBlocks(lines)
+	-- Drop redundant nested `if X then if X then BODY end end` (same condition).
+	lines = dropRedundantNestedSameCond(lines)
 	return table.concat(lines, "\n")
 end
 
