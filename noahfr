@@ -12106,7 +12106,7 @@ local function applyUpvalueRenameHints(body, hints)
 	return table.concat(lines, "\n")
 end
 
-local function predeclareHoistedUpvalues(lines)
+PASSES.predeclareHoistedUpvalues = function(lines)
 	local mainIdx = nil
 	for i, line in ipairs(lines) do
 		if line:match("^%-%- main chunk%s*%(") then
@@ -12190,7 +12190,7 @@ local function predeclareHoistedUpvalues(lines)
 	return out
 end
 
-local function foldPcallRequireUpvalueWriters(lines)
+PASSES.foldPcallRequireUpvalueWriters = function(lines)
 	local out = {}
 	local captureNames = {}
 	local i = 1
@@ -12308,7 +12308,7 @@ local function closeBlockText(text, stack)
 	end
 end
 
-local function fixCameraModuleActivateController(lines, indentUnit)
+PASSES.fixCameraModuleActivateController = function(lines, indentUnit)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -12453,7 +12453,7 @@ local function lineHasAnyIdent(line, names)
 	return false
 end
 
-local function reattachLeakedFunctionTails(lines, indentUnit)
+PASSES.reattachLeakedFunctionTails = function(lines, indentUnit)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -12556,7 +12556,7 @@ local function reattachLeakedFunctionTails(lines, indentUnit)
 	return out
 end
 
-local function fixSplitFallbackObjectAlias(lines)
+PASSES.fixSplitFallbackObjectAlias = function(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -12644,7 +12644,7 @@ local function fixSplitFallbackObjectAlias(lines)
 	return out
 end
 
-local function hoistLocalsUsedOutsideDeclBlock(lines)
+PASSES.hoistLocalsUsedOutsideDeclBlock = function(lines)
 	if #lines == 0 then return lines end
 	local function processSegment(segment)
 		if #segment == 0 then return segment end
@@ -12784,7 +12784,7 @@ local function hoistLocalsUsedOutsideDeclBlock(lines)
 	return outAll
 end
 
-local function fixModelPivotCFrameFallback(lines)
+PASSES.fixModelPivotCFrameFallback = function(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -12828,7 +12828,7 @@ local function fixModelPivotCFrameFallback(lines)
 	return out
 end
 
-local function sinkFunctionOnlyTempHoists(lines)
+PASSES.sinkFunctionOnlyTempHoists = function(lines)
 	local function functionEnd(startIdx)
 		local stack = { "function" }
 		local j = startIdx + 1
@@ -13111,7 +13111,7 @@ local function sinkFunctionOnlyTempHoists(lines)
 	return out
 end
 
-local function findFirstChildGuardParts(line)
+PASSES.findFirstChildGuardParts = function(line)
 	local ind, expr, child = line:match("^(%s*)if%s+not%s+%((.+:FindFirstChild%s*%(%s*\"([^\"]+)\".-%))%)%s+then%s*$")
 	if ind then return ind, expr, cleanGeneratedIdent(child) end
 	ind, expr, child = line:match("^(%s*)if%s+not%s+%((.+:FindFirstChild%s*%(%s*'([^']+)'.-%))%)%s+then%s*$")
@@ -13119,7 +13119,7 @@ local function findFirstChildGuardParts(line)
 	return nil
 end
 
-local function nameUsedBeforeNextTopLevel(lines, startIdx, name)
+PASSES.nameUsedBeforeNextTopLevel = function(lines, startIdx, name)
 	for i = startIdx, math.min(#lines, startIdx + 80) do
 		local text = lines[i]:match("^%s*(.-)%s*$")
 		local ind = lines[i]:match("^(%s*)") or ""
@@ -13133,12 +13133,12 @@ local function nameUsedBeforeNextTopLevel(lines, startIdx, name)
 	return false
 end
 
-local function fixFindFirstChildGuardLocals(lines)
+PASSES.fixFindFirstChildGuardLocals = function(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
-		local ind, findExpr, childName = findFirstChildGuardParts(lines[i])
-		if ind and childName and isValidIdent(childName) and nameUsedBeforeNextTopLevel(lines, i + 1, childName) then
+		local ind, findExpr, childName = PASSES.findFirstChildGuardParts(lines[i])
+		if ind and childName and isValidIdent(childName) and PASSES.nameUsedBeforeNextTopLevel(lines, i + 1, childName) then
 			local prevIdx = #out
 			while prevIdx > 0 and not out[prevIdx]:match("%S") do
 				prevIdx = prevIdx - 1
@@ -13186,7 +13186,7 @@ local function fixFindFirstChildGuardLocals(lines)
 	return out
 end
 
-local function restoreGuardedFindCallResultLocals(lines)
+PASSES.restoreGuardedFindCallResultLocals = function(lines)
 	local out = {}
 	local function firstTempUse(startIdx)
 		for j = startIdx, math.min(#lines, startIdx + 80) do
@@ -13237,10 +13237,10 @@ local function restoreGuardedFindCallResultLocals(lines)
 		if ind and expr then
 			local hint = deriveNameHint(expr)
 			local name = hint and cleanGeneratedIdent(hint) or nil
-			if not (name and isValidIdent(name) and nameUsedBeforeNextTopLevel(lines, i + 1, name)) then
+			if not (name and isValidIdent(name) and PASSES.nameUsedBeforeNextTopLevel(lines, i + 1, name)) then
 				name = firstSemanticResultUse(i + 1, expr) or firstTempUse(i + 1)
 			end
-			if name and isValidIdent(name) and nameUsedBeforeNextTopLevel(lines, i + 1, name) then
+			if name and isValidIdent(name) and PASSES.nameUsedBeforeNextTopLevel(lines, i + 1, name) then
 				out[#out+1] = ind .. "local " .. name .. " = " .. expr
 				out[#out+1] = ind .. "if not " .. name .. " then return end"
 				i = endIdx + 1
@@ -13253,7 +13253,7 @@ local function restoreGuardedFindCallResultLocals(lines)
 	return out
 end
 
-local function fixBasePartFallbackMergeNames(lines)
+PASSES.fixBasePartFallbackMergeNames = function(lines)
 	local fallbackChildByPrimary = {
 		Torso = "UpperTorso",
 		["Left Arm"] = "LeftUpperArm",
@@ -13379,7 +13379,7 @@ local function fixBasePartFallbackMergeNames(lines)
 	return out
 end
 
-local function restoreLastBarrelPointAfterAllBarrels(lines)
+PASSES.restoreLastBarrelPointAfterAllBarrels = function(lines)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -13425,7 +13425,7 @@ local function restoreLastBarrelPointAfterAllBarrels(lines)
 	return out
 end
 
-local function fixNestedModelBasePartElseif(lines, indentUnit)
+PASSES.fixNestedModelBasePartElseif = function(lines, indentUnit)
 	local out = {}
 	local i = 1
 	while i <= #lines do
@@ -13539,31 +13539,31 @@ local function renderSource(bc)
 	for line in (source .. "\n"):gmatch("(.-)\n") do
 		lines[#lines+1] = line
 	end
-	lines = foldPcallRequireUpvalueWriters(lines)
+	lines = PASSES.foldPcallRequireUpvalueWriters(lines)
 	-- predeclareHoistedUpvalues intentionally disabled: hoist already forward-declares
 	-- repeated locals inside the main chunk, and the top-of-file `local X, Y, Z`
 	-- block plus stripped `local` prefixes in main chunk produces noisy/duplicate
 	-- declarations such as `local Players` appearing both at the top and inside
 	-- the main chunk body.
-	-- lines = predeclareHoistedUpvalues(lines)
+	-- lines = PASSES.predeclareHoistedUpvalues(lines)
 	lines = renderLuaAstLines(lines, "\t")
-	lines = fixCameraModuleActivateController(lines, "\t")
-	lines = reattachLeakedFunctionTails(lines, "\t")
-	lines = fixFindFirstChildGuardLocals(lines)
-	lines = restoreGuardedFindCallResultLocals(lines)
-	lines = fixBasePartFallbackMergeNames(lines)
-	lines = restoreLastBarrelPointAfterAllBarrels(lines)
-	lines = fixSplitFallbackObjectAlias(lines)
-	lines = hoistLocalsUsedOutsideDeclBlock(lines)
-	lines = fixNestedModelBasePartElseif(lines, "\t")
-	lines = fixModelPivotCFrameFallback(lines)
-	lines = hoistLocalsUsedOutsideDeclBlock(lines)
-	lines = sinkFunctionOnlyTempHoists(lines)
+	lines = PASSES.fixCameraModuleActivateController(lines, "\t")
+	lines = PASSES.reattachLeakedFunctionTails(lines, "\t")
+	lines = PASSES.fixFindFirstChildGuardLocals(lines)
+	lines = PASSES.restoreGuardedFindCallResultLocals(lines)
+	lines = PASSES.fixBasePartFallbackMergeNames(lines)
+	lines = PASSES.restoreLastBarrelPointAfterAllBarrels(lines)
+	lines = PASSES.fixSplitFallbackObjectAlias(lines)
+	lines = PASSES.hoistLocalsUsedOutsideDeclBlock(lines)
+	lines = PASSES.fixNestedModelBasePartElseif(lines, "\t")
+	lines = PASSES.fixModelPivotCFrameFallback(lines)
+	lines = PASSES.hoistLocalsUsedOutsideDeclBlock(lines)
+	lines = PASSES.sinkFunctionOnlyTempHoists(lines)
 	lines = renderLuaAstLines(lines, "\t")
-	lines = hoistLocalsUsedOutsideDeclBlock(lines)
-	lines = fixCameraModuleActivateController(lines, "\t")
-	lines = fixBasePartFallbackMergeNames(lines)
-	lines = restoreLastBarrelPointAfterAllBarrels(lines)
+	lines = PASSES.hoistLocalsUsedOutsideDeclBlock(lines)
+	lines = PASSES.fixCameraModuleActivateController(lines, "\t")
+	lines = PASSES.fixBasePartFallbackMergeNames(lines)
+	lines = PASSES.restoreLastBarrelPointAfterAllBarrels(lines)
 	lines = restoreFirstMatchLoopBreaks(lines)
 	lines = fixLoadbSkipBooleanAssignments(lines)
 	lines = normalizeLuaIndentation(lines, "\t")
