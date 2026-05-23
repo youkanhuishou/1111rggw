@@ -156,6 +156,39 @@ local LUA_KEYWORDS = {
 	["while"] = true,
 }
 
+-- Lua/Luau standard globals that should not be picked up as phi target names
+-- when they appear via GETIMPORT (e.g. `warn(...)` consumes a register, then
+-- the same register gets reused for an unrelated local — phi shouldn't
+-- propagate "warn" forward and shadow the global function).
+local LUA_BUILTIN_GLOBALS = {
+	["print"] = true, ["warn"] = true, ["error"] = true, ["assert"] = true,
+	["select"] = true, ["pcall"] = true, ["xpcall"] = true, ["pairs"] = true,
+	["ipairs"] = true, ["next"] = true, ["unpack"] = true, ["type"] = true,
+	["typeof"] = true, ["tostring"] = true, ["tonumber"] = true,
+	["rawget"] = true, ["rawset"] = true, ["rawequal"] = true, ["rawlen"] = true,
+	["setmetatable"] = true, ["getmetatable"] = true, ["require"] = true,
+	["newproxy"] = true, ["getfenv"] = true, ["setfenv"] = true,
+	["collectgarbage"] = true, ["gcinfo"] = true, ["loadstring"] = true,
+	["math"] = true, ["string"] = true, ["table"] = true, ["coroutine"] = true,
+	["os"] = true, ["io"] = true, ["debug"] = true, ["bit32"] = true,
+	["utf8"] = true, ["task"] = true, ["buffer"] = true, ["vector"] = true,
+	["game"] = true, ["workspace"] = true, ["script"] = true, ["shared"] = true,
+	["plugin"] = true, ["_G"] = true, ["_ENV"] = true,
+	["Instance"] = true, ["Vector2"] = true, ["Vector3"] = true,
+	["CFrame"] = true, ["Color3"] = true, ["UDim"] = true, ["UDim2"] = true,
+	["Rect"] = true, ["Region3"] = true, ["Ray"] = true, ["BrickColor"] = true,
+	["Enum"] = true, ["NumberRange"] = true, ["NumberSequence"] = true,
+	["NumberSequenceKeypoint"] = true, ["ColorSequence"] = true,
+	["ColorSequenceKeypoint"] = true, ["TweenInfo"] = true,
+	["RaycastParams"] = true, ["PathWaypoint"] = true,
+	["PhysicalProperties"] = true, ["Faces"] = true, ["Axes"] = true,
+	["DateTime"] = true, ["Random"] = true, ["OverlapParams"] = true,
+	["FloatCurveKey"] = true, ["Vector3int16"] = true, ["Vector2int16"] = true,
+	["Region3int16"] = true, ["Font"] = true, ["ContentId"] = true,
+	["Content"] = true, ["wait"] = true, ["delay"] = true, ["spawn"] = true,
+	["tick"] = true, ["time"] = true, ["elapsedTime"] = true,
+}
+
 local function push(list, value)
 	list[#list + 1] = value
 end
@@ -307,12 +340,25 @@ local function deriveNameHint(expr, functionName)
 			requirePath = h
 		end
 		if requirePath then
+			-- Try simple trailing identifier first: `require(A.B.C)` → "C".
 			local last = requirePath:match("([%a_][%w_]*)%s*$")
 			if last and isValidIdent(last) then return last end
+			-- Otherwise, find the LAST string argument inside a chained method
+			-- call: `require(...:WaitForChild("X"):FindFirstChild("Y"))` → "Y".
+			-- Excludes generic builders like :GetService since those name a
+			-- service, not the loaded module's name.
+			local lastChildName = nil
+			for h in requirePath:gmatch(":[A-Za-z_][A-Za-z_0-9]*%s*%(%s*[\"']([^\"']+)[\"']") do
+				lastChildName = h
+			end
+			if lastChildName then
+				local cleaned = cleanGeneratedIdent(lastChildName)
+				if cleaned then return cleaned end
+			end
 		end
 	end
 	local classHint = nil
-	for cls in e:gmatch(":FindFirstChildOfClass%s*%(%s*[\"']([^\"']+)[\"']") do
+	for cls in e:gmatch(":FindFirstChildOfClass%s*%(%s*[\"']([^\"']+)[\"']%s*%)%s*$") do
 		classHint = cls
 	end
 	if classHint then
@@ -321,23 +367,23 @@ local function deriveNameHint(expr, functionName)
 	end
 	local childHint = nil
 	for _, methodName in ipairs({"WaitForChild", "FindFirstChild", "GetChild"}) do
-		for h in e:gmatch(":" .. methodName .. "%s*%(%s*[\"']([^\"']+)[\"']") do
+		for h in e:gmatch(":" .. methodName .. "%s*%(%s*[\"']([^\"']+)[\"'][^)]-%)%s*$") do
 			childHint = h
 		end
 	end
 	if childHint then return cleanGeneratedIdent(childHint) end
 	local serviceHint = nil
-	for h in e:gmatch(":GetService%s*%(%s*[\"']([^\"']+)[\"']") do
+	for h in e:gmatch(":GetService%s*%(%s*[\"']([^\"']+)[\"']%s*%)%s*$") do
 		serviceHint = h
 	end
 	if serviceHint then return cleanGeneratedIdent(serviceHint) end
 	local attrHint = nil
-	for h in e:gmatch(":GetAttribute%s*%(%s*[\"']([^\"']+)[\"']") do
+	for h in e:gmatch(":GetAttribute%s*%(%s*[\"']([^\"']+)[\"']%s*%)%s*$") do
 		attrHint = h
 	end
 	if attrHint then return cleanGeneratedIdent(attrHint) end
 	local instanceHint = nil
-	for h in e:gmatch("Instance%.new%s*%(%s*[\"']([^\"']+)[\"']") do
+	for h in e:gmatch("Instance%.new%s*%(%s*[\"']([^\"']+)[\"'][^)]-%)%s*$") do
 		instanceHint = h
 	end
 	if instanceHint then return cleanGeneratedIdent(instanceHint) end
@@ -355,6 +401,16 @@ local function deriveNameHint(expr, functionName)
 	if not e:find("%(") and not e:find("%[") and (e:find("%.") or e:find(":")) then
 		local last = e:match("([%a_][%w_]*)%s*$")
 		if last and isValidIdent(last) then return last end
+	end
+	-- Chained access after a parenthesized call, e.g. `game:GetService("X").Y`
+	-- or `Instance.new("X").Y`. The value is the LAST identifier in the chain
+	-- after the closing paren, not anything inside the call.
+	if e:find("%)") and e:find("%.") then
+		local tail = e:match("%)([^()%[%]]*)$")
+		if tail then
+			local last = tail:match("%.([%a_][%w_]*)%s*$")
+			if last and isValidIdent(last) then return last end
+		end
 	end
 	local method = nil
 	for h in e:gmatch("[:%.]([%a_][%w_]*)%s*%(") do
@@ -2153,6 +2209,7 @@ local function analyzeProtoFlow(p, bc)
 				and not candidate:match("^R%d+$")
 				and not isParamName(candidate)
 				and not isGeneratedPhiName(candidate)
+				and not LUA_BUILTIN_GLOBALS[candidate]
 			then
 				return candidate
 			end
@@ -2162,6 +2219,7 @@ local function analyzeProtoFlow(p, bc)
 				and isValidIdent(candidate)
 				and not candidate:match("^R%d+$")
 				and not isParamName(candidate)
+				and not LUA_BUILTIN_GLOBALS[candidate]
 			then
 				return candidate
 			end
@@ -2180,6 +2238,7 @@ local function analyzeProtoFlow(p, bc)
 				and isValidIdent(candidate)
 				and not candidate:match("^R%d+$")
 				and candidate ~= sourceName
+				and not LUA_BUILTIN_GLOBALS[candidate]
 			then
 				return candidate
 			end
@@ -3422,7 +3481,19 @@ local function propagateUpvalueNames(protoIdx, bc, visited)
 		elseif semanticHint and isFallbackUpvalueName(rawExpr) then
 			hint = semanticHint
 		else
-			hint = deriveNameHint(rawExpr) or cleanGeneratedIdent(rawExpr)
+			-- For dict-literal table expressions like `{ Countdown = "...", ... }`,
+			-- prefer a short generic name over running cleanGeneratedIdent on the
+			-- raw text (which would produce a long key-mashup like
+			-- `_Countdown_Next_wave_in_d_WaveStarted_Wave_d_Has`).
+			if rawExpr:match("^%{.*%}$") then
+				if rawExpr:find("%f[%a_][A-Z][A-Z0-9_]*%f[^%a_%d]%s*=") then
+					hint = semanticHint or "config"
+				else
+					hint = semanticHint or "data"
+				end
+			else
+				hint = deriveNameHint(rawExpr) or cleanGeneratedIdent(rawExpr)
+			end
 		end
 		if not hint or not isValidIdent(hint) then return end
 		if hint:match("^R%d+$") or hint:match("^U%d+$") or hint:match("^_r%d") or hint:match("^_%d+$") then return end
@@ -6181,6 +6252,168 @@ end
 -- Arises when the bytecode has both an analysis-driven local declaration and a
 -- subsequent MOVE that re-asserts the same value. The second assignment is
 -- always a no-op since it copies from itself.
+-- Drop dead `NAME = nil` immediately followed by `NAME = expr` where expr
+-- isn't `nil` — the nil assignment is overwritten before being read.
+local function dropDeadNilThenAssign(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		local cur = lines[i]
+		if i + 1 <= #lines then
+			local ind1, name1 = cur:match("^(%s*)([%a_][%w_]*)%s*=%s*nil%s*$")
+			local ind2, name2, rhs2 = lines[i + 1]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+)$")
+			if ind1 and name1 and ind2 and name2 and rhs2
+				and ind1 == ind2 and name1 == name2
+				and not cur:match("^%s*local%s")
+				and not lines[i + 1]:match("^%s*local%s")
+				and rhs2:match("^%s*(.-)%s*$") ~= "nil"
+			then
+				-- skip the dead nil assign
+				i = i + 1
+			else
+				out[#out + 1] = cur
+				i = i + 1
+			end
+		else
+			out[#out + 1] = cur
+			i = i + 1
+		end
+	end
+	return out
+end
+
+-- Drop dead `local NAME = X.FIELD` (or `local NAME = X[K]`) lines whose NAME
+-- is never read in the enclosing function scope. Such lines are dangerous
+-- because they nil-index `X` if `X` is nil at runtime, even though their
+-- result is unused. Common pattern: register-tracking artifacts emit a
+-- guarded GETTABLEKS as an unconditional local declaration.
+local function dropDeadFieldAccessLocals(lines)
+	-- Compute function ranges (same logic as dropDeadNilLocals).
+	local fnRanges = {}
+	do
+		local stack = {}
+		for i, line in ipairs(lines) do
+			local indent = line:match("^(%s*)") or ""
+			local text = line:match("^%s*(.-)%s*$") or ""
+			if text:match("^function%s") or text:match("^local%s+function%s")
+				or text:match("=%s*function%s*%(") then
+				if not text:match("end%s*$") then
+					stack[#stack + 1] = { startIdx = i, ind = indent .. "\t" }
+				end
+			elseif text == "end" then
+				if #stack > 0 and #indent == #stack[#stack].ind - 1 then
+					local top = table.remove(stack)
+					fnRanges[#fnRanges + 1] = { startIdx = top.startIdx, endIdx = i, ind = top.ind }
+				end
+			end
+		end
+	end
+	fnRanges[#fnRanges + 1] = { startIdx = 1, endIdx = #lines, ind = "" }
+	local function rangeFor(idx)
+		local best = nil
+		for _, r in ipairs(fnRanges) do
+			if r.startIdx <= idx and idx <= r.endIdx then
+				if (not best) or (r.startIdx > best.startIdx) then best = r end
+			end
+		end
+		return best
+	end
+	-- Match: `local NAME = X.field` or `local NAME = X.field.deeper`. NAME is a
+	-- single identifier, RHS is pure field/index chain (no calls, no methods).
+	local function isSimpleFieldChain(rhs)
+		rhs = rhs:match("^%s*(.-)%s*$") or ""
+		if rhs:match("^[%a_][%w_]*%.[%a_][%w_%.]*$") then return true end
+		return false
+	end
+	local toDrop = {}
+	-- Helper: count actual identifier references in a line, excluding contexts
+	-- where the token appears as a field key/access rather than a variable use:
+	--   `.NAME`, `:NAME`, `NAME = X` inside `{ ... }` table constructor.
+	-- We use a simple state machine that tokenizes outside string literals.
+	local function lineUsesIdent(line, name)
+		local i, n = 1, #line
+		local inStr = nil
+		local braceDepth = 0
+		while i <= n do
+			local c = line:sub(i, i)
+			if inStr then
+				if c == "\\" and i + 1 <= n then
+					i = i + 2
+				elseif c == inStr then
+					inStr = nil
+					i = i + 1
+				else
+					i = i + 1
+				end
+			elseif c == '"' or c == "'" then
+				inStr = c
+				i = i + 1
+			elseif c == "-" and line:sub(i + 1, i + 1) == "-" then
+				return false  -- comment, stop scanning
+			elseif c == "{" then
+				braceDepth = braceDepth + 1
+				i = i + 1
+			elseif c == "}" then
+				braceDepth = math.max(0, braceDepth - 1)
+				i = i + 1
+			elseif c:match("[%a_]") then
+				local j = i
+				while j <= n and line:sub(j, j):match("[%w_]") do j = j + 1 end
+				local tok = line:sub(i, j - 1)
+				if tok == name then
+					-- Check preceding non-space char.
+					local k = i - 1
+					while k >= 1 and line:sub(k, k):match("%s") do k = k - 1 end
+					local prevCh = k >= 1 and line:sub(k, k) or ""
+					-- Skip field/method access: `.NAME` or `:NAME`.
+					if prevCh ~= "." and prevCh ~= ":" then
+						-- Inside a table constructor, `NAME = X` is a field key,
+						-- not a variable use. Detect: after the token there's an
+						-- `=` (not `==`).
+						if braceDepth > 0 then
+							local m = j
+							while m <= n and line:sub(m, m):match("%s") do m = m + 1 end
+							if line:sub(m, m) == "=" and line:sub(m + 1, m + 1) ~= "=" then
+								-- field key, skip
+							else
+								return true
+							end
+						else
+							return true
+						end
+					end
+				end
+				i = j
+			else
+				i = i + 1
+			end
+		end
+		return false
+	end
+	for i, line in ipairs(lines) do
+		local nm, rhs = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+		if nm and rhs and isSimpleFieldChain(rhs) then
+			local rng = rangeFor(i)
+			if rng then
+				local found = false
+				for j = rng.startIdx, rng.endIdx do
+					if j ~= i and lineUsesIdent(lines[j], nm) then
+						found = true
+						break
+					end
+				end
+				if not found then toDrop[i] = true end
+			end
+		end
+	end
+	if next(toDrop) == nil then return lines end
+	local out = {}
+	for i, line in ipairs(lines) do
+		if not toDrop[i] then out[#out + 1] = line end
+	end
+	return out
+end
+
 local function dropDuplicateConsecutiveAssignments(lines)
 	local out = {}
 	local i = 1
@@ -6435,8 +6668,23 @@ local function fixInvertedFalseyGuard(lines)
 			local endLine = out[j1b + 2]
 			local endInd = endLine and endLine:match("^(%s*)end%s*$")
 			local nextIf = j1b + 3 <= #out and out[j1b + 3] or nil
-			-- Body must be a single function call (indented)
-			local isSingleCall = bodyLine and bodyLine:match("^" .. luaPE(pInd) .. "\t") and not bodyLine:match("^%s*if%s") and not bodyLine:match("^%s*local%s")
+			-- Body must be a single function call (indented). Specifically:
+			-- a method/function call statement, NOT an assignment. The pattern
+			-- this pass targets is `if X then X:cleanup() end; if not X then return end`
+			-- where the cleanup is purely side-effecting. If the body REASSIGNS
+			-- the guard variable (e.g. `if X then X = X.Field end`), the first
+			-- branch is doing field-extraction and inversion would corrupt
+			-- semantics (X would only be reassigned when nil — invalid).
+			local bodyTrim = bodyLine and bodyLine:match("^%s*(.-)%s*$") or ""
+			local isSingleCall = bodyLine
+				and bodyLine:match("^" .. luaPE(pInd) .. "\t")
+				and not bodyLine:match("^%s*if%s")
+				and not bodyLine:match("^%s*local%s")
+				-- Reject assignments to the guard variable itself.
+				and not bodyTrim:match("^" .. luaPE(pExpr) .. "%s*=")
+				-- Reject any assignment statement (LHS = RHS without `:`/`.` before `=`).
+				-- Match "expression = ..." where expression isn't a method call.
+				and not (bodyTrim:match("^[%a_][%w_%.]*%s*=") and not bodyTrim:match("[:%.][%a_][%w_]*%s*%("))
 			-- Next line must be `if not (EXPR) then` or `if not EXPR then`
 			local negGuard = nextIf and (
 				nextIf:match("^" .. luaPE(pInd) .. "if%s+not%s+%(" .. luaPE(pExpr) .. "%)%s+then")
@@ -7510,6 +7758,269 @@ PASSES.dropDuplicateLocalForwardDecls = function(lines)
 			if cur.names[declName] then isDup = true else cur.names[declName] = true end
 		end
 		if not isDup then out[#out + 1] = line end
+	end
+	return out
+end
+
+-- Drop `local NAME = nil` lines whose NAME is referenced nowhere else in the
+-- enclosing function scope. These are typically register-merge phi placeholders
+-- left behind when one branch of a phi is a no-op (e.g. `elseif B then local
+-- _v = nil end`). Only targets generated temp names so user-meaningful locals
+-- are untouched.
+PASSES.dropDeadNilLocals = function(lines)
+	local function isTempName(n)
+		if type(n) ~= "string" then return false end
+		if n:match("^v_u%d") then return true end
+		if n:match("^_v%d") then return true end
+		if n:match("^_r%d") then return true end
+		if n:match("^_value_") then return true end
+		if n:match("^_value%d") then return true end
+		if n:match("^_flag%d") then return true end
+		if n:match("^_t%d") then return true end
+		return false
+	end
+	-- Compute function ranges by tracking indent of `function`/`local function`
+	-- opens and `end` closes. Naive but adequate for our pretty-printed output.
+	-- Each entry: { startIdx, endIdx, ind } where ind is the indent of the
+	-- function body (one tab deeper than the header).
+	local fnRanges = {}
+	do
+		local stack = {}
+		for i, line in ipairs(lines) do
+			local indent = line:match("^(%s*)") or ""
+			local text = line:match("^%s*(.-)%s*$") or ""
+			-- Function open
+			if text:match("^function%s") or text:match("^local%s+function%s")
+				or text:match("=%s*function%s*%(") then
+				if not text:match("end%s*$") then
+					stack[#stack + 1] = { startIdx = i, ind = indent .. "\t" }
+				end
+			elseif text == "end" or text:match("^end[%)%},;]") or text:match("^end%s") then
+				if #stack > 0 and #indent == #stack[#stack].ind - 1 then
+					local top = table.remove(stack)
+					fnRanges[#fnRanges + 1] = { startIdx = top.startIdx, endIdx = i, ind = top.ind }
+				end
+			end
+		end
+	end
+	-- Module-level (whole file) range as fallback for top-level decls.
+	fnRanges[#fnRanges + 1] = { startIdx = 1, endIdx = #lines, ind = "" }
+	-- For a given line index, find the smallest enclosing function range.
+	local function rangeFor(idx)
+		local best = nil
+		for _, r in ipairs(fnRanges) do
+			if r.startIdx <= idx and idx <= r.endIdx then
+				if (not best) or (r.startIdx > best.startIdx) then best = r end
+			end
+		end
+		return best
+	end
+	local toDrop = {}
+	for i, line in ipairs(lines) do
+		local nm = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*nil%s*$")
+		if nm and isTempName(nm) then
+			local rng = rangeFor(i)
+			if rng then
+				local pat = "%f[%w_]" .. nm .. "%f[^%w_]"
+				local found = false
+				for j = rng.startIdx, rng.endIdx do
+					if j ~= i and lines[j]:find(pat) then
+						found = true
+						break
+					end
+				end
+				if not found then toDrop[i] = true end
+			end
+		end
+	end
+	if next(toDrop) == nil then return lines end
+	local out = {}
+	for i, line in ipairs(lines) do
+		if not toDrop[i] then out[#out + 1] = line end
+	end
+	return out
+end
+
+-- Add forward `local NAME` declarations at the start of a function for any
+-- target identifier that is bare-assigned somewhere inside the function but
+-- never declared in any enclosing scope. Without this pass, register-tracking
+-- artifacts can produce statements like:
+--     MainPart_2 = Base
+--     C0 = ((MainPart_2) and (MainPart_2.C0)) or nil
+-- inside a function body, where `MainPart_2` and `C0` were never declared.
+-- These would silently leak to the global scope. By hoisting to a single
+-- forward decl at function entry, references that span sibling/inner blocks
+-- (e.g. `if X then C0 = ... end; tbl = { C0 = C0 }`) keep working.
+PASSES.addMissingLocalPrefix = function(lines)
+	local KNOWN_GLOBALS = {
+		_G = true, _ENV = true, script = true, game = true, workspace = true,
+		shared = true, plugin = true, math = true, table = true, string = true,
+		coroutine = true, os = true, io = true, debug = true, bit32 = true,
+		utf8 = true, task = true, buffer = true, vector = true,
+		require = true, getfenv = true, setfenv = true, getmetatable = true,
+		setmetatable = true, rawget = true, rawset = true, rawequal = true,
+		rawlen = true, type = true, typeof = true, tostring = true, tonumber = true,
+		print = true, warn = true, error = true, assert = true, select = true,
+		pcall = true, xpcall = true, ipairs = true, pairs = true, next = true,
+		unpack = true, newproxy = true, gcinfo = true, collectgarbage = true,
+		Instance = true, Vector2 = true, Vector3 = true, CFrame = true,
+		Color3 = true, UDim = true, UDim2 = true, Rect = true, Region3 = true,
+		Ray = true, BrickColor = true, Enum = true, NumberRange = true,
+		NumberSequence = true, NumberSequenceKeypoint = true, ColorSequence = true,
+		ColorSequenceKeypoint = true, TweenInfo = true, RaycastParams = true,
+		PathWaypoint = true, PhysicalProperties = true, Faces = true, Axes = true,
+		DateTime = true, Random = true, OverlapParams = true, FloatCurveKey = true,
+		Vector3int16 = true, Vector2int16 = true, Region3int16 = true,
+		Font = true, ContentId = true, Content = true, ["nil"] = true,
+		["true"] = true, ["false"] = true, inf = true,
+		self = true,
+	}
+	-- Match `NAME = EXPR` where NAME is a single identifier (no dot/colon/[])
+	-- and the line doesn't start with `local`/`function`/`return`/`if`/`for`/etc.
+	local function isSimpleNameAssign(text)
+		if text == "" then return nil end
+		local first = text:match("^([%a_][%w_]*)") or ""
+		if first == "local" or first == "function" or first == "return"
+			or first == "if" or first == "elseif" or first == "else"
+			or first == "for" or first == "while" or first == "do"
+			or first == "repeat" or first == "until" or first == "end"
+			or first == "break" or first == "continue" then
+			return nil
+		end
+		-- Multi-target `A, B = X, Y` skipped (too complex; rare in our output)
+		local name, rest = text:match("^([%a_][%w_]*)%s*=%s*(.+)$")
+		if not name then return nil end
+		-- Reject augmented assignments (`A += B` etc.) — Luau permits them.
+		if text:match("^[%a_][%w_]*%s*[%+%-%*%/%%%.][%+%-%*%/%%%.]*=") then return nil end
+		return name, rest
+	end
+	-- Phase 1: walk lines tracking function-scope stack; collect:
+	--   - per function, the set of names bare-assigned inside it
+	--   - per function, the set of names declared (locals + params) — across all
+	--     nested blocks within the function
+	--   - per function, the line-index where its body begins (for hoist insertion)
+	-- A line is "inside a function" only if at least one function frame is on the
+	-- stack beyond the module-level frame.
+	local stack = { { ind = "", kind = "function", declared = {}, bareAssigns = {}, headerIdx = 0 } }
+	local function topFn()
+		for k = #stack, 1, -1 do
+			if stack[k].kind == "function" then return stack[k] end
+		end
+		return stack[1]
+	end
+	local function isDeclaredInChain(name)
+		if KNOWN_GLOBALS[name] then return true end
+		for k = #stack, 1, -1 do
+			if stack[k].declared[name] then return true end
+		end
+		return false
+	end
+	-- Track all function frames in order so we can insert hoists after the walk.
+	local allFnFrames = { stack[1] }
+	for idx, line in ipairs(lines) do
+		local indent = line:match("^(%s*)") or ""
+		local text = line:match("^%s*(.-)%s*$") or ""
+		-- Pop block scopes whose indent is strictly greater than current.
+		-- Function scopes pop only on a closing `end`/dedent below their indent.
+		while #stack > 1 do
+			local top = stack[#stack]
+			if #indent < #top.ind then
+				table.remove(stack)
+			else
+				break
+			end
+		end
+		-- Detect function-open and capture its arg list.
+		local fnArgs = nil
+		local fnNameLocal = nil  -- for `local NAME = function(...)`, declares NAME in parent scope
+		do
+			local n1, args1 = text:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)")
+			if n1 then
+				topFn().declared[n1] = true
+				fnArgs = args1
+			else
+				local args2 = text:match("^function%s+[%a_][%w_%.:]*%s*%(([^)]*)%)")
+				if args2 ~= nil then
+					fnArgs = args2
+				else
+					local nm3, args3 = text:match("^local%s+([%a_][%w_]*)%s*=%s*function%s*%(([^)]*)%)")
+					if nm3 then
+						topFn().declared[nm3] = true
+						fnArgs = args3
+						fnNameLocal = nm3
+					else
+						local args4 = text:match("=%s*function%s*%(([^)]*)%)")
+						if args4 ~= nil then fnArgs = args4 end
+					end
+				end
+			end
+		end
+		if fnArgs ~= nil then
+			local newFn = { ind = indent .. "\t", kind = "function", declared = {}, bareAssigns = {}, headerIdx = idx }
+			-- Method form `function T:method(...)` declares implicit `self`
+			if text:match("^function%s+[%a_][%w_%.]*:[%a_]") then
+				newFn.declared["self"] = true
+			end
+			for arg in fnArgs:gmatch("([%a_][%w_]*)") do
+				newFn.declared[arg] = true
+			end
+			table.insert(stack, newFn)
+			table.insert(allFnFrames, newFn)
+		else
+			-- Track local declarations
+			local locDecls = text:match("^local%s+([^=]+)%s*=") or text:match("^local%s+([%a_][%w_,%s]*)%s*$")
+			if locDecls then
+				for nm in locDecls:gmatch("([%a_][%w_]*)") do
+					if nm ~= "function" then topFn().declared[nm] = true end
+				end
+			end
+			-- `for K, V in ... do` and `for K = ... do`
+			local forVars = text:match("^for%s+([^=]+)%s+in%s")
+			if forVars then
+				for nm in forVars:gmatch("([%a_][%w_]*)") do
+					topFn().declared[nm] = true
+				end
+			end
+			local forNumeric = text:match("^for%s+([%a_][%w_]*)%s*=")
+			if forNumeric then topFn().declared[forNumeric] = true end
+			-- Detect bare assignments inside a function (not at module level).
+			local isInsideFunction = #stack >= 2
+			if isInsideFunction then
+				local name = isSimpleNameAssign(text)
+				if name and not KNOWN_GLOBALS[name] and not isDeclaredInChain(name) then
+					-- Record for hoist; mark declared in current top function so we
+					-- don't re-record on later assignments to the same name.
+					local fn = topFn()
+					if not fn.bareAssigns[name] then
+						fn.bareAssigns[name] = true
+					end
+					fn.declared[name] = true
+				end
+			end
+		end
+	end
+	-- Phase 2: build new lines. For each function frame with bareAssigns, insert
+	-- `local NAME, NAME, ...` (one combined decl) right after its header line.
+	-- Frames with empty bareAssigns are skipped.
+	-- Module-level frame (allFnFrames[1]) is skipped: top-level bare assigns are
+	-- intentional global writes in many cases.
+	local insertions = {}  -- map[lineIdx] = string to insert after that line
+	for k = 2, #allFnFrames do
+		local fn = allFnFrames[k]
+		local names = {}
+		for nm in pairs(fn.bareAssigns) do names[#names + 1] = nm end
+		if #names > 0 and fn.headerIdx > 0 then
+			table.sort(names)
+			insertions[fn.headerIdx] = fn.ind .. "local " .. table.concat(names, ", ")
+		end
+	end
+	if next(insertions) == nil then return lines end
+	local out = {}
+	for i = 1, #lines do
+		out[#out + 1] = lines[i]
+		if insertions[i] then
+			out[#out + 1] = insertions[i]
+		end
 	end
 	return out
 end
@@ -8743,108 +9254,10 @@ local function simplifyEmptyTableDefaults(lines)
 end
 
 local function fixRefreshPreviousUserIdPattern(lines)
-	local out = {}
-	for _, ln in ipairs(lines) do out[#out+1] = ln end
-	local current = "currentUserId"
-	local i = 1
-	while i <= #out - 3 do
-		local assignInd, stateName = out[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*%([^()]+%s+or%s+%{%}%)%s*$")
-		local ifInd, ifState, indexName
-		if out[i + 1] then
-			ifInd, ifState, indexName = out[i + 1]:match("^(%s*)if%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
-		end
-		local valueName, forState
-		if out[i + 2] then
-			local _forInd, _keyName
-			_forInd, _keyName, valueName, forState = out[i + 2]:match("^(%s*)for%s+([%a_][%w_]*),%s*([%a_][%w_]*)%s+in%s+ipairs%(([%a_][%w_]*)%)%s+do%s*$")
-		end
-		local cmpInd, cmpValue, cmpState, cmpIndex
-		if out[i + 3] then
-			cmpInd, cmpValue, cmpState, cmpIndex = out[i + 3]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+~=%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
-		end
-		local skipInd, skipValue, skipState, skipIndex
-		if out[i + 3] then
-			skipInd, skipValue, skipState, skipIndex = out[i + 3]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+==%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s+continue%s+end%s*$")
-		end
-		if assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == skipValue and stateName == skipState and indexName == skipIndex then
-			local replacement = {
-				assignInd .. "local " .. current .. " = nil",
-				assignInd .. "if " .. stateName .. "[" .. indexName .. "] then",
-				assignInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
-				assignInd .. "end",
-				out[i],
-				assignInd .. "if " .. current .. " then",
-				out[i + 2],
-				skipInd .. "if " .. valueName .. ".UserId ~= " .. current .. " then continue end",
-			}
-			for _ = 1, 4 do table.remove(out, i) end
-			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
-			i = i + #replacement
-		elseif assignInd and ifInd == assignInd and stateName == ifState and stateName == forState and valueName == cmpValue and stateName == cmpState and indexName == cmpIndex then
-			local replacement = {
-				assignInd .. "local " .. current .. " = nil",
-				assignInd .. "if " .. stateName .. "[" .. indexName .. "] then",
-				assignInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
-				assignInd .. "end",
-				out[i],
-				assignInd .. "if " .. current .. " then",
-				out[i + 2],
-				cmpInd .. "if " .. valueName .. ".UserId == " .. current .. " then",
-			}
-			for _ = 1, 4 do table.remove(out, i) end
-			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
-			i = i + #replacement
-		else
-			i = i + 1
-		end
-	end
-	i = 1
-	while i <= #out - 6 do
-		local ifInd, sourceExpr = out[i]:match("^(%s*)if%s+not%s+%(([%a_][%w_]*)%)%s+then%s*$")
-		if not ifInd then
-			ifInd, sourceExpr = out[i]:match("^(%s*)if%s+not%s+([%a_][%w_]*)%s+then%s*$")
-		end
-		local tmpName = out[i + 1] and out[i + 1]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*%{%}%s*$")
-		local endLine = out[i + 2] and out[i + 2]:match("^%s*end%s*$")
-		local assignInd, stateName, assignTmp
-		if out[i + 3] then
-			assignInd, stateName, assignTmp = out[i + 3]:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
-		end
-		local oldIfInd, oldState, indexName
-		if out[i + 4] then
-			oldIfInd, oldState, indexName = out[i + 4]:match("^(%s*)if%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s*$")
-		end
-		local valueName, forState
-		if out[i + 5] then
-			local _forInd, _keyName
-			_forInd, _keyName, valueName, forState = out[i + 5]:match("^(%s*)for%s+([%a_][%w_]*),%s*([%a_][%w_]*)%s+in%s+ipairs%(([%a_][%w_]*)%)%s+do%s*$")
-		end
-		local skipInd, skipValue, skipState, skipIndex
-		if out[i + 6] then
-			skipInd, skipValue, skipState, skipIndex = out[i + 6]:match("^(%s*)if%s+([%a_][%w_]*)%.UserId%s+==%s+([%a_][%w_]*)%[([%a_][%w_]*)%]%.UserId%s+then%s+continue%s+end%s*$")
-		end
-		if ifInd and sourceExpr and tmpName and endLine and assignInd == ifInd and assignTmp == tmpName
-			and oldIfInd == ifInd and oldState == stateName
-			and forState == stateName and skipValue == valueName and skipState == stateName and skipIndex == indexName
-		then
-			local replacement = {
-				ifInd .. "local " .. current .. " = nil",
-				ifInd .. "if " .. stateName .. "[" .. indexName .. "] then",
-				ifInd .. "\t" .. current .. " = " .. stateName .. "[" .. indexName .. "].UserId",
-				ifInd .. "end",
-				ifInd .. stateName .. " = (" .. sourceExpr .. " or {})",
-				ifInd .. "if " .. current .. " then",
-				out[i + 5],
-				skipInd .. "if " .. valueName .. ".UserId ~= " .. current .. " then continue end",
-			}
-			for _ = 1, 7 do table.remove(out, i) end
-			for k = #replacement, 1, -1 do table.insert(out, i, replacement[k]) end
-			i = i + #replacement
-		else
-			i = i + 1
-		end
-	end
-	return out
+	-- DELETED: hardcoded to specific spectator player-list refresh patterns
+	-- with the literal `.UserId` field. Violates AGENTS.md (no field-name
+	-- hardcoding for individual bytecode patterns).
+	return lines
 end
 local function renameFallbackIndexUpvalues(lines)
 	if #lines == 0 then return lines end
@@ -12343,126 +12756,17 @@ local function closeBlockText(text, stack)
 end
 
 PASSES.fixCameraModuleActivateController = function(lines, indentUnit)
-	local out = {}
-	local i = 1
-	while i <= #lines do
-		local ind, params, upvalueText = lines[i]:match("^(%s*)local%s+function%s+ActivateCameraController%s*%(([^)]*)%)%s*.*%-%-%s+upvalues:%s+(.+)$")
-		if not ind then
-			out[#out+1] = lines[i]
-			i = i + 1
-		else
-			local stack = { "block" }
-			local endIdx = nil
-			for j = i + 1, #lines do
-				local text = stripLineComment(lines[j]):match("^%s*(.-)%s*$")
-				closeBlockText(text, stack)
-				if #stack == 0 then
-					endIdx = j
-					break
-				end
-				local openKind = opensBlockText(text)
-				if openKind then stack[#stack+1] = openKind end
-			end
-			local shouldFix = false
-			if endIdx then
-				for j = i + 1, endIdx - 1 do
-					if lines[j]:find("goto pc76", 1, true) or lines[j]:find("goto pc99", 1, true) then
-						shouldFix = true
-						break
-					end
-				end
-			end
-			local upvalues = {}
-			for raw in tostring(upvalueText):gmatch("[^,]+") do
-				upvalues[#upvalues+1] = raw:match("^%s*(.-)%s*$")
-			end
-			if not shouldFix or not endIdx or #upvalues < 9 then
-				out[#out+1] = lines[i]
-				i = i + 1
-			else
-				local selfName = params:match("^%s*([%a_][%w_]*)") or "arg0"
-				local legacyCamera, vrService, vrCamera = upvalues[1], upvalues[2], upvalues[3]
-				local classicCamera, orbitalCamera = upvalues[4], upvalues[5]
-				local vrVehicleCamera, vehicleCamera = upvalues[6], upvalues[7]
-				local stateName, flagName = upvalues[8], upvalues[9]
-				local b = ind .. indentUnit
-				local b2 = b .. indentUnit
-				local b3 = b2 .. indentUnit
-				out[#out+1] = lines[i]
-				out[#out+1] = b .. "local CameraType = workspace.CurrentCamera.CameraType"
-				out[#out+1] = b .. "local cameraMovementMode = " .. selfName .. ":GetCameraMovementModeFromSettings()"
-				out[#out+1] = b .. "local cameraModule = nil"
-				out[#out+1] = b .. "if CameraType == Enum.CameraType.Scriptable then"
-				out[#out+1] = b2 .. "if not " .. selfName .. ".activeCameraController then return end"
-				out[#out+1] = b2 .. selfName .. ".activeCameraController:Enable(false)"
-				out[#out+1] = b2 .. selfName .. ".activeCameraController = nil"
-				out[#out+1] = b2 .. "return"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "if CameraType == Enum.CameraType.Custom then"
-				out[#out+1] = b2 .. "cameraMovementMode = " .. selfName .. ":GetCameraMovementModeFromSettings()"
-				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Track then"
-				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Classic"
-				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Follow then"
-				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Follow"
-				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Orbital then"
-				out[#out+1] = b2 .. "cameraMovementMode = Enum.ComputerCameraMovementMode.Orbital"
-				out[#out+1] = b .. "elseif CameraType == Enum.CameraType.Attach or CameraType == Enum.CameraType.Watch or CameraType == Enum.CameraType.Fixed then"
-				out[#out+1] = b2 .. "cameraModule = " .. legacyCamera
-				out[#out+1] = b .. "else"
-				out[#out+1] = b2 .. "warn(\"CameraScript encountered an unhandled Camera.CameraType value: \", CameraType)"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "if not cameraModule then"
-				out[#out+1] = b2 .. "if " .. vrService .. ".VREnabled then"
-				out[#out+1] = b3 .. "cameraModule = " .. vrCamera
-				out[#out+1] = b2 .. "elseif cameraMovementMode == Enum.ComputerCameraMovementMode.Classic or cameraMovementMode == Enum.ComputerCameraMovementMode.Follow or cameraMovementMode == Enum.ComputerCameraMovementMode.Default or cameraMovementMode == Enum.ComputerCameraMovementMode.CameraToggle then"
-				out[#out+1] = b3 .. "cameraModule = " .. classicCamera
-				out[#out+1] = b2 .. "elseif cameraMovementMode == Enum.ComputerCameraMovementMode.Orbital then"
-				out[#out+1] = b3 .. "cameraModule = " .. orbitalCamera
-				out[#out+1] = b2 .. "else"
-				out[#out+1] = b3 .. "warn(\"ActivateCameraController did not select a module.\")"
-				out[#out+1] = b3 .. "return"
-				out[#out+1] = b2 .. "end"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "if " .. selfName .. ":ShouldUseVehicleCamera() then"
-				out[#out+1] = b2 .. "if " .. vrService .. ".VREnabled then"
-				out[#out+1] = b3 .. "cameraModule = " .. vrVehicleCamera
-				out[#out+1] = b2 .. "else"
-				out[#out+1] = b3 .. "cameraModule = " .. vehicleCamera
-				out[#out+1] = b2 .. "end"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "local activeCameraController = " .. stateName .. "[cameraModule]"
-				out[#out+1] = b .. "if not activeCameraController then"
-				out[#out+1] = b2 .. "activeCameraController = cameraModule.new()"
-				out[#out+1] = b2 .. stateName .. "[cameraModule] = activeCameraController"
-				out[#out+1] = b .. "elseif " .. flagName .. " then"
-				out[#out+1] = b2 .. "if activeCameraController.Reset and " .. selfName .. ".activeCameraController ~= activeCameraController then"
-				out[#out+1] = b3 .. "activeCameraController:Reset()"
-				out[#out+1] = b2 .. "end"
-				out[#out+1] = b .. "elseif activeCameraController.Reset then"
-				out[#out+1] = b2 .. "activeCameraController:Reset()"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "if " .. selfName .. ".activeCameraController then"
-				out[#out+1] = b2 .. "if " .. selfName .. ".activeCameraController ~= activeCameraController then"
-				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(false)"
-				out[#out+1] = b3 .. selfName .. ".activeCameraController = activeCameraController"
-				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(true)"
-				out[#out+1] = b2 .. "elseif not " .. selfName .. ".activeCameraController:GetEnabled() then"
-				out[#out+1] = b3 .. selfName .. ".activeCameraController:Enable(true)"
-				out[#out+1] = b2 .. "end"
-				out[#out+1] = b .. "elseif activeCameraController ~= nil then"
-				out[#out+1] = b2 .. selfName .. ".activeCameraController = activeCameraController"
-				out[#out+1] = b2 .. "assert(" .. selfName .. ".activeCameraController, \"Strict typing check\")"
-				out[#out+1] = b2 .. selfName .. ".activeCameraController:Enable(true)"
-				out[#out+1] = b .. "end"
-				out[#out+1] = b .. "if not " .. selfName .. ".activeCameraController then return end"
-				out[#out+1] = b .. selfName .. ".activeCameraController:SetCameraMovementMode(cameraMovementMode)"
-				out[#out+1] = b .. selfName .. ".activeCameraController:SetCameraType(CameraType)"
-				out[#out+1] = ind .. "end"
-				i = endIdx + 1
-			end
-		end
-	end
-	return out
+	-- DELETED: this pass was a hardcoded special-case for Roblox's CameraModule
+	-- ActivateCameraController function. It violated AGENTS.md by:
+	--   1. Matching by hardcoded function name ("ActivateCameraController")
+	--   2. Matching by hardcoded PC labels ("goto pc76"/"goto pc99")
+	--   3. Emitting the entire function body as literal Roblox source code
+	--      (with hardcoded Enum.CameraType.*, Enum.ComputerCameraMovementMode.*,
+	--      method names like :GetCameraMovementModeFromSettings, etc.)
+	-- A proper fix needs to be a generic structural recovery in the lift
+	-- pipeline. For now, the input is passed through unchanged and the
+	-- generic decompiler output is used (with whatever artifacts remain).
+	return lines
 end
 
 local function lineHasAnyIdent(line, names)
@@ -13288,232 +13592,32 @@ PASSES.restoreGuardedFindCallResultLocals = function(lines)
 end
 
 PASSES.fixBasePartFallbackMergeNames = function(lines)
-	local fallbackChildByPrimary = {
-		Torso = "UpperTorso",
-		["Left Arm"] = "LeftUpperArm",
-		["Right Arm"] = "RightUpperArm",
-		["Left Leg"] = "LeftUpperLeg",
-		["Right Leg"] = "RightUpperLeg",
-	}
-	local function normalizedName(name)
-		return type(name) == "string" and (name:gsub("_", "")) or ""
-	end
-	local function trimmed(line)
-		return (stripLineComment(line):match("^%s*(.-)%s*$"))
-	end
-	local function matchingEnd(startIdx)
-		local stack = {}
-		for idx = startIdx, #lines do
-			local text = trimmed(lines[idx])
-			local open = opensBlockText(text)
-			if open then stack[#stack+1] = open end
-			closeBlockText(text, stack)
-			if idx > startIdx and #stack == 0 then
-				return idx
-			end
-		end
-		return nil
-	end
-	local function nextNonBlank(startIdx)
-		local idx = startIdx
-		while idx <= #lines and not lines[idx]:match("%S") do
-			idx = idx + 1
-		end
-		return idx <= #lines and idx or nil
-	end
-	local function primaryUsedAfter(name, startIdx)
-		for idx = startIdx, math.min(#lines, startIdx + 80) do
-			local text = trimmed(lines[idx])
-			local ind = lines[idx]:match("^(%s*)") or ""
-			if ind == "" and (text == "end" or text:match("^local%s+function%f[%W]") or text:match("^function%f[%W]")) then
-				return false
-			end
-			if lineHasAnyIdent(lines[idx], { [name] = true }) then
-				return true
-			end
-		end
-		return false
-	end
-	local out = {}
-	local i = 1
-	while i <= #lines do
-		local ind, primaryName, receiver, child = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
-		if not ind then
-			ind, primaryName, receiver, child = lines[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
-		end
-		if not ind then
-			ind, primaryName, receiver, child = lines[i]:match("^(%s*)local%s+([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
-		end
-		if not ind then
-			ind, primaryName, receiver, child = lines[i]:match("^(%s*)([%a_][%w_]*)%s*=%s*(.+):FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
-		end
-		local fallbackChild = child and fallbackChildByPrimary[child] or nil
-		local ifLine = lines[i + 1] or ""
-		local ifInd, ifName, checkName = ifLine:match("^(%s*)if%s+([%a_][%w_]*)%s+and%s+%(%s*([%a_][%w_]*):IsA%(%s*\"BasePart\"%s*%)%s*%)%s+then%s*$")
-		if ind and fallbackChild and ifInd == ind and ifName == primaryName and checkName == primaryName then
-			local endIdx = matchingEnd(i + 1)
-			if endIdx then
-				local fallbackNames = {}
-				for scan = i + 2, endIdx - 1 do
-					local fallbackName, fallbackFoundChild = lines[scan]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
-					if not fallbackName then
-						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*\"([^\"]+)\"%s*%)%s*$")
-					end
-					if not fallbackName then
-						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*local%s+([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
-					end
-					if not fallbackName then
-						fallbackName, fallbackFoundChild = lines[scan]:match("^%s*([%a_][%w_]*)%s*=%s*.+:FindFirstChild%s*%(%s*'([^']+)'%s*%)%s*$")
-					end
-					if fallbackName and fallbackFoundChild == fallbackChild then
-						fallbackNames[fallbackName] = true
-					end
-				end
-				if next(fallbackNames) then
-					local afterIdx = nextNonBlank(endIdx + 1)
-					local fixesAfterField = false
-					local afterLine = afterIdx and lines[afterIdx] or nil
-					if afterLine then
-						local assignInd, lhs, rhs = afterLine:match("^(%s*)(.-)%s*=%s*([%a_][%w_]*)%s*$")
-						local field = lhs and lhs:match("%.([%a_][%w_]*)$") or nil
-						if assignInd == ind and field and fallbackNames[rhs] and normalizedName(field) == normalizedName(primaryName) then
-							fixesAfterField = true
-						end
-					end
-					local fixInner = fixesAfterField or primaryUsedAfter(primaryName, endIdx + 1)
-					if fixInner then
-						for copyIdx = i, endIdx do
-							local ln = lines[copyIdx]
-							local assignInd, lhs, rhs = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
-							if assignInd and lhs ~= primaryName and (rhs == primaryName or fallbackNames[rhs]) then
-								ln = assignInd .. primaryName .. " = " .. rhs
-							else
-								local nilInd, nilName = ln:match("^(%s*)([%a_][%w_]*)%s*=%s*nil%s*$")
-								if nilInd and fallbackNames[nilName] then
-									ln = nilInd .. primaryName .. " = nil"
-								end
-							end
-							out[#out+1] = ln
-						end
-						if fixesAfterField and afterIdx then
-							local assignInd, lhs, rhs = lines[afterIdx]:match("^(%s*)(.-)%s*=%s*([%a_][%w_]*)%s*$")
-							out[#out+1] = assignInd .. lhs .. " = " .. primaryName
-							i = afterIdx + 1
-						else
-							i = endIdx + 1
-						end
-						continue
-					end
-				end
-			end
-		end
-		out[#out+1] = lines[i]
-		i = i + 1
-	end
-	return out
+	-- DELETED: hardcoded for Roblox R6/R15 character body part names (Torso ->
+	-- UpperTorso, Left Arm -> LeftUpperArm, etc.). Violates AGENTS.md (no
+	-- bytecode-specific hardcoded field names). The generic naming/aliasing
+	-- in the renderer should suffice; specific cases that look ugly will
+	-- require a generic structural fix instead.
+	return lines
 end
 
 PASSES.restoreLastBarrelPointAfterAllBarrels = function(lines)
-	local out = {}
-	local i = 1
-	while i <= #lines do
-		local ind = lines[i]:match("^(%s*)if%s+[%a_][%w_%.]*%.FireAllBarrels%s+then%s*$")
-		if ind then
-			local forIdx = nil
-			local forEndIdx = nil
-			local restoreIdx = nil
-			for j = i + 1, math.min(#lines, i + 80) do
-				local lineInd = lines[j]:match("^(%s*)") or ""
-				local text = stripLineComment(lines[j]):match("^%s*(.-)%s*$")
-				if lineInd == ind and text == "end" then
-					break
-				end
-				if not forIdx and lineInd == ind .. "\t" and text:match("^for%s+.+#arg0%.BarrelPoints.+%s+do$") then
-					forIdx = j
-				elseif forIdx and not forEndIdx and lineInd == ind .. "\t" and text == "end" then
-					forEndIdx = j
-				elseif forEndIdx and lineInd == ind .. "\t" and text == "arg0.LastBarrelPoint = arg0.LastBarrelPoint" then
-					restoreIdx = j
-					break
-				end
-			end
-			if forIdx and forEndIdx and restoreIdx then
-				for copyIdx = i, forIdx - 1 do
-					out[#out+1] = lines[copyIdx]
-				end
-				out[#out+1] = (lines[forIdx]:match("^(%s*)") or "") .. "local LastBarrelPoint_saved = arg0.LastBarrelPoint"
-				for copyIdx = forIdx, forEndIdx do
-					out[#out+1] = lines[copyIdx]
-				end
-				for copyIdx = forEndIdx + 1, restoreIdx - 1 do
-					out[#out+1] = lines[copyIdx]
-				end
-				out[#out+1] = (lines[restoreIdx]:match("^(%s*)") or "") .. "arg0.LastBarrelPoint = LastBarrelPoint_saved"
-				i = restoreIdx + 1
-				continue
-			end
-		end
-		out[#out+1] = lines[i]
-		i = i + 1
-	end
-	return out
+	-- DELETED: hardcoded to specific FireAllBarrels / arg0.BarrelPoints /
+	-- arg0.LastBarrelPoint pattern matching one specific bytecode. Violates
+	-- AGENTS.md.
+	return lines
+end
+
+PASSES.fixModelPivotCFrameFallback = function(lines)
+	-- DELETED: hardcoded to :IsA("Model") + :PivotTo(...) + IsCustomModel
+	-- literal text replacement. Violates AGENTS.md.
+	return lines
 end
 
 PASSES.fixNestedModelBasePartElseif = function(lines, indentUnit)
-	local out = {}
-	local i = 1
-	while i <= #lines do
-		local ind, receiver = lines[i]:match("^(%s*)if%s+(.+):IsA%(%s*\"Model\"%s*%)%s+then%s*$")
-		if ind and i + 4 <= #lines then
-			local childInd, primaryReceiver = lines[i + 1]:match("^(%s*)if%s+(.+)%.PrimaryPart%s+then%s*$")
-			if childInd == ind .. indentUnit and primaryReceiver == receiver then
-				local elseifIdx = nil
-				local innerEndIdx = nil
-				local outerEndIdx = nil
-				local j = i + 2
-				while j <= #lines do
-					local text = lines[j]:match("^%s*(.-)%s*$")
-					local lineInd = lines[j]:match("^(%s*)") or ""
-					if lineInd == childInd and text == "elseif " .. receiver .. ":IsA(\"BasePart\") then" then
-						elseifIdx = j
-					elseif elseifIdx and lineInd == childInd and text == "end" then
-						innerEndIdx = j
-						break
-					elseif lineInd == ind and text == "end" then
-						break
-					end
-					j = j + 1
-				end
-				if innerEndIdx then
-					local k = innerEndIdx + 1
-					while k <= #lines and not lines[k]:match("%S") do k = k + 1 end
-					if k <= #lines and (lines[k]:match("^(%s*)") or "") == ind and lines[k]:match("^%s*end%s*$") then
-						outerEndIdx = k
-					end
-				end
-				if elseifIdx and innerEndIdx and outerEndIdx then
-					for copyIdx = i, elseifIdx - 1 do
-						out[#out+1] = lines[copyIdx]
-					end
-					out[#out+1] = childInd .. "end"
-					out[#out+1] = ind .. "elseif " .. receiver .. ":IsA(\"BasePart\") then"
-					for copyIdx = elseifIdx + 1, innerEndIdx - 1 do
-						local moved = lines[copyIdx]
-						if moved:sub(1, #indentUnit) == indentUnit then
-							moved = moved:sub(#indentUnit + 1)
-						end
-						out[#out+1] = moved
-					end
-					out[#out+1] = lines[outerEndIdx]
-					i = outerEndIdx + 1
-					continue
-				end
-			end
-		end
-		out[#out+1] = lines[i]
-		i = i + 1
-	end
-	return out
+	-- DELETED: hardcoded to :IsA("Model") + .PrimaryPart + :IsA("BasePart")
+	-- pattern. While more abstract than others, still tied to specific
+	-- Roblox class names. Violates AGENTS.md preference.
+	return lines
 end
 
 local function renderSource(bc)
@@ -14084,15 +14188,42 @@ local function renderSource(bc)
 		end
 		local function lineOpens(text)
 			if text == "do" or text == "repeat" then return true end
-			if text:sub(1, 3) == "if " or text:match("^if%s.*%sthen$") then return true end
-			if text:sub(1, 4) == "for " then return true end
-			if text:sub(1, 6) == "while " then return true end
+			-- Only treat as block-open if the line ENDS with the opener
+			-- (otherwise it's an inline `if X then Y end` / `for X do Y end`
+			-- whose `end` is on the same line and would never get popped).
+			if text:match("%sthen$") and (text:sub(1, 3) == "if " or text:sub(1, 7) == "elseif ") then return true end
+			if text:match("%sdo$") and (text:sub(1, 4) == "for " or text:sub(1, 6) == "while ") then return true end
 			return false
 		end
 		local function tokenizeArgs(s)
 			local out = {}
 			for tok in s:gmatch("[%a_][%w_]*") do out[#out + 1] = tok end
 			return out
+		end
+		-- For lines that open a new function literal mid-line (e.g.
+		-- `arg0.Foo = X:Connect(function(arg0, arg1) ... end)`), the LHS belongs
+		-- to the OUTER scope and must use the outer argMap, while tokens after
+		-- the `function(` keyword belong to the inner function and use the inner
+		-- argMap. Detect a switch point and rewrite each region with its own map.
+		local function findFunctionLitSplit(line)
+			-- Returns the byte index of the `function` keyword that opens an
+			-- inline literal (i.e. `function%s*%(`), or nil.
+			-- Skips `function NAME(...)` / `local function NAME(...)` because
+			-- those are the line's main opener (handled below by switching
+			-- argMap for the whole line).
+			local s = line:find("function%s*%(")
+			if not s then return nil end
+			-- Don't split if the line starts with `function ` or `local function `
+			-- (named definitions). The whole line uses the new argMap.
+			local prefix = line:sub(1, s - 1)
+			if prefix:match("^%s*$") then return nil end  -- starts with function
+			if prefix:match("^%s*local%s*$") then return nil end
+			-- Verify the function keyword isn't a substring of a longer identifier.
+			if s > 1 then
+				local ch = line:sub(s - 1, s - 1)
+				if ch:match("[%w_]") then return nil end
+			end
+			return s
 		end
 		for li, line in ipairs(lines) do
 			local indent = line:match("^(%s*)") or ""
@@ -14136,8 +14267,18 @@ local function renderSource(bc)
 				end
 				stack[#stack + 1] = { kind = "function", argMap = argMap, indent = indent }
 				-- After we pushed the new function, references on this same line (e.g. in the
-				-- signature) should resolve against the NEW map.
-				lineFuncMap[li] = argMap
+				-- signature) should resolve against the NEW map — UNLESS the function
+				-- literal is opened mid-line by some preceding LHS expression that
+				-- belongs to the OUTER scope. In that case, the outer-scope LHS
+				-- must be rewritten with the OUTER map. Detect this by checking
+				-- if the line's prefix before `function(` is non-trivial.
+				local splitAt = findFunctionLitSplit(line)
+				if splitAt then
+					-- Two-region rewrite: prefix uses outerMap, suffix uses argMap.
+					lineFuncMap[li] = { __split = true, prefixMap = outerMap, suffixMap = argMap, splitAt = splitAt }
+				else
+					lineFuncMap[li] = argMap
+				end
 			elseif lineOpens(text) then
 				stack[#stack + 1] = { kind = "block", indent = indent }
 			elseif text == "end" or text:sub(1, 6) == "until " then
@@ -14154,6 +14295,12 @@ local function renderSource(bc)
 			return tok
 		end
 		local function rewriteLine(line, argMap)
+			-- Handle two-region split: prefix uses prefixMap, suffix uses suffixMap.
+			if type(argMap) == "table" and argMap.__split then
+				local prefix = line:sub(1, argMap.splitAt - 1)
+				local suffix = line:sub(argMap.splitAt)
+				return rewriteLine(prefix, argMap.prefixMap) .. rewriteLine(suffix, argMap.suffixMap)
+			end
 			local out, i, len = {}, 1, #line
 			local inStr = nil
 			while i <= len do
@@ -14187,8 +14334,7 @@ local function renderSource(bc)
 		end
 		for li, line in ipairs(lines) do
 			lines[li] = rewriteLine(line, lineFuncMap[li])
-		end
-		-- Drop identity-alias lines that became `local X = X` after we renamed
+		end		-- Drop identity-alias lines that became `local X = X` after we renamed
 		-- a parent's parameter to `self`.  The materialization in
 		-- `flushPendingClosure` emitted `local self = arg<N>`; after rename
 		-- both sides are the same name and the line is pure noise.
@@ -14241,12 +14387,29 @@ local function renderSource(bc)
 	lines = dropSelfAssignmentNoops(lines)
 	-- Drop duplicate consecutive assignments: `local X = Y; X = Y`.
 	lines = dropDuplicateConsecutiveAssignments(lines)
+	-- Drop dead `NAME = nil; NAME = expr` (the nil is immediately overwritten).
+	lines = dropDeadNilThenAssign(lines)
+	-- Drop dead `local NAME = X.field` whose NAME has no later reads in scope.
+	-- Avoids both wasted lines and runtime nil-index hazards from unused
+	-- guard-protected reads that the renderer materialized as flat locals.
+	lines = dropDeadFieldAccessLocals(lines)
 	-- Re-run the flip pass: dropping self-assignments may have made then-bodies
 	-- empty, exposing more `if X then else BODY end` patterns to flip.
 	lines = PASSES.flipEmptyThenWithElse(lines)
 	lines = dropEmptyIfBlocks(lines)
 	-- Drop redundant nested `if X then if X then BODY end end` (same condition).
 	lines = dropRedundantNestedSameCond(lines)
+	-- Drop dead `local NAME = nil` whose NAME is never referenced. These appear
+	-- as merge-block phi placeholders left behind when one branch of a phi is
+	-- a no-op (typical pattern: `if A then else B then local _v = nil end`).
+	lines = PASSES.dropDeadNilLocals(lines)
+	-- Drop empty branches (then/elseif) left behind by other passes; an `if A then
+	-- (empty) elseif B then ... end` becomes `if not A then if B then ... end end`
+	-- only when safer. For now, just collapse fully-empty `if A then end`.
+	lines = dropEmptyIfBlocks(lines)
+	-- Add missing `local` prefix to function-scope assignments to names that
+	-- were never declared as local in the enclosing function scope.
+	lines = PASSES.addMissingLocalPrefix(lines)
 	return table.concat(lines, "\n")
 end
 
