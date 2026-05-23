@@ -296,6 +296,21 @@ local function deriveNameHint(expr, functionName)
 	if e:match("^select%s*%(") then
 		return "select_result"
 	end
+	-- require(...) is a module loader; the result name should come from the
+	-- module path, not from any inner :GetService("X") used to build the path.
+	-- Match this BEFORE :GetService/:FindFirstChild/etc lookups so wrappers
+	-- like `require(game:GetService("ReplicatedStorage").Modules.Foo)` yield
+	-- "Foo", not "ReplicatedStorage" or "Modules".
+	if e:match("^require%s*%(") then
+		local requirePath = nil
+		for h in e:gmatch("require%s*%((.+)%)") do
+			requirePath = h
+		end
+		if requirePath then
+			local last = requirePath:match("([%a_][%w_]*)%s*$")
+			if last and isValidIdent(last) then return last end
+		end
+	end
 	local classHint = nil
 	for cls in e:gmatch(":FindFirstChildOfClass%s*%(%s*[\"']([^\"']+)[\"']") do
 		classHint = cls
@@ -2058,6 +2073,11 @@ local function analyzeProtoFlow(p, bc)
 			and write.opName ~= "LOADK"
 			and write.opName ~= "LOADKC"
 			and write.opName ~= "LOADKX"
+			-- A NAMECALL writes the self-slot R[a+1] with the receiver's value;
+			-- the slot is consumed by the immediately following CALL, so it
+			-- isn't a real assignment to a logical variable. Treat as non-value
+			-- to avoid leaking the receiver's name into a phi target.
+			and write.opName ~= "NAMECALL"
 	end
 	local function nilPhiCandidateName(write)
 		if not isNilPhiValueWrite(write) then return nil end
@@ -2109,10 +2129,21 @@ local function analyzeProtoFlow(p, bc)
 	end
 	local function valuePhiTargetName(reg, mergePc, ...)
 		local candidates = { localAt(p, reg, mergePc) }
-		for _, write in ipairs({ ... }) do
+		local writesArr = { ... }
+		for _, write in ipairs(writesArr) do
 			if write then
-				candidates[#candidates+1] = write.sourceName
-				candidates[#candidates+1] = write.name
+				-- A NAMECALL writes both R[a] (the function/method ref) and
+				-- R[a+1] (the self/receiver). The name attached to the self-slot
+				-- write is the receiver's name (e.g., "game" when calling
+				-- `game:GetService("Players")`), but that slot is consumed by the
+				-- immediately following CALL — it does NOT represent a real
+				-- assignment to a logical variable. If a later LOADNIL/MOVE
+				-- reuses the same slot, the phi shouldn't pick up the receiver
+				-- name. Exclude such writes from name candidates.
+				if write.opName ~= "NAMECALL" then
+					candidates[#candidates+1] = write.sourceName
+					candidates[#candidates+1] = write.name
+				end
 				candidates[#candidates+1] = localAt(p, reg, write.pc)
 			end
 		end
@@ -12090,7 +12121,7 @@ local function stripParentLocalCaptureTags(body)
 	return (body:gsub("%s*%[parent%-local capture%]", ""))
 end
 
-local function applyUpvalueRenameHints(body, hints)
+PASSES.applyUpvalueRenameHints = function(body, hints)
 	if type(body) ~= "string" or type(hints) ~= "table" then
 		return body
 	end
@@ -12104,6 +12135,9 @@ local function applyUpvalueRenameHints(body, hints)
 		lines[#lines+1] = line
 	end
 	return table.concat(lines, "\n")
+end
+local function applyUpvalueRenameHints(body, hints)
+	return PASSES.applyUpvalueRenameHints(body, hints)
 end
 
 PASSES.predeclareHoistedUpvalues = function(lines)
