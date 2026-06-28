@@ -5907,6 +5907,63 @@ local xP7ck=ws7lX6m_:JSONEncode(f)return xP7ck end
 local sdfJ=_serializeParts(J8)local uwuecWs local l,xhVT42E=ypcall(function() uwuecWs=ws7lX6m_:PostAsync('http://www.f3xteam.com/bt/export',sdfJ)end)local qX local A=ypcall(function()qX=ws7lX6m_:JSONDecode(uwuecWs)end)return l,xhVT42E,A,qX end IE={["export"]=function()if#Selection.Items==0 then return end local MOd9uwnL=DFb100j.BTExportDialog:Clone()MOd9uwnL.Loading.Size=UDim2.new(1,0,0,0) MOd9uwnL.Parent=UI MOd9uwnL.Loading:TweenSize(UDim2.new(1,0,0,80),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.25) MOd9uwnL.Loading.CloseButton.MouseButton1Up:connect(function() MOd9uwnL:Destroy()end) local JZDx8,_XR0EY1,z3J,ufXNV=ExportInterface.Export(Selection.Items) if not JZDx8 and (_XR0EY1 =='Http requests are not enabled'or _XR0EY1 == 'Http requests can only be executed by game server')then MOd9uwnL.Loading.TextLabel.Text='上传失败，请查看提示信息'MOd9uwnL.Loading.CloseButton.Text='确定！'XL_=false ShowStartupNotifications()elseif not JZDx8 then MOd9uwnL.Loading.TextLabel.Text='上传失败（未知请求错误）'MOd9uwnL.Loading.CloseButton.Text='确定 :(' XL_=false
 ShowStartupNotifications()elseif JZDx8 and (not z3J or not ufXNV.success)then MOd9uwnL.Loading.TextLabel.Text='上传失败（未知处理错误）'MOd9uwnL.Loading.CloseButton.Text='确定 :(' XL_=false
 ShowStartupNotifications()elseif JZDx8 and z3J then print("[Building Tools by F3X] Uploaded Export: ".. ufXNV.id)MOd9uwnL.Loading.Visible=false MOd9uwnL.Info.Size=UDim2.new(1,0,0,0)MOd9uwnL.Info.CreationID.Text=ufXNV.id MOd9uwnL.Info.Visible=true MOd9uwnL.Info:TweenSize(UDim2.new(1,0,0,75),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.25)MOd9uwnL.Tip.Size=UDim2.new(1,0,0,0) MOd9uwnL.Tip.Visible=true MOd9uwnL.Tip:TweenSize(UDim2.new(1,0,0,30),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.25)MOd9uwnL.Close.Size=UDim2.new(1,0,0,0) MOd9uwnL.Close.Visible=true MOd9uwnL.Close:TweenSize(UDim2.new(1,0,0,20),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.25) MOd9uwnL.Close.Button.MouseButton1Up:connect(function() MOd9uwnL:Destroy()end) local Vum8=RbxUtility.Create"Sound"{Name="BTActionCompletionSound",Pitch=1.5,SoundId=Assets.ActionCompletionSound,Volume=1,Parent=Player or SoundService}Vum8:Play()Vum8:Destroy()end end}Tooltips={}Dock=DFb100j.BTDockGUI:Clone() Dock.Parent=UI
+do
+	local function WaveGetViewport()
+		local cam=Workspace.CurrentCamera
+		if cam and cam.ViewportSize then return cam.ViewportSize end
+		return Vector2.new(800,600)
+	end
+	local function WaveClamp(v,a,b)
+		return math.max(a,math.min(b,v))
+	end
+	local function WaveIsSmallTouch()
+		local view=WaveGetViewport()
+		return (UserInputService and UserInputService.TouchEnabled) or view.Y<500
+	end
+	local function WaveScale(gui,scale)
+		local s=gui:FindFirstChild("WaveMobileScale")
+		if not s then
+			s=Instance.new("UIScale")
+			s.Name="WaveMobileScale"
+			s.Parent=gui
+		end
+		s.Scale=scale
+	end
+	local function WaveFixPanel(gui)
+		if not WaveIsSmallTouch() or not gui or not gui:IsA("GuiObject") then return end
+		local view=WaveGetViewport()
+		local n=gui.Name
+		if n=="BTDockGUI" then
+			local scale=WaveClamp((view.Y-24)/380,0.68,1)
+			WaveScale(gui,scale)
+			gui.Position=UDim2.new(1,-(math.floor(70*scale)+12),0,8)
+		elseif n:find("ToolGUI") then
+			local scale=WaveClamp((view.Y-40)/220,0.82,1)
+			WaveScale(gui,scale)
+			gui.Position=UDim2.new(0,8,0,42)
+		elseif n=="BTHSVColorPicker" or n=="BTGroupsGUI" or n=="BTExportDialog" then
+			local scale=WaveClamp((view.Y-30)/380,0.75,1)
+			WaveScale(gui,scale)
+			gui.Position=UDim2.new(0,8,0,22)
+		end
+	end
+	local function WaveApplyMobileUI()
+		if not WaveIsSmallTouch() then return end
+		pcall(function() UI.IgnoreGuiInset=true end)
+		WaveFixPanel(Dock)
+		for _,child in pairs(UI:GetChildren())do
+			WaveFixPanel(child)
+		end
+	end
+	WaveApplyMobileUI()
+	UI.ChildAdded:connect(function(child)
+		wait()
+		WaveFixPanel(child)
+	end)
+	pcall(function()
+		Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):connect(WaveApplyMobileUI)
+	end)
+end
 Dock.Visible=false function RegisterToolButton(NQSh) local Y1rSR=NQSh.Name:match("(.+)Button") if Y1rSR then NQSh.MouseButton1Up:connect(function()local aqQh=Tools[Y1rSR] if aqQh then equipTool(aqQh)end end) NQSh.MouseEnter:connect(function()local H_=Tooltips[Y1rSR] if H_ then H_:focus('button')end end) NQSh.MouseLeave:connect(function()local EQaFI0gZ=Tooltips[Y1rSR]if EQaFI0gZ then EQaFI0gZ:unfocus('button')end end)end end
 for kKiLOav,XW8 in pairs(Dock.ToolButtons:GetChildren())do RegisterToolButton(XW8)end function RegisterTooltip(_8Ls) local t_t7=_8Ls.Name:match("(.+)Info") Tooltips[t_t7]={GUI=_8Ls,button_focus=false,tooltip_focus=false,focus=function(o,ogi5Usg)if Dock.HelpInfo.Visible then return end if ogi5Usg=='button'then o.button_focus=true elseif ogi5Usg=='tooltip'then o.tooltip_focus=true end for pA,_8Ls in pairs(Dock.Tooltips:GetChildren())do _8Ls.Visible=false end
 o.GUI.Visible=true end,unfocus=function(DOIqPj09,RoKAkM)if RoKAkM=='button'then DOIqPj09.button_focus=false elseif RoKAkM=='tooltip'then DOIqPj09.tooltip_focus=false end
