@@ -1,4 +1,4 @@
---// 功能层：运行环境、状态与核心配置
+--// 功能
 
 local translateText=function(text) return text end
 
@@ -1168,10 +1168,10 @@ local currentValue2=math["max"](0, currentValue/speed2)
 local previousEta=progress2["smoothedETA"]or currentValue2
 local previousEta2=previousEta+((currentValue2-previousEta))*.2 progress2["smoothedETA"]=previousEta2 etaSeconds=previousEta2
 if etaSeconds<60 then
-etaText=string["format"]("%ds", math["ceil"](etaSeconds))
+etaText=string["format"]("%d秒", math["ceil"](etaSeconds))
 else
 local minutes=math["floor"](etaSeconds/60)
-local seconds=math["ceil"](etaSeconds%60)etaText=string["format"]("%dm %02ds", minutes, seconds)
+local seconds=math["ceil"](etaSeconds%60)etaText=string["format"]("%d分 %02d秒", minutes, seconds)
 end
 else
 progress2["smoothedETA"]=nil
@@ -1185,7 +1185,7 @@ if generatoresp then
 if progress>=generatoresp2 then
 if not progress2["alertTriggered"]then
 progress2["alertTriggered"]=true
-local conditionMet=((progress2["etaFormatted"]and progress2["etaFormatted"]~=""))and("ETA: "..progress2["etaFormatted"])or"Nearly Complete!"showNotification("⚡ Generator Alert", string["format"]("Generator reached %d%% progress! (%s)", math["floor"](progress), conditionMet), "warning")
+local conditionMet=((progress2["etaFormatted"]and progress2["etaFormatted"]~=""))and("预计剩余："..progress2["etaFormatted"])or"即将完成！"showNotification("⚡ 发电机警报", string["format"]("发电机进度已达到 %d%%！（%s）", math["floor"](progress), conditionMet), "warning")
 end
 else
 if progress<(generatoresp2-5)then
@@ -1223,7 +1223,7 @@ end
 end
 local sound=nil function playSoundPreview(value)
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if sound then
@@ -1249,7 +1249,7 @@ end
 return normalizedText
 end
 local sound2=conditionMet(value)
-local customgensound=(settings["CustomGenSound"]and settings["CustomGenSound"]["Volume"])or 1 sound=Instance["new"]("Sound")sound["SoundId"]=sound2 sound["Volume"]=customgensound sound["Parent"]=workspace:FindFirstChild("CurrentCamera")or workspace sound:Play()showNotification("🔊 Sound Preview", "Playing sound: "..sound2, "info")task["delay"](4, function()
+local customgensound=(settings["CustomGenSound"]and settings["CustomGenSound"]["Volume"])or 1 sound=Instance["new"]("Sound")sound["SoundId"]=sound2 sound["Volume"]=customgensound sound["Parent"]=workspace:FindFirstChild("CurrentCamera")or workspace sound:Play()showNotification("🔊 音效预览", "正在播放音效："..sound2, "info")task["delay"](4, function()
 if sound then
 pcall(function()sound:Stop()sound:Destroy()
 end
@@ -1467,7 +1467,7 @@ settings["SpeedBoostEnabled"]=false pcall(saveSettings)
 if speedBoostConnection then
 pcall(speedBoostConnection)
 end
-showNotification("Speed Boost", "Disabled: Speed Boost team filter active!", "warning")
+showNotification("速度增强", "已关闭：速度增强队伍筛选已启用！", "warning")
 end
 local name2=localPlayer["Name"]
 if not name2 then
@@ -1998,23 +1998,95 @@ item2["LastESPStyle"]=nil
 end
 end
 end
+--// 玩家 ESP：极简信息卡
 function createPlayerESP(player)
 if ActiveESP["Players"][player]then
 return
 end
-local highlight=Instance["new"]("Highlight")highlight["FillTransparency"]=.6 highlight["OutlineTransparency"]=.1 highlight["Enabled"]=false highlight["Parent"]=highlightParent
-local billboard=Instance["new"]("BillboardGui")billboard["AlwaysOnTop"]=true billboard["StudsOffset"]=Vector3["new"](0, 3.5, 0)billboard["Enabled"]=false billboard["Parent"]=billboardParent
-local frame=Instance["new"]("Frame")frame["Name"]="Container"frame["BackgroundTransparency"]=1 frame["BorderSizePixel"]=0 frame["Parent"]=billboard
-local corner=Instance["new"]("UICorner")corner["CornerRadius"]=UDim["new"](0, 6)corner["Parent"]=frame
-local stroke=Instance["new"]("UIStroke")stroke["Thickness"]=1 stroke["Transparency"]=1 stroke["Parent"]=frame
-local label=Instance["new"]("TextLabel")label["BackgroundTransparency"]=1 label["TextColor3"]=Color3["fromRGB"](255, 255, 255)label["Font"]=Enum["Font"]["GothamBold"]label["TextStrokeTransparency"]=.4 label["Parent"]=frame
-local label2=Instance["new"]("TextLabel")label2["BackgroundTransparency"]=1 label2["TextColor3"]=Color3["fromRGB"](220, 220, 220)label2["Font"]=Enum["Font"]["Gotham"]label2["TextStrokeTransparency"]=.78 label2["Parent"]=frame ActiveESP["Players"][player]={["Highlight"]=highlight, ["Billboard"]=billboard, ["Container"]=frame, ["ContainerStroke"]=stroke, ["NameLabel"]=label, ["InfoLabel"]=label2;
-["Tracer"]=nil;
-["CurrentCharacter"]=nil;
-["LastAuraEnabled"]=nil, ["LastHighlightColor"]=nil;
-["LastBillboardEnabled"]=nil, ["LastNameText"]=nil, ["LastNameColor"]=nil;
-["LastInfoText"]=nil, ["LastHookedProgressVal"]=nil, ["LastHookedChangeTime"]=0, ["LastESPStyle"]=nil;
-["LastIsMobile"]=nil}
+local highlight=Instance["new"]("Highlight")
+highlight["FillTransparency"]=.9
+highlight["OutlineTransparency"]=.22
+highlight["Enabled"]=false
+highlight["Parent"]=highlightParent
+
+local billboard=Instance["new"]("BillboardGui")
+billboard["AlwaysOnTop"]=true
+billboard["StudsOffset"]=Vector3["new"](0, 3.5, 0)
+billboard["Enabled"]=false
+billboard["Parent"]=billboardParent
+
+local frame=Instance["new"]("Frame")
+frame["Name"]="Container"
+frame["BackgroundTransparency"]=1
+frame["BorderSizePixel"]=0
+frame["Parent"]=billboard
+
+local corner=Instance["new"]("UICorner")
+corner["CornerRadius"]=UDim["new"](0, 5)
+corner["Parent"]=frame
+
+local stroke=Instance["new"]("UIStroke")
+stroke["Color"]=Color3["fromRGB"](48, 55, 51)
+stroke["Thickness"]=1
+stroke["Transparency"]=1
+stroke["Parent"]=frame
+
+local accentBar=Instance["new"]("Frame")
+accentBar["Name"]="AccentBar"
+accentBar["BorderSizePixel"]=0
+accentBar["BackgroundColor3"]=Color3["fromRGB"](76, 220, 118)
+accentBar["Parent"]=frame
+local accentCorner=Instance["new"]("UICorner")
+accentCorner["CornerRadius"]=UDim["new"](1, 0)
+accentCorner["Parent"]=accentBar
+
+local statusDot=Instance["new"]("Frame")
+statusDot["Name"]="StatusDot"
+statusDot["BorderSizePixel"]=0
+statusDot["BackgroundColor3"]=Color3["fromRGB"](76, 220, 118)
+statusDot["Parent"]=frame
+local statusCorner=Instance["new"]("UICorner")
+statusCorner["CornerRadius"]=UDim["new"](1, 0)
+statusCorner["Parent"]=statusDot
+
+local label=Instance["new"]("TextLabel")
+label["BackgroundTransparency"]=1
+label["TextColor3"]=Color3["fromRGB"](236, 240, 237)
+label["Font"]=Enum["Font"]["GothamBold"]
+label["TextStrokeTransparency"]=.82
+label["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+label["Parent"]=frame
+
+local label2=Instance["new"]("TextLabel")
+label2["BackgroundTransparency"]=1
+label2["TextColor3"]=Color3["fromRGB"](157, 170, 162)
+label2["Font"]=Enum["Font"]["Gotham"]
+label2["TextStrokeTransparency"]=1
+label2["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+label2["Parent"]=frame
+
+ActiveESP["Players"][player]={
+["Highlight"]=highlight,
+["Billboard"]=billboard,
+["Container"]=frame,
+["ContainerStroke"]=stroke,
+["AccentBar"]=accentBar,
+["StatusDot"]=statusDot,
+["NameLabel"]=label,
+["InfoLabel"]=label2,
+["Tracer"]=nil,
+["CurrentCharacter"]=nil,
+["LastAuraEnabled"]=nil,
+["LastHighlightColor"]=nil,
+["LastBillboardEnabled"]=nil,
+["LastNameText"]=nil,
+["LastNameColor"]=nil,
+["LastInfoText"]=nil,
+["LastHookedProgressVal"]=nil,
+["LastHookedChangeTime"]=0,
+["LastESPStyle"]=nil,
+["LastIsMobile"]=nil
+}
 end
 local function cleanupResources(value, contextValue)
 local currentValue=value["Tracer"]
@@ -2245,10 +2317,14 @@ local espfademax=settings["ESPFadeMax"]-settings["ESPFadeStart"]
 local espfadestart=distance-settings["ESPFadeStart"]transparency=1-(espfadestart/espfademax)
 end
 end
-local highlight=.6
-local highlight2=.1
-if espstyle~="Old"and((isMobileDevice or espstyle=="Compact"or espstyle=="Minimal"))then
-highlight=.8 highlight2=.4
+local highlight=.9
+local highlight2=.22
+if espstyle=="Old"then
+highlight=.72
+highlight2=.12
+elseif isMobileDevice or espstyle=="Compact"or espstyle=="Minimal"then
+highlight=.94
+highlight2=.3
 end
 local highlight3=killeresp
 if espdistancefade then
@@ -2260,8 +2336,11 @@ end
 if progress["LastHighlightColor"]~=teamName2 then
 progress["Highlight"]["FillColor"]=teamName2 progress["Highlight"]["OutlineColor"]=teamName2 progress["LastHighlightColor"]=teamName2
 end
-if progress["ContainerStroke"]and progress["ContainerStroke"]["Color"]~=teamName2 then
-progress["ContainerStroke"]["Color"]=teamName2
+if progress["AccentBar"]and progress["AccentBar"]["BackgroundColor3"]~=teamName2 then
+progress["AccentBar"]["BackgroundColor3"]=teamName2
+end
+if progress["StatusDot"]and progress["StatusDot"]["BackgroundColor3"]~=teamName2 then
+progress["StatusDot"]["BackgroundColor3"]=teamName2
 end
 if progress["Highlight"]["FillTransparency"]~=highlight then
 progress["Highlight"]["FillTransparency"]=highlight
@@ -2271,14 +2350,14 @@ progress["Highlight"]["OutlineTransparency"]=highlight2
 end
 local name2=1-transparency
 if progress["NameLabel"]["TextTransparency"]~=name2 then
-progress["NameLabel"]["TextTransparency"]=name2 progress["NameLabel"]["TextStrokeTransparency"]=1-(.6*transparency)
+progress["NameLabel"]["TextTransparency"]=name2 progress["NameLabel"]["TextStrokeTransparency"]=1-(.18*transparency)
 end
 if progress["InfoLabel"]["TextTransparency"]~=name2 then
-progress["InfoLabel"]["TextTransparency"]=name2 progress["InfoLabel"]["TextStrokeTransparency"]=1-(.5*transparency)
+progress["InfoLabel"]["TextTransparency"]=name2 progress["InfoLabel"]["TextStrokeTransparency"]=1
 end
 if settings["ESPBackground"]then
-local espbackground=settings["ESPBackground"]and.62 or 1
-local espbackground2=settings["ESPBackground"]and.24 or 1
+local espbackground=settings["ESPBackground"]and.42 or 1
+local espbackground2=settings["ESPBackground"]and.62 or 1
 if espdistancefade then
 espbackground=1-(((1-espbackground))*transparency)espbackground2=1-(((1-espbackground2))*transparency)
 end
@@ -2292,13 +2371,85 @@ end
 if progress["LastESPStyle"]~=espstyle or progress["LastIsMobile"]~=isMobileDevice or progress["LastESPBackground"]~=settings["ESPBackground"]then
 progress["LastESPStyle"]=espstyle progress["LastIsMobile"]=isMobileDevice progress["LastESPBackground"]=settings["ESPBackground"]
 if espstyle=="Old"then
-progress["Billboard"]["Size"]=UDim2["new"](0, 200, 0, 70)progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["Container"]["BackgroundTransparency"]=1 progress["ContainerStroke"]["Transparency"]=1 progress["NameLabel"]["Size"]=UDim2["new"](1, 0, .4, 0)progress["NameLabel"]["Position"]=UDim2["new"](0, 0, 0, 0)progress["NameLabel"]["TextSize"]=15 progress["NameLabel"]["Visible"]=true progress["InfoLabel"]["Size"]=UDim2["new"](1, 0, .6, 0)progress["InfoLabel"]["Position"]=UDim2["new"](0, 0, .4, 0)progress["InfoLabel"]["TextSize"]=13 progress["InfoLabel"]["Visible"]=true
+progress["Billboard"]["Size"]=UDim2["new"](0, 200, 0, 70)
+progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)
+progress["Container"]["BackgroundTransparency"]=1
+progress["ContainerStroke"]["Transparency"]=1
+progress["AccentBar"]["Visible"]=false
+progress["StatusDot"]["Visible"]=false
+progress["NameLabel"]["Size"]=UDim2["new"](1, 0, .4, 0)
+progress["NameLabel"]["Position"]=UDim2["new"](0, 0, 0, 0)
+progress["NameLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Center"]
+progress["NameLabel"]["TextSize"]=15
+progress["NameLabel"]["Visible"]=true
+progress["InfoLabel"]["Size"]=UDim2["new"](1, 0, .6, 0)
+progress["InfoLabel"]["Position"]=UDim2["new"](0, 0, .4, 0)
+progress["InfoLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Center"]
+progress["InfoLabel"]["TextSize"]=13
+progress["InfoLabel"]["Visible"]=true
 elseif espstyle=="Standard"then
-progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 130, 0, 42)or UDim2["new"](0, 180, 0, 50)progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.62 or 1 progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 64, 53)progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.24 or 1 progress["NameLabel"]["Size"]=UDim2["new"](1, 0, .45, 0)progress["NameLabel"]["Position"]=UDim2["new"](0, 0, .05, 0)progress["NameLabel"]["TextSize"]=isMobileDevice and 11 or 13 progress["NameLabel"]["Visible"]=true progress["InfoLabel"]["Size"]=UDim2["new"](1, 0, .45, 0)progress["InfoLabel"]["Position"]=UDim2["new"](0, 0, .5, 0)progress["InfoLabel"]["TextSize"]=isMobileDevice and 9 or 11 progress["InfoLabel"]["Visible"]=true
+progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 150, 0, 44)or UDim2["new"](0, 188, 0, 46)
+progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)
+progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)
+progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.42 or 1
+progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 55, 51)
+progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.62 or 1
+progress["AccentBar"]["Visible"]=true
+progress["AccentBar"]["Size"]=UDim2["new"](0, 2, 1, -14)
+progress["AccentBar"]["Position"]=UDim2["new"](0, 5, 0, 7)
+progress["StatusDot"]["Visible"]=true
+progress["StatusDot"]["Size"]=UDim2["new"](0, 5, 0, 5)
+progress["StatusDot"]["Position"]=UDim2["new"](0, 12, 0, 10)
+progress["NameLabel"]["Size"]=UDim2["new"](1, -27, 0, 19)
+progress["NameLabel"]["Position"]=UDim2["new"](0, 22, 0, 3)
+progress["NameLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+progress["NameLabel"]["TextSize"]=isMobileDevice and 10 or 12
+progress["NameLabel"]["TextTruncate"]=Enum["TextTruncate"]["AtEnd"]
+progress["NameLabel"]["Visible"]=true
+progress["InfoLabel"]["Size"]=UDim2["new"](1, -20, 0, 18)
+progress["InfoLabel"]["Position"]=UDim2["new"](0, 12, 0, 23)
+progress["InfoLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+progress["InfoLabel"]["TextSize"]=isMobileDevice and 8 or 10
+progress["InfoLabel"]["TextTruncate"]=Enum["TextTruncate"]["AtEnd"]
+progress["InfoLabel"]["Visible"]=true
 elseif espstyle=="Compact"then
-progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 110, 0, 18)or UDim2["new"](0, 145, 0, 22)progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.62 or 1 progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 64, 53)progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.24 or 1 progress["NameLabel"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["NameLabel"]["Position"]=UDim2["new"](0, 0, 0, 0)progress["NameLabel"]["TextSize"]=isMobileDevice and 9 or 11 progress["NameLabel"]["Visible"]=true progress["InfoLabel"]["Visible"]=false
+progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 120, 0, 20)or UDim2["new"](0, 154, 0, 22)
+progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)
+progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)
+progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.46 or 1
+progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 55, 51)
+progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.68 or 1
+progress["AccentBar"]["Visible"]=true
+progress["AccentBar"]["Size"]=UDim2["new"](0, 2, 1, -8)
+progress["AccentBar"]["Position"]=UDim2["new"](0, 4, 0, 4)
+progress["StatusDot"]["Visible"]=true
+progress["StatusDot"]["Size"]=UDim2["new"](0, 5, 0, 5)
+progress["StatusDot"]["Position"]=UDim2["new"](0, 10, .5, -2)
+progress["NameLabel"]["Size"]=UDim2["new"](1, -23, 1, 0)
+progress["NameLabel"]["Position"]=UDim2["new"](0, 20, 0, 0)
+progress["NameLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+progress["NameLabel"]["TextSize"]=isMobileDevice and 9 or 10
+progress["NameLabel"]["TextTruncate"]=Enum["TextTruncate"]["AtEnd"]
+progress["NameLabel"]["Visible"]=true
+progress["InfoLabel"]["Visible"]=false
 elseif espstyle=="Minimal"then
-progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 42, 0, 16)or UDim2["new"](0, 52, 0, 20)progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.62 or 1 progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 64, 53)progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.24 or 1 progress["NameLabel"]["Size"]=UDim2["new"](1, 0, 1, 0)progress["NameLabel"]["Position"]=UDim2["new"](0, 0, 0, 0)progress["NameLabel"]["TextSize"]=isMobileDevice and 9 or 11 progress["NameLabel"]["Visible"]=true progress["InfoLabel"]["Visible"]=false
+progress["Billboard"]["Size"]=isMobileDevice and UDim2["new"](0, 58, 0, 18)or UDim2["new"](0, 68, 0, 20)
+progress["Container"]["Size"]=UDim2["new"](1, 0, 1, 0)
+progress["Container"]["BackgroundColor3"]=Color3["fromRGB"](8, 10, 9)
+progress["Container"]["BackgroundTransparency"]=settings["ESPBackground"]and.56 or 1
+progress["ContainerStroke"]["Color"]=Color3["fromRGB"](48, 55, 51)
+progress["ContainerStroke"]["Transparency"]=settings["ESPBackground"]and.76 or 1
+progress["AccentBar"]["Visible"]=false
+progress["StatusDot"]["Visible"]=true
+progress["StatusDot"]["Size"]=UDim2["new"](0, 4, 0, 4)
+progress["StatusDot"]["Position"]=UDim2["new"](0, 7, .5, -2)
+progress["NameLabel"]["Size"]=UDim2["new"](1, -18, 1, 0)
+progress["NameLabel"]["Position"]=UDim2["new"](0, 15, 0, 0)
+progress["NameLabel"]["TextXAlignment"]=Enum["TextXAlignment"]["Left"]
+progress["NameLabel"]["TextSize"]=isMobileDevice and 9 or 10
+progress["NameLabel"]["TextTruncate"]=Enum["TextTruncate"]["AtEnd"]
+progress["NameLabel"]["Visible"]=true
+progress["InfoLabel"]["Visible"]=false
 end
 end
 if espstyle=="Aura Only"then
@@ -2448,8 +2599,10 @@ end
 if progress["LastNameText"]~=espStyle then
 progress["NameLabel"]["Text"]=espStyle progress["LastNameText"]=espStyle
 end
-if progress["LastNameColor"]~=teamName2 then
-progress["NameLabel"]["TextColor3"]=teamName2 progress["LastNameColor"]=teamName2
+local nameTextColor=Color3["fromRGB"](236, 240, 237)
+if progress["LastNameColor"]~=nameTextColor then
+progress["NameLabel"]["TextColor3"]=nameTextColor
+progress["LastNameColor"]=nameTextColor
 end
 if espstyle=="Standard"or espstyle=="Old"then
 if progress["LastInfoText"]~=displayText then
@@ -3764,6 +3917,23 @@ translateText=function(text)
 if type(text)~="string" then return text end
 return UI_TEXT[text] or text
 end
+local NOTIFICATION_TEXT={
+["Generator"]="发电机",["Hook"]="钩子",["Pallet"]="木板",["Vault"]="翻越点",["Gate"]="大门",["Survivor"]="幸存者",["Killer"]="杀手",
+["Rilevata Hitbox di Attacco"]="检测到攻击判定箱",["Attivazione Trail Arma"]="检测到武器轨迹",["Contatto Fisico Arma"]="检测到武器接触",["Rincorsa Veloce Killer"]="检测到杀手快速追击"
+}
+local function translateNotificationText(text)
+if type(text)~="string" then return text end
+local exact=UI_TEXT[text] or NOTIFICATION_TEXT[text]
+if exact then return exact end
+text=text:gsub("Rilevata Hitbox di Attacco", "检测到攻击判定箱")
+text=text:gsub("Attivazione Trail Arma", "检测到武器轨迹")
+text=text:gsub("Contatto Fisico Arma", "检测到武器接触")
+text=text:gsub("Rincorsa Veloce Killer", "检测到杀手快速追击")
+text=text:gsub("Distanza", "距离")
+text=text:gsub("ENABLED", "已开启")
+text=text:gsub("DISABLED", "已关闭")
+return text
+end
 function applyTheme(themeName)currentThemeName=themeName or"Default"
 local name2=themes[currentThemeName]or themes["Default"]
 local bgColor=UI["Bg"]
@@ -4179,7 +4349,7 @@ processValue3()currentValue2()
 end
 )
 end
-function showNotification(title, message, notificationType)title=translateText(title)message=translateText(message)table["insert"](items9, {["title"]=title;
+function showNotification(title, message, notificationType)title=translateNotificationText(title)message=translateNotificationText(message)table["insert"](items9, {["title"]=title;
 ["message"]=message;
 ["notifType"]=notificationType or"info"})
 while#items10<numericValue and#items9>0 do
@@ -4193,12 +4363,83 @@ end
 if not screenGui["Parent"]then
 screenGui["Parent"]=billboardParent
 end
-minimapConnection=Instance["new"]("Frame")minimapConnection["Name"]="VD_TracerContainer"minimapConnection["Size"]=UDim2["new"](1, 0, 1, 0)minimapConnection["BackgroundTransparency"]=1 minimapConnection["BorderSizePixel"]=0 minimapConnection["ZIndex"]=1 minimapConnection["Parent"]=screenGui minimapFrame=Instance["new"]("CanvasGroup")minimapFrame["Name"]="VD_MinimapCard"minimapFrame["Size"]=UDim2["new"](0, 130, 0, 130)minimapFrame["Position"]=isMobileDevice and UDim2["new"](1, -140, 0, 10)or UDim2["new"](1, -150, 0, 10)minimapFrame["BackgroundColor3"]=UI["Bg"]minimapFrame["BackgroundTransparency"]=.2 minimapFrame["BorderSizePixel"]=0 minimapFrame["ZIndex"]=5 minimapFrame["Visible"]=false minimapFrame["Parent"]=screenGui;
-(Instance["new"]("UICorner", minimapFrame))["CornerRadius"]=UDim["new"](.5, 0)
-local stroke=Instance["new"]("UIStroke", minimapFrame)stroke["Color"]=UI["Stroke"]stroke["Thickness"]=1.2 stroke["Transparency"]=.3
-local frame=Instance["new"]("Frame")frame["Name"]="CenterPlayer"frame["Size"]=UDim2["new"](0, 7, 0, 7)frame["Position"]=UDim2["new"](.5, 0, .5, 0)frame["AnchorPoint"]=Vector2["new"](.5, .5)frame["BackgroundColor3"]=UI["AccentCyan"]frame["BorderSizePixel"]=0 frame["ZIndex"]=10 frame["Parent"]=minimapFrame;
-(Instance["new"]("UICorner", frame))["CornerRadius"]=UDim["new"](1, 0)
-local label=Instance["new"]("TextLabel")label["Name"]="RadarLabel"label["Size"]=UDim2["new"](1, 0, 0, 14)label["Position"]=UDim2["new"](0, 0, 1, -16)label["BackgroundTransparency"]=1 label["Text"]="雷达"label["TextColor3"]=UI["Accent"]label["Font"]=Enum["Font"]["GothamBold"]label["TextSize"]=8 label["TextStrokeTransparency"]=.6 label["ZIndex"]=11 label["Parent"]=minimapFrame
+--// 雷达：极简 HUD 与距离环
+minimapConnection=Instance["new"]("Frame")
+minimapConnection["Name"]="VD_TracerContainer"
+minimapConnection["Size"]=UDim2["new"](1, 0, 1, 0)
+minimapConnection["BackgroundTransparency"]=1
+minimapConnection["BorderSizePixel"]=0
+minimapConnection["ZIndex"]=1
+minimapConnection["Parent"]=screenGui
+
+minimapFrame=Instance["new"]("CanvasGroup")
+minimapFrame["Name"]="VD_MinimapCard"
+minimapFrame["Size"]=UDim2["new"](0, 148, 0, 148)
+minimapFrame["Position"]=isMobileDevice and UDim2["new"](1, -158, 0, 10)or UDim2["new"](1, -168, 0, 10)
+minimapFrame["BackgroundColor3"]=Color3["fromRGB"](7, 9, 8)
+minimapFrame["BackgroundTransparency"]=.22
+minimapFrame["BorderSizePixel"]=0
+minimapFrame["ZIndex"]=5
+minimapFrame["Visible"]=false
+minimapFrame["Parent"]=screenGui
+
+do
+local radarCorner=Instance["new"]("UICorner", minimapFrame)
+radarCorner["CornerRadius"]=UDim["new"](.5, 0)
+local radarStroke=Instance["new"]("UIStroke", minimapFrame)
+radarStroke["Color"]=Color3["fromRGB"](48, 58, 52)
+radarStroke["Thickness"]=1
+radarStroke["Transparency"]=.28
+
+local function createRadarRing(size, transparency)
+local ring=Instance["new"]("Frame")
+ring["Name"]="RadarRing"
+ring["Size"]=UDim2["new"](0, size, 0, size)
+ring["Position"]=UDim2["new"](.5, 0, .5, 0)
+ring["AnchorPoint"]=Vector2["new"](.5, .5)
+ring["BackgroundTransparency"]=1
+ring["BorderSizePixel"]=0
+ring["ZIndex"]=6
+ring["Parent"]=minimapFrame
+local ringCorner=Instance["new"]("UICorner", ring)
+ringCorner["CornerRadius"]=UDim["new"](.5, 0)
+local ringStroke=Instance["new"]("UIStroke", ring)
+ringStroke["Color"]=Color3["fromRGB"](86, 105, 94)
+ringStroke["Thickness"]=1
+ringStroke["Transparency"]=transparency
+return ring
+end
+
+createRadarRing(52, .78)
+createRadarRing(100, .84)
+
+local centerPlayer=Instance["new"]("TextLabel")
+centerPlayer["Name"]="CenterPlayer"
+centerPlayer["Size"]=UDim2["new"](0, 14, 0, 14)
+centerPlayer["Position"]=UDim2["new"](.5, 0, .5, 0)
+centerPlayer["AnchorPoint"]=Vector2["new"](.5, .5)
+centerPlayer["BackgroundTransparency"]=1
+centerPlayer["Text"]="▲"
+centerPlayer["TextColor3"]=UI["Accent"]
+centerPlayer["Font"]=Enum["Font"]["GothamBold"]
+centerPlayer["TextSize"]=12
+centerPlayer["TextStrokeTransparency"]=.7
+centerPlayer["ZIndex"]=10
+centerPlayer["Parent"]=minimapFrame
+
+local radarLabel=Instance["new"]("TextLabel")
+radarLabel["Name"]="RadarLabel"
+radarLabel["Size"]=UDim2["new"](1, 0, 0, 14)
+radarLabel["Position"]=UDim2["new"](0, 0, 1, -17)
+radarLabel["BackgroundTransparency"]=1
+radarLabel["Text"]="雷达"
+radarLabel["TextColor3"]=Color3["fromRGB"](145, 166, 153)
+radarLabel["Font"]=Enum["Font"]["GothamMedium"]
+radarLabel["TextSize"]=8
+radarLabel["TextStrokeTransparency"]=1
+radarLabel["ZIndex"]=11
+radarLabel["Parent"]=minimapFrame
+end
 local conditionMet4=false
 local startPosition=nil
 local startPosition2=nil
@@ -4589,7 +4830,7 @@ settings["SpeedBoostEnabled"]=false pcall(saveSettings)
 if speedBoostConnection then
 pcall(speedBoostConnection)
 end
-showNotification("Speed Boost", "Speed Boost can only be used as Survivor or Killer!", "warning")
+showNotification("速度增强", "速度增强仅能在幸存者或杀手身份下使用！", "warning")
 return
 end
 settings["SpeedBoostEnabled"]=not settings["SpeedBoostEnabled"]pcall(applyLocalPlayerModifiers)pcall(saveSettings)
@@ -4597,7 +4838,7 @@ if speedBoostConnection then
 pcall(speedBoostConnection)
 end
 if settings["ShowToggleNotifications"]then
-showNotification("Speed Boost", settings["SpeedBoostEnabled"]and"Enabled"or"Disabled", "info")
+showNotification("速度增强", settings["SpeedBoostEnabled"]and"已开启"or"已关闭", "info")
 end
 end
 actionHandlers["AutoMoonwalk"]=function()settings["AutoMoonwalk"]=not settings["AutoMoonwalk"]
@@ -4616,12 +4857,12 @@ if speedBoostConnection then
 pcall(speedBoostConnection)
 end
 if settings["ShowToggleNotifications"]then
-showNotification("Auto Moonwalk", settings["AutoMoonwalk"]and"Enabled"or"Disabled", "info")
+showNotification("自动月步", settings["AutoMoonwalk"]and"已开启"or"已关闭", "info")
 end
 end
 actionHandlers["CancelGen"]=function()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["CancelGen"])))then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if doCancelGen then
@@ -4820,13 +5061,13 @@ pcall(function()mobileFloatingButtons[actionName]:Destroy()
 end
 )mobileFloatingButtons[actionName]=nil
 end
-showNotification("Button Removed", "Floating button removed.", "info")
+showNotification("按钮已移除", "悬浮按钮已移除。", "info")
 else
 local button3=value:sub(1, 6)
 if settings["MobileButtons"]then
 settings["MobileButtons"][actionName]=button3
 end
-createOrUpdateMobileFloatingButton(actionName, button3)showNotification("Button Setup", "Floating button '"..(button3.."' setup!"), "success")
+createOrUpdateMobileFloatingButton(actionName, button3)showNotification("按钮设置", "悬浮按钮「"..(button3.."」设置完成！"), "success")
 end
 pcall(saveSettings)bindControlKey()
 end
@@ -4882,7 +5123,7 @@ end
 if keybindButtons[conflictingBinding]then
 keybindButtons[conflictingBinding]()
 end
-showNotification("Keybind Conflict", "Replaced other keybind successfully.", "success")
+showNotification("按键冲突", "已成功替换其他按键绑定。", "success")
 else
 if settings["Keybinds"]then
 settings["Keybinds"][actionName]="None"
@@ -4936,7 +5177,7 @@ end
 if settings["Keybinds"]then
 settings["Keybinds"][actionName]="None"
 end
-bindControlKey()pcall(saveSettings)showNotification("Keybind Reset", "Keybind reset successfully.", "info")
+bindControlKey()pcall(saveSettings)showNotification("按键重置", "按键绑定已成功重置。", "info")
 end
 )
 local items9={["InstantEscape"]="Instant Escape", ["CancelGen"]="Generator Buff", ["NoclipVaultsPallets"]="Noclip Vaults & Pallets", ["RevolverAutofarm"]="Enable Revolver Autofarm [BETA]", ["InstantHeal"]="Instant Heal", ["InstantBandage"]="Instant Bandage";
@@ -4956,7 +5197,7 @@ local items9={["InstantEscape"]="Instant Escape", ["CancelGen"]="Generator Buff"
 ["InfiniteLunge"]="Infinite Lunge"}
 local currentValue3=items9[actionName]actionHandlers[actionName]=function(...)
 if currentValue3 and not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 return callback(...)
@@ -5014,7 +5255,7 @@ end
 end
 local function getFeatureState3()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")updateVisualState(false)
+showNotification("功能", "功能不可用。", "warning")updateVisualState(false)
 return
 end
 local conditionMet6=not text3 updateVisualState(conditionMet6)
@@ -5022,8 +5263,8 @@ if callback then
 pcall(callback, conditionMet6)
 end
 if settings["ShowToggleNotifications"]then
-local toggleStateText=conditionMet6 and"ENABLED"or"DISABLED"
-local notificationType=conditionMet6 and"success"or"warning"showNotification(labelText, "Toggled: "..toggleStateText, notificationType)
+local toggleStateText=conditionMet6 and"已开启"or"已关闭"
+local notificationType=conditionMet6 and"success"or"warning"showNotification(labelText, "已切换："..toggleStateText, notificationType)
 end
 end
 if keybindId and keybindId~=""then
@@ -5091,7 +5332,7 @@ end
 )
 local connection=function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 pcall(callback)
@@ -5130,7 +5371,7 @@ local function tween2(value)tween=value;
 end
 button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")tween2(false)
+showNotification("功能", "功能不可用。", "warning")tween2(false)
 return
 end
 tween2(not tween)callback(tween)
@@ -5202,7 +5443,7 @@ local tween2=layoutPosition and listLayout2["AbsoluteContentSize"]["Y"]or 0;
 end
 button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 updateExpandState()
@@ -5275,7 +5516,7 @@ local tween2=conditionMet5 and listLayout2["AbsoluteContentSize"]["Y"]or 0;
 end
 button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 updateExpandState()
@@ -5329,7 +5570,7 @@ local function tween2(value2)tween=value2;
 end
 button4["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and currentValue4 then
-showNotification("Feature", "Feature unavailable.", "warning")tween2(false)
+showNotification("功能", "功能不可用。", "warning")tween2(false)
 return
 end
 tween2(not tween)callback2(tween)
@@ -5349,7 +5590,7 @@ end
 end
 button3["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")updateControlVisual(false)
+showNotification("功能", "功能不可用。", "warning")updateControlVisual(false)
 return
 end
 updateControlVisual(not currentValue4)callback(currentValue4)
@@ -5358,13 +5599,13 @@ end
 if hasParent then
 local button4=createKeybindButton(frame5, keybindId, function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 local conditionMet6=not currentValue4 updateControlVisual(conditionMet6)callback(conditionMet6)
 if settings["ShowToggleNotifications"]then
-local toggleStateText=conditionMet6 and"ENABLED"or"DISABLED"
-local notificationType=conditionMet6 and"success"or"warning"showNotification(labelText, "Toggled: "..toggleStateText, notificationType)
+local toggleStateText=conditionMet6 and"已开启"or"已关闭"
+local notificationType=conditionMet6 and"success"or"warning"showNotification(labelText, "已切换："..toggleStateText, notificationType)
 end
 end
 )button4["Position"]=UDim2["new"](1, -104, .5, -9)
@@ -5413,7 +5654,7 @@ local tween=UDim2["new"](1, 0, 0, layoutPosition and listLayout2["AbsoluteConten
 end
 button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and isPrem then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 updateExpandState()
@@ -5484,7 +5725,7 @@ local function processValue5(value, contextValue, contextValue2)options=value se
 end
 button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if#options==0 then
@@ -5545,7 +5786,7 @@ local clampedValue=math["clamp"](((currentValue3-minimum))/((maximum-minimum)), 
 local currentValue4=false button2["InputBegan"]:Connect(function(input)
 if input["UserInputType"]==Enum["UserInputType"]["MouseButton1"]or input["UserInputType"]==Enum["UserInputType"]["Touch"]then
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 currentValue4=true calculateValue(input)
@@ -5615,7 +5856,7 @@ local clampedValue=math["clamp"](((currentValue3-minimum))/((maximum-minimum)), 
 local currentValue4=false button2["InputBegan"]:Connect(function(input)
 if input["UserInputType"]==Enum["UserInputType"]["MouseButton1"]or input["UserInputType"]==Enum["UserInputType"]["Touch"]then
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 currentValue4=true calculateValue(input)
@@ -5664,7 +5905,7 @@ local textBox=Instance["new"]("TextBox")textBox["Size"]=UDim2["new"](1, -10, 1, 
 local actionButton=Instance["new"]("TextButton")actionButton["Size"]=UDim2["new"](0, 54, 0, 20)actionButton["Position"]=UDim2["new"](1, -60, 0, 23)actionButton["BackgroundColor3"]=UI["AccentCyan"]actionButton["Text"]=actionButtonText or"▶ PLAY"actionButton["TextColor3"]=Color3["fromRGB"](255, 255, 255)actionButton["Font"]=Enum["Font"]["GothamBold"]actionButton["TextSize"]=10.5 actionButton["AutoButtonColor"]=true actionButton["Parent"]=inputRow;
 (Instance["new"]("UICorner", actionButton))["CornerRadius"]=UDim["new"](0, 5)actionButton["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()and text then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if actionButtonCallback then
@@ -5673,7 +5914,7 @@ end
 end
 )textBox["Focused"]:Connect(function()
 if not isFeatureAvailable()and text then
-textBox:ReleaseFocus()showNotification("Feature", "Feature unavailable.", "warning")
+textBox:ReleaseFocus()showNotification("功能", "功能不可用。", "warning")
 end
 end
 )textBox["FocusLost"]:Connect(function(value)pcall(callback, textBox["Text"])
@@ -5692,7 +5933,7 @@ local textFieldContainer=Instance["new"]("Frame")textFieldContainer["Size"]=UDim
 local textFieldStroke=Instance["new"]("UIStroke", textFieldContainer)textFieldStroke["Color"]=UI["StrokeDim"]textFieldStroke["Thickness"]=.8
 local textBox=Instance["new"]("TextBox")textBox["Size"]=UDim2["new"](1, -10, 1, 0)textBox["Position"]=UDim2["new"](0, 5, 0, 0)textBox["BackgroundTransparency"]=1 textBox["Text"]=tostring(currentValue or"")textBox["PlaceholderText"]=placeholder or"0"textBox["PlaceholderColor3"]=UI["Muted"]textBox["TextColor3"]=UI["Text"]textBox["Font"]=Enum["Font"]["GothamBold"]textBox["TextSize"]=11 textBox["ClearTextOnFocus"]=false textBox["Parent"]=textFieldContainer textBox["Focused"]:Connect(function()
 if not isFeatureAvailable()and text then
-textBox:ReleaseFocus()showNotification("Feature", "Feature unavailable.", "warning")
+textBox:ReleaseFocus()showNotification("功能", "功能不可用。", "warning")
 end
 end
 )textBox["FocusLost"]:Connect(function(value)pcall(callback, textBox["Text"])
@@ -5901,7 +6142,7 @@ local character=localPlayer and localPlayer["Character"]
 local humanoid=character and character:FindFirstChildOfClass("Humanoid")
 local child=humanoid and((humanoid:FindFirstChildOfClass("Animator")or humanoid))
 if not child then
-showNotification("Animation Player", "Character Animator not found!", "error")
+showNotification("动画播放器", "未找到角色动画控制器！", "error")
 return
 end
 local numericId=(tostring(animationId)):match("%d+")or tostring(animationId)
@@ -5911,10 +6152,10 @@ return child:LoadAnimation(animation)
 end
 )
 if not success or not result then
-showNotification("Animation Player", "Failed to load emote: "..tostring(soundId), "error")
+showNotification("动画播放器", "动画加载失败："..tostring(soundId), "error")
 return
 end
-currentEmoteTrack=result result["Priority"]=Enum["AnimationPriority"]["Action4"]result:Play(.2)showNotification("Animation Player", "Playing: "..soundId, "info")
+currentEmoteTrack=result result["Priority"]=Enum["AnimationPriority"]["Action4"]result:Play(.2)showNotification("动画播放器", "正在播放："..soundId, "info")
 if not((settings["WalkWhileEmoting"]==true))then
 connection2=registerConnection((humanoid:GetPropertyChangedSignal("MoveDirection")):Connect(function()
 if humanoid["MoveDirection"]["Magnitude"]>0 and currentEmoteTrack==result then
@@ -6173,7 +6414,7 @@ end
 end
 )button2["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if teamName3 then
@@ -6222,7 +6463,7 @@ end
 end
 settings["AutoFarmSurvivor"]=not settings["AutoFarmSurvivor"]connection2(settings["AutoFarmSurvivor"])
 if settings["AutoFarmSurvivor"]then
-_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""showNotification("Auto Farm Enabled", "Starting automatic generator repairs.", "success")
+_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""showNotification("自动农场已开启", "开始自动修理发电机。", "success")
 end
 pcall(saveSettings)
 end
@@ -6254,7 +6495,7 @@ end
 end
 settings["AutoServerHopEscape"]=not settings["AutoServerHopEscape"]accentgreenColor(settings["AutoServerHopEscape"])
 if settings["AutoServerHopEscape"]then
-showNotification("Server Hop Escape Enabled", "Searching for short matches to auto escape.", "success")
+showNotification("自动换服逃脱已开启", "正在寻找短局以自动逃脱。", "success")
 end
 pcall(saveSettings)
 end
@@ -6274,9 +6515,9 @@ local frame9=Instance["new"]("Frame")frame9["Size"]=UDim2["new"](0, 12, 0, 12)fr
 end
 _G["VD_SetTotalAFKToggle"]=connection4 button4["MouseButton1Click"]:Connect(function()settings["AutoFarmAFKTotal"]=not settings["AutoFarmAFKTotal"]connection4(settings["AutoFarmAFKTotal"])
 if settings["AutoFarmAFKTotal"]then
-_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""settings["AutoFarmSurvivor"]=false connection2(false)settings["AutoFarmKiller"]=false connection3(false)settings["AutoServerHopEscape"]=false accentgreenColor(false)showNotification("Total AFK Farm Enabled", "Coordinating auto farm for both teams.", "success")
+_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""settings["AutoFarmSurvivor"]=false connection2(false)settings["AutoFarmKiller"]=false connection3(false)settings["AutoServerHopEscape"]=false accentgreenColor(false)showNotification("全自动挂机已开启", "正在协调双方队伍的自动农场。", "success")
 else
-settings["AutoFarmSurvivor"]=false connection2(false)settings["AutoFarmKiller"]=false connection3(false)settings["AutoServerHopEscape"]=false accentgreenColor(false)showNotification("Total AFK Farm Disabled", "Stopped total AFK mode.", "success")
+settings["AutoFarmSurvivor"]=false connection2(false)settings["AutoFarmKiller"]=false connection3(false)settings["AutoServerHopEscape"]=false accentgreenColor(false)showNotification("全自动挂机已关闭", "已停止全自动挂机模式。", "success")
 end
 pcall(saveSettings)
 end
@@ -6292,7 +6533,7 @@ local stroke5=Instance["new"]("UIStroke", button5)stroke5["Color"]=Color3["fromR
 local character=localPlayer["Character"]
 local rootPart=character and character:FindFirstChild("HumanoidRootPart")
 if not rootPart then
-showNotification("Escape Failed", "Character root part not found!", "error")
+showNotification("逃脱失败", "未找到角色根部件！", "error")
 return
 end
 local part=nil
@@ -6309,14 +6550,14 @@ if part then
 if _G["VD_StopAllInteractions"]then
 pcall(_G["VD_StopAllInteractions"])task["wait"](.15)
 end
-rootPart["CFrame"]=part["CFrame"]showNotification("Instant Escape", "Teleported to finish line!", "success")
+rootPart["CFrame"]=part["CFrame"]showNotification("立即逃脱", "已传送至终点线！", "success")
 else
-showNotification("Escape Failed", "No Finish Line found on this map!", "error")
+showNotification("逃脱失败", "当前地图未找到终点线！", "error")
 end
 end
 button5["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 activeFarmThread()
@@ -6365,7 +6606,7 @@ local button6=Instance["new"]("TextButton")button6["Size"]=UDim2["new"](0, 90, 0
 (Instance["new"]("UICorner", button6))["CornerRadius"]=UDim["new"](0, 5)
 local stroke6=Instance["new"]("UIStroke", button6)stroke6["Color"]=Color3["fromRGB"](255, 255, 255)stroke6["Thickness"]=.5 button6["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if accentgreenColor2 then
@@ -6376,7 +6617,7 @@ end
 if not isMobileDevice then
 local success=createKeybindButton(frame11, "CancelGen", function()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if accentgreenColor2 then
@@ -6410,7 +6651,7 @@ end
 end
 settings["AutoFarmKiller"]=not settings["AutoFarmKiller"]connection3(settings["AutoFarmKiller"])
 if settings["AutoFarmKiller"]then
-_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""showNotification("Killer Auto Farm Enabled", "Starting automatic survivor hunting.", "success")
+_G["VD_FarmState"]["farmTeamStartTime"]=tick()_G["VD_FarmState"]["farmLastTeamName"]=""showNotification("杀手自动农场已开启", "开始自动追猎幸存者。", "success")
 end
 pcall(saveSettings)
 end
@@ -6431,12 +6672,12 @@ local function updateControlVisual(color)(TweenService:Create(button8, TweenInfo
 end
 button8["MouseButton1Click"]:Connect(function()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 settings["AntiWiggle"]=not settings["AntiWiggle"]updateControlVisual(settings["AntiWiggle"])
 if settings["AntiWiggle"]and isFeatureAvailable()then
-showNotification("Anti Wiggle Enabled", "Will auto-drop survivors right before wiggle escapes.", "success")
+showNotification("防挣扎已开启", "将在幸存者即将挣脱前自动放下。", "success")
 end
 pcall(saveSettings)
 end
@@ -6474,7 +6715,7 @@ settings["SpeedBoostEnabled"]=false pcall(saveSettings)
 if speedBoostConnection then
 pcall(speedBoostConnection)
 end
-showNotification("Speed Boost", "Speed Boost team filter active!", "warning")
+showNotification("速度增强", "速度增强队伍筛选已启用！", "warning")
 return
 end
 end
@@ -6583,7 +6824,7 @@ end
 local instance=(game:GetService("ReplicatedStorage")):FindFirstChild("Remotes")instance=instance and instance:FindFirstChild("Shop")instance=instance and instance:FindFirstChild("UnequipPerk")
 local instance2=(game:GetService("ReplicatedStorage")):FindFirstChild("Remotes")instance2=instance2 and instance2:FindFirstChild("Shop")instance2=instance2 and instance2:FindFirstChild("EquipPerk")
 if not instance or not instance2 then
-showNotification("Perk Loadouts", "Shop remotes not found! Make sure you are in game.", "error")
+showNotification("技能配置", "未找到商店远程事件，请确认已经进入游戏。", "error")
 return
 end
 pcall(function()instance:FireServer(3)task["wait"](.05)instance:FireServer(2)task["wait"](.05)instance:FireServer(1)task["wait"](.05)
@@ -6596,7 +6837,7 @@ end
 if value["Perk1"]and(value["Perk1"]~="None"and value["Perk1"]~="")then
 instance2:FireServer(value["Perk1"], 1)task["wait"](.05)
 end
-showNotification("Perk Loadouts", "Loadout applied successfully!", "success")
+showNotification("技能配置", "配置已成功应用！", "success")
 end
 )
 end
@@ -6622,7 +6863,7 @@ table["insert"](items11, item)
 end
 pcall(function()success["updateOptions"](items11, items11, settings["SelectedPerk1"])success2["updateOptions"](items11, items11, settings["SelectedPerk2"])success3["updateOptions"](items11, items11, settings["SelectedPerk3"])
 end
-)showNotification("Perk Loadouts", "Available perks list updated!", "success")
+)showNotification("技能配置", "可用技能列表已更新！", "success")
 end
 , UI["AccentCyan"])
 local currentValue4="My Loadout"createInput(accentcyanColor["content"], "New Loadout Name", "Type name...", "My Loadout", function(value)currentValue4=value
@@ -6644,7 +6885,7 @@ end
 local currentValue5=getFeatureState3()
 local button2=nil createButton(accentcyanColor["content"], "Save Current Selection", "Save", function()
 if not currentValue4 or currentValue4==""or currentValue4=="None"then
-showNotification("Perk Loadouts", "Please enter a valid loadout name!", "warning")
+showNotification("技能配置", "请输入有效的配置名称！", "warning")
 return
 end
 if not settings["PerkLoadouts"]then
@@ -6659,7 +6900,7 @@ pcall(function()button2["updateOptions"](currentValue6, currentValue6, currentVa
 end
 )
 end
-showNotification("Perk Loadouts", "Saved loadout: "..currentValue4, "success")
+showNotification("技能配置", "已保存配置："..currentValue4, "success")
 end
 , UI["AccentGreen"])button2=processValue4(accentcyanColor["content"], "Select Saved Loadout", currentValue5, settings["SelectedPerkLoadout"]or currentValue5[1], function(value)settings["SelectedPerkLoadout"]=value pcall(saveSettings)
 local perkloadouts=settings["PerkLoadouts"]and settings["PerkLoadouts"][value]
@@ -6673,7 +6914,7 @@ end
 local selectedperkloadout=settings["SelectedPerkLoadout"]
 local perkloadouts=settings["PerkLoadouts"]and settings["PerkLoadouts"][selectedperkloadout]
 if not perkloadouts then
-showNotification("Perk Loadouts", "Selected loadout not found!", "warning")
+showNotification("技能配置", "未找到所选配置！", "warning")
 return
 end
 invokeRemote(perkloadouts)
@@ -6681,7 +6922,7 @@ end
 , UI["AccentCyan"])createButton(accentcyanColor["content"], "Delete Selected Loadout", "Delete", function()
 local selectedperkloadout=settings["SelectedPerkLoadout"]
 if not selectedperkloadout or selectedperkloadout=="None"or not settings["PerkLoadouts"]or not settings["PerkLoadouts"][selectedperkloadout]then
-showNotification("Perk Loadouts", "Cannot delete selected loadout!", "warning")
+showNotification("技能配置", "无法删除当前选中的配置！", "warning")
 return
 end
 settings["PerkLoadouts"][selectedperkloadout]=nil pcall(saveSettings)
@@ -6698,7 +6939,7 @@ settings["SelectedPerk1"]=perkloadouts["Perk1"]or"None"settings["SelectedPerk2"]
 end
 )
 end
-showNotification("Perk Loadouts", "Deleted loadout: "..selectedperkloadout, "success")
+showNotification("技能配置", "已删除配置："..selectedperkloadout, "success")
 end
 , UI["AccentRed"])controlRegistry["SelectedPerk1"]={["setValue"]=function(value)success["setValue"](value)
 end
@@ -6723,16 +6964,16 @@ local function character()
 local character2=localPlayer["Character"]
 local humanoid=character2 and character2:FindFirstChildOfClass("Humanoid")
 if not humanoid then
-showNotification("Instant Bandage", "Character humanoid not found!", "error")
+showNotification("瞬间绷带", "未找到角色人形对象！", "error")
 return
 end
 if humanoid["Health"]>=humanoid["MaxHealth"]then
-showNotification("Instant Bandage", "You are already at full health!", "warning")
+showNotification("瞬间绷带", "你当前已经满血！", "warning")
 return
 end
 local instance=character2:FindFirstChild("Bandage")or(localPlayer:FindFirstChild("Backpack")and localPlayer["Backpack"]:FindFirstChild("Bandage"))
 if not instance then
-showNotification("Instant Bandage", "No bandage tool in Backpack or equipped!", "error")
+showNotification("瞬间绷带", "背包或已装备物品中没有绷带工具！", "error")
 return
 end
 if instance["Parent"]==localPlayer:FindFirstChild("Backpack")then
@@ -6741,7 +6982,7 @@ end
 )task["wait"](.1)
 end
 if instance["Parent"]~=character2 then
-showNotification("Instant Bandage", "Failed to equip bandage tool!", "error")
+showNotification("瞬间绷带", "绷带工具装备失败！", "error")
 return
 end
 local instance2=instance:FindFirstChild("Right Arm")
@@ -6750,7 +6991,7 @@ if not bandage then
 bandage=instance:FindFirstChild("Bandage", true)
 end
 if not bandage then
-showNotification("Instant Bandage", "Bandage part not found inside tool!", "error")
+showNotification("瞬间绷带", "绷带工具内未找到绷带部件！", "error")
 return
 end
 local instance3=(game:GetService("ReplicatedStorage")):FindFirstChild("Remotes")
@@ -6758,10 +6999,10 @@ local instance4=instance3 and instance3:FindFirstChild("Items")
 local instance5=instance4 and instance4:FindFirstChild("Bandage")
 local fire=instance5 and instance5:FindFirstChild("Fire")
 if not fire then
-showNotification("Instant Bandage", "Bandage remote not found in ReplicatedStorage!", "error")
+showNotification("瞬间绷带", "共享存储中未找到绷带远程事件！", "error")
 return
 end
-showNotification("Instant Bandage", "Spamming bandage...", "success")task["spawn"](function()
+showNotification("瞬间绷带", "正在连续使用绷带……", "success")task["spawn"](function()
 local timestamp=tick()
 while humanoid["Health"]<humanoid["MaxHealth"]and(instance["Parent"]==character2 and(humanoid["Health"]>0 and(tick()-timestamp<8)))do
 pcall(function()fire:FireServer(true, bandage)fire:FireServer(false, bandage)
@@ -6769,9 +7010,9 @@ end
 )task["wait"](.01)
 end
 if humanoid["Health"]>=humanoid["MaxHealth"]then
-showNotification("Instant Bandage", "Healed to full health!", "success")
+showNotification("瞬间绷带", "已恢复至满血！", "success")
 else
-showNotification("Instant Bandage", "Stopped healing.", "info")
+showNotification("瞬间绷带", "已停止治疗。", "info")
 end
 end
 )
@@ -6891,14 +7132,14 @@ return
 end
 local target=camera()
 if not target then
-showNotification("Remote Drop Pallet", "No pallet targeted!", "warning")
+showNotification("远程放下木板", "未选中木板！", "warning")
 return
 end
 local instance=(game:GetService("ReplicatedStorage")):FindFirstChild("Remotes")
 local instance2=instance and instance:FindFirstChild("Pallet")
 local palletdropevent=instance2 and instance2:FindFirstChild("PalletDropEvent")
 if not palletdropevent then
-showNotification("Remote Drop Pallet", "PalletDropEvent remote not found!", "error")
+showNotification("远程放下木板", "未找到木板放下远程事件！", "error")
 return
 end
 local character2=localPlayer["Character"]
@@ -6922,9 +7163,9 @@ end
 end
 )
 end
-showNotification("Remote Drop Pallet", "Pallet dropped remotely!", "success")
+showNotification("远程放下木板", "已远程放下木板！", "success")
 else
-showNotification("Remote Drop Pallet", "Failed to drop pallet (already dropped?)", "warning")
+showNotification("远程放下木板", "木板放下失败（可能已经放下？）", "warning")
 end
 end
 task["spawn"](function()
@@ -6938,7 +7179,7 @@ local instance=(game:GetService("ReplicatedStorage")):FindFirstChild("Remotes")
 local instance2=instance and instance:FindFirstChild("Pallet")
 local palletdropevent=instance2 and instance2:FindFirstChild("PalletDropEvent")
 if not palletdropevent then
-showNotification("Drop Pallets", "PalletDropEvent remote not found!", "error")
+showNotification("放下木板", "未找到木板放下远程事件！", "error")
 return
 end
 local character2=localPlayer["Character"]
@@ -6970,7 +7211,7 @@ end
 end
 )
 end
-showNotification("Drop Pallets", "Dropped "..(numericValue.." pallets!"), "success")
+showNotification("放下木板", "已放下 "..(numericValue.." 个木板！"), "success")
 end
 end
 createButton(tabSelf, "Drop All Pallets", "Drop", findRootPart2, UI["AccentCyan"], "DropAllPallets")controlRegistry["RemoteDropPallet"]=createToggle(tabSelf, "Remote Drop Pallet", settings["RemoteDropPallet"], function(value)settings["RemoteDropPallet"]=value pcall(saveSettings)
@@ -6978,7 +7219,7 @@ end
 , UI["AccentCyan"])createButton(tabSelf, "Drop Target Pallet", "Drop", findRootPart, UI["AccentCyan"], "RemoteDropPalletKey")
 local function invokeRemote2()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["BlockVaultPallets"])))then
-showNotification("Block Vaults", "Feature unavailable.", "error")
+showNotification("禁用翻越点", "功能不可用。", "error")
 return
 end
 pcall(function()
@@ -6993,16 +7234,16 @@ end
 end
 end
 end
-showNotification("Block Vaults", "Vaults blocked!", "success")
+showNotification("禁用翻越点", "翻越点已禁用！", "success")
 else
-showNotification("Block Vaults", "VaultEvent remote not found!", "error")
+showNotification("禁用翻越点", "未找到翻越远程事件！", "error")
 end
 end
 )
 end
 local function processValue6()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["BlockVaultPallets"])))then
-showNotification("Block Pallets", "Feature unavailable.", "error")
+showNotification("禁用木板", "功能不可用。", "error")
 return
 end
 pcall(function()
@@ -7017,16 +7258,16 @@ end
 end
 end
 end
-showNotification("Block Pallets", "Pallets blocked!", "success")
+showNotification("禁用木板", "木板已禁用！", "success")
 else
-showNotification("Block Pallets", "PalletSlideEvent remote not found!", "error")
+showNotification("禁用木板", "未找到木板滑动远程事件！", "error")
 end
 end
 )
 end
 local function processValue7()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["BlockVaultPallets"])))then
-showNotification("Unlock Vaults", "Feature unavailable.", "error")
+showNotification("解锁翻越点", "功能不可用。", "error")
 return
 end
 pcall(function()
@@ -7043,19 +7284,19 @@ end
 end
 end
 if numericValue>0 then
-showNotification("Unlock Vaults", "Unlocked "..(tostring(numericValue).." vaults!"), "success")
+showNotification("解锁翻越点", "已解锁 "..(tostring(numericValue).." 个翻越点！"), "success")
 else
-showNotification("Unlock Vaults", "No VaultTriggers/Points found!", "warning")
+showNotification("解锁翻越点", "未找到翻越触发点/交互点！", "warning")
 end
 else
-showNotification("Unlock Vaults", "Remote not found!", "error")
+showNotification("解锁翻越点", "未找到远程事件！", "error")
 end
 end
 )
 end
 local function processValue8()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["BlockVaultPallets"])))then
-showNotification("Unlock Pallets", "Feature unavailable.", "error")
+showNotification("解锁木板", "功能不可用。", "error")
 return
 end
 pcall(function()
@@ -7070,9 +7311,9 @@ end
 end
 end
 end
-showNotification("Unlock Pallets", "Pallets unlocked!", "success")
+showNotification("解锁木板", "木板已解锁！", "success")
 else
-showNotification("Unlock Pallets", "PalletSlideCompleteEvent remote not found!", "error")
+showNotification("解锁木板", "未找到木板滑动完成远程事件！", "error")
 end
 end
 )
@@ -7083,9 +7324,9 @@ local player=localPlayer:GetAttribute(contextValue)or 0
 local inputControl=createInput(tabSelf, value, tostring(player), tostring(player), function(value2)
 local player2=tonumber(value2)
 if player2 then
-localPlayer:SetAttribute(contextValue, player2)showNotification(value, "Updated to "..player2, "success")
+localPlayer:SetAttribute(contextValue, player2)showNotification(value, "已更新为 "..player2, "success")
 else
-showNotification(value, "Invalid number", "error")
+showNotification(value, "无效数字", "error")
 end
 end
 )
@@ -7176,15 +7417,15 @@ end
 end
 accentgreenColor2=function()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["CancelGen"])))then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
-showNotification("Generator Buff", "Attempting to buff generator...", "info")task["spawn"](function()
+showNotification("发电机强化", "正在尝试强化发电机……", "info")task["spawn"](function()
 local success, result=pcall(function()
 local character=localPlayer["Character"]
 local rootPart=character and character:FindFirstChild("HumanoidRootPart")
 if not rootPart then
-showNotification("Generator Buff", "Character HumanoidRootPart not found!", "error")
+showNotification("发电机强化", "未找到角色根部件！", "error")
 return
 end
 local function processValue4(instance)
@@ -7228,7 +7469,7 @@ end
 end
 end
 if#items10==0 then
-showNotification("Generator Buff", "No generators found in map!", "error")
+showNotification("发电机强化", "地图中未找到发电机！", "error")
 return
 end
 local cachedValue3=nil
@@ -7243,7 +7484,7 @@ end
 end
 end
 if not cachedValue3 or distance>15 then
-local currentValue3=cachedValue3 and string["format"]("%.1f studs", distance)or"N/A"showNotification("Generator Buff", "No generator within 15 studs! ("..(currentValue3..")"), "error")
+local currentValue3=cachedValue3 and string["format"]("%.1f 格", distance)or"不可用"showNotification("发电机强化", "15 格范围内没有发电机！（"..(currentValue3..")"), "error")
 return
 end
 local items12={}
@@ -7257,7 +7498,7 @@ return name2["Name"]<name3["Name"]
 end
 )
 if#items12==0 then
-showNotification("Generator Buff", "No generator points resolved!", "error")
+showNotification("发电机强化", "未解析到发电机交互点！", "error")
 return
 end
 local instance2=game:GetService("ReplicatedStorage")
@@ -7268,7 +7509,7 @@ if not repairevent then
 repairevent=instance2:FindFirstChild("RepairEvent", true)
 end
 if not repairevent then
-showNotification("Generator Buff", "RepairEvent remote not found!", "error")
+showNotification("发电机强化", "未找到修理远程事件！", "error")
 return
 end
 local count=#items12
@@ -7284,11 +7525,11 @@ task["wait"](.2)
 end
 end
 end
-showNotification("Generator Buff", "Successfully applied generator buff!", "success")
+showNotification("发电机强化", "发电机强化已成功应用！", "success")
 end
 )
 if not success then
-showNotification("Generator Buff", "Critical Error: "..tostring(result), "error")
+showNotification("发电机强化", "严重错误："..tostring(result), "error")
 end
 end
 )
@@ -7323,7 +7564,7 @@ end
 local conditionMet5=false
 local function processValue4()
 if not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if conditionMet5 then
@@ -7404,7 +7645,7 @@ end
 table["sort"](items10)
 for index, item in ipairs(items10)do
 end
-showNotification("Parry Animations", "Printed "..(#items10.." animation IDs to F9 Console!"), "success")
+showNotification("格挡动画", "已将 "..(#items10.." 个动画编号输出到 F9 控制台！"), "success")
 end
 if localPlayer["Name"]=="dontgrabme_2"then
 createButton(tabCombat, "List Active/Learned Animations", "Print", getFeatureState3, UI["AccentCyan"], "PrintAnimations")
@@ -7606,7 +7847,7 @@ end
 , UI["AccentOrange"], " ms")
 local target2=createCollapsibleToggle(accentorangeColor["content"], "Spear Silent Aim", settings["SpearSilentAim"]and settings["SpearSilentAim"]["Enabled"], function(enabled3)
 if enabled3 and not((isFeatureAvailable()and(featureAvailability and featureAvailability["SpearSilentAim"])))then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 if not settings["SpearSilentAim"]then
@@ -7703,12 +7944,12 @@ local conditionMet6=false
 for index, item in ipairs(items10)do
 createButton(button2["content"], item["name"], "Apply", function()
 if not((isFeatureAvailable()and(featureAvailability and featureAvailability["Masked"])))then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 return
 end
 task["spawn"](function()
 if conditionMet6 then
-showNotification("Masked Buff", "Activation in progress, please wait!", "warning")
+showNotification("蒙面者增益", "正在激活，请稍候！", "warning")
 return
 end
 conditionMet6=true
@@ -7721,21 +7962,21 @@ else
 currentValue4["Remotes"]["Killers"]["Masked"]["Deactivatepower"]:FireServer()
 end
 if item["id"]then
-showNotification("Masked Buff", "Deactivated. Activating "..(item["id"].." in 4s..."), "info")task["wait"](4)
+showNotification("蒙面者增益", "已停用，4 秒后激活 "..(translateNotificationText(item["id"]).."……"), "info")task["wait"](4)
 local remotes2=currentValue4:WaitForChild("Remotes", 2)remotes2=remotes2 and remotes2:WaitForChild("Killers", 2)remotes2=remotes2 and remotes2:WaitForChild("Masked", 2)remotes2=remotes2 and remotes2:WaitForChild("Activatepower", 2)
 if remotes2 then
 remotes2:FireServer(item["id"])
 else
 currentValue4["Remotes"]["Killers"]["Masked"]["Activatepower"]:FireServer(item["id"])
 end
-showNotification("Masked Buff", item["id"].." activated successfully!", "success")
+showNotification("蒙面者增益", translateNotificationText(item["id"]).." 已成功激活！", "success")
 else
-showNotification("Masked Buff", "Buffs deactivated!", "success")
+showNotification("蒙面者增益", "增益已停用！", "success")
 end
 end
 )
 if not success then
-showNotification("Masked Buff", "Error: "..tostring(result), "error")
+showNotification("蒙面者增益", "错误："..tostring(result), "error")
 end
 conditionMet6=false
 end
@@ -7767,7 +8008,7 @@ local instance2=instance and instance:FindFirstChild("Killers")
 local instance3=instance2 and instance2:FindFirstChild("Stalker")
 local startstalking=instance3 and instance3:FindFirstChild("StartStalking")
 if not startstalking then
-showNotification("Stalker", "StartStalking remote not found!", "error")
+showNotification("追猎者", "未找到追猎远程事件！", "error")
 return
 end
 local numericValue=0
@@ -7778,7 +8019,7 @@ end
 )numericValue=numericValue+1
 end
 end
-showNotification("Stalker", "Stalking "..(numericValue.." players!"), "success")
+showNotification("追猎者", "正在追踪 "..(numericValue.." 名玩家！"), "success")
 end
 )
 end
@@ -7883,7 +8124,7 @@ local function character(callback, contextValue)
 local character2=localPlayer["Character"]
 local rootPart=character2 and character2:FindFirstChild("HumanoidRootPart")
 if not rootPart then
-showNotification("Teleport", "Character root not found!", "error")
+showNotification("传送", "未找到角色根部件！", "error")
 return
 end
 local items10={}
@@ -7994,9 +8235,9 @@ if part then
 if _G["VD_StopAllInteractions"]then
 pcall(_G["VD_StopAllInteractions"])task["wait"](.15)
 end
-rootPart["CFrame"]=part["CFrame"]+Vector3["new"](0, 3, 0)showNotification("Teleport", "Teleported to "..(((contextValue and"furthest"or"nearest"))..(" "..(callback.."!"))), "success")
+rootPart["CFrame"]=part["CFrame"]+Vector3["new"](0, 3, 0)showNotification("传送", "已传送到"..(((contextValue and"最远的"or"最近的"))..(" "..(translateText(callback).."！"))), "success")
 else
-showNotification("Teleport", "No "..(((contextValue and"furthest"or"nearest"))..(" "..(callback.." found!"))), "error")
+showNotification("传送", "未找到"..(((contextValue and"最远的"or"最近的"))..(" "..(translateText(callback).."！"))), "error")
 end
 end
 local function processValue4(callback)character(callback, false)
@@ -8073,7 +8314,7 @@ end
 do
 createSection(tabVisuals, "Cinematic Visuals", UI["Accent"])controlRegistry["RTXGraphics"]=createToggle(tabVisuals, "RTX Graphics Booster", settings["RTXGraphics"], function(value)
 if value and not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 if controlRegistry["RTXGraphics"]and controlRegistry["RTXGraphics"]["setValue"]then
 controlRegistry["RTXGraphics"]["setValue"](false)
 end
@@ -8086,7 +8327,7 @@ end
 end
 , UI["Accent"])controlRegistry["CinematicDOF"]=createToggle(tabVisuals, "Cinematic Depth of Field", settings["CinematicDOF"], function(value)
 if value and not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 if controlRegistry["CinematicDOF"]and controlRegistry["CinematicDOF"]["setValue"]then
 controlRegistry["CinematicDOF"]["setValue"](false)
 end
@@ -8163,7 +8404,7 @@ end
 end
 controlRegistry["CustomBg_Enabled"]=createToggle(tabVisuals, "Custom Background", settings["CustomBackground"]and settings["CustomBackground"]["Enabled"]or false, function(enabled3)
 if enabled3 and((not isFeatureAvailable()or not((featureAvailability and featureAvailability["CustomBackground"]))))then
-showNotification("Feature", "Feature unavailable.", "warning")
+showNotification("功能", "功能不可用。", "warning")
 if controlRegistry["CustomBg_Enabled"]and controlRegistry["CustomBg_Enabled"]["setValue"]then
 controlRegistry["CustomBg_Enabled"]["setValue"](false)
 end
@@ -8289,7 +8530,7 @@ end
 , UI["AccentCyan"])createSection(tabVisuals, "Network Manipulation", UI["Danger"])
 local fakelag=createCollapsibleToggle(tabVisuals, "Fake Lag", settings["FakeLag"], function(value)
 if value and not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")settings["FakeLag"]=false pcall(saveSettings)
+showNotification("功能", "功能不可用。", "warning")settings["FakeLag"]=false pcall(saveSettings)
 if fakeLagGroup and fakeLagGroup["setValue"]then
 fakeLagGroup["setValue"](false)
 end
@@ -8316,7 +8557,7 @@ end
 , nil, "FakeLagGhost")
 local desync=createCollapsibleToggle(tabVisuals, "Network Desync", settings["Desync"], function(value)
 if value and not isFeatureAvailable()then
-showNotification("Feature", "Feature unavailable.", "warning")settings["Desync"]=false pcall(saveSettings)
+showNotification("功能", "功能不可用。", "warning")settings["Desync"]=false pcall(saveSettings)
 if desyncGroup and desyncGroup["setValue"]then
 desyncGroup["setValue"](false)
 end
@@ -9246,88 +9487,148 @@ end
 currentValue7=((currentValue7+1))%#espEntries
 local success=espEntries[currentValue7+1]updateMapESP(success["typeKey"], success["cached"]())pcall(manageHighlights)
 if settings["Minimap"]["Enabled"]then
-pcall(function()minimapFrame["Visible"]=true
+pcall(function()
+minimapFrame["Visible"]=true
 local camera=workspace["CurrentCamera"]
-local transform=camera["CFrame"]
-local character=cachedRootPart and cachedRootPart["Position"]or(localPlayer["Character"]and(localPlayer["Character"]:FindFirstChild("HumanoidRootPart")and localPlayer["Character"]["HumanoidRootPart"]["Position"]))
-if not character then
+local cameraCFrame=camera["CFrame"]
+local playerPosition=cachedRootPart and cachedRootPart["Position"]or(localPlayer["Character"]and(localPlayer["Character"]:FindFirstChild("HumanoidRootPart")and localPlayer["Character"]["HumanoidRootPart"]["Position"]))
+if not playerPosition then
 return
 end
-local numericValue=130
-local numericValue2=5
-local numericValue3=130
-local distance2=numericValue3/2
-local vector2=(Vector3["new"](transform["LookVector"]["X"], 0, transform["LookVector"]["Z"]))["Unit"]
-local vector3=(Vector3["new"](transform["RightVector"]["X"], 0, transform["RightVector"]["Z"]))["Unit"]
-for index, container in ipairs(minimapFrame:GetChildren())do
-if container["Name"]=="RadarDot"then
-container["Visible"]=false
+
+local radarRange=130
+local radarSize=148
+local radarCenter=radarSize/2
+local radarUsableRadius=radarCenter-9
+local cameraForward=(Vector3["new"](cameraCFrame["LookVector"]["X"], 0, cameraCFrame["LookVector"]["Z"]))["Unit"]
+local cameraRight=(Vector3["new"](cameraCFrame["RightVector"]["X"], 0, cameraCFrame["RightVector"]["Z"]))["Unit"]
+
+for _, marker in ipairs(minimapFrame:GetChildren())do
+if marker["Name"]=="RadarMarker"then
+marker["Visible"]=false
 end
 end
-local function children()
-for index, container in ipairs(minimapFrame:GetChildren())do
-if container["Name"]=="RadarDot"and not container["Visible"]then
-return container
+
+local function acquireRadarMarker()
+for _, marker in ipairs(minimapFrame:GetChildren())do
+if marker["Name"]=="RadarMarker"and not marker["Visible"]then
+return marker
 end
 end
-local frame4=Instance["new"]("Frame")frame4["Name"]="RadarDot"frame4["Size"]=UDim2["new"](0, numericValue2, 0, numericValue2)frame4["AnchorPoint"]=Vector2["new"](.5, .5)frame4["BorderSizePixel"]=0 frame4["ZIndex"]=8 frame4["Parent"]=minimapFrame;
-(Instance["new"]("UICorner", frame4))["CornerRadius"]=UDim["new"](1, 0)
-return frame4
+local marker=Instance["new"]("Frame")
+marker["Name"]="RadarMarker"
+marker["AnchorPoint"]=Vector2["new"](.5, .5)
+marker["BorderSizePixel"]=0
+marker["BackgroundTransparency"]=.04
+marker["ZIndex"]=8
+marker["Parent"]=minimapFrame
+local markerCorner=Instance["new"]("UICorner", marker)
+markerCorner["Name"]="MarkerCorner"
+markerCorner["CornerRadius"]=UDim["new"](0, 1)
+return marker
 end
-local function getDistance2(value, color2)
-local currentValue8=value-character
-local currentValue9=currentValue8:Dot(vector3)
-local currentValue10=currentValue8:Dot(vector2)
-local currentValue11=distance2/numericValue
-local currentValue12=distance2+currentValue9*currentValue11
-local currentValue13=distance2-currentValue10*currentValue11
-local distance3=distance2-numericValue2
-if((Vector2["new"](currentValue12, currentValue13)-Vector2["new"](distance2, distance2)))["Magnitude"]>distance3 then
+
+local function styleRadarMarker(marker, markerType, color)
+local markerCorner=marker:FindFirstChild("MarkerCorner")
+marker["Rotation"]=0
+marker["BackgroundColor3"]=color
+if markerType=="Killer"then
+marker["Size"]=UDim2["new"](0, 7, 0, 7)
+marker["Rotation"]=45
+markerCorner["CornerRadius"]=UDim["new"](0, 1)
+elseif markerType=="Survivor"then
+marker["Size"]=UDim2["new"](0, 6, 0, 6)
+markerCorner["CornerRadius"]=UDim["new"](.5, 0)
+elseif markerType=="Generator"then
+marker["Size"]=UDim2["new"](0, 6, 0, 6)
+markerCorner["CornerRadius"]=UDim["new"](0, 1)
+elseif markerType=="Hook"then
+marker["Size"]=UDim2["new"](0, 5, 0, 5)
+marker["Rotation"]=45
+markerCorner["CornerRadius"]=UDim["new"](0, 1)
+elseif markerType=="Pallet"then
+marker["Size"]=UDim2["new"](0, 8, 0, 3)
+markerCorner["CornerRadius"]=UDim["new"](0, 1)
+else
+marker["Size"]=UDim2["new"](0, 5, 0, 5)
+markerCorner["CornerRadius"]=UDim["new"](.5, 0)
+end
+end
+
+local function plotRadarMarker(worldPosition, color, markerType)
+local worldOffset=worldPosition-playerPosition
+local horizontalOffset=worldOffset:Dot(cameraRight)
+local forwardOffset=worldOffset:Dot(cameraForward)
+local radarScale=radarUsableRadius/radarRange
+local radarX=radarCenter+horizontalOffset*radarScale
+local radarY=radarCenter-forwardOffset*radarScale
+local fromCenter=Vector2["new"](radarX-radarCenter, radarY-radarCenter)
+if fromCenter["Magnitude"]>radarUsableRadius then
 return
 end
-local layoutPosition=children()layoutPosition["Position"]=UDim2["new"](0, currentValue12, 0, currentValue13)layoutPosition["BackgroundColor3"]=color2 layoutPosition["Visible"]=true
+local marker=acquireRadarMarker()
+styleRadarMarker(marker, markerType, color)
+marker["Position"]=UDim2["new"](0, radarX, 0, radarY)
+marker["Visible"]=true
 end
-for index, player2 in ipairs(Players:GetPlayers())do
-if player2==localPlayer then
+
+for _, radarPlayer in ipairs(Players:GetPlayers())do
+if radarPlayer==localPlayer then
 continue
 end
-local instance=player2["Character"]
-local rootPart=instance and instance:FindFirstChild("HumanoidRootPart")
+local character=radarPlayer["Character"]
+local rootPart=character and character:FindFirstChild("HumanoidRootPart")
 if not rootPart then
 continue
 end
-local name4=player2["Team"]
-local isMatchingTeam=name4 and name4["Name"]=="Killer"
-local teamName=isMatchingTeam and Color3["fromRGB"](255, 70, 70)or Color3["fromRGB"](80, 255, 130)getDistance2(rootPart["Position"], teamName)
+local team=radarPlayer["Team"]
+local playerEsp=ActiveESP["Players"][radarPlayer]
+local isKiller=(team and team["Name"]=="Killer")or(playerEsp and playerEsp["IsKiller"]==true)
+if isKiller then
+plotRadarMarker(rootPart["Position"], getESPColor("Killer"), "Killer")
+else
+local survivorColor=getESPColor("SurvivorHealthy")
+local knocked=getObjectValue(character, "Knocked")
+local hooked=getObjectValue(character, "IsHooked")==true or character:GetAttribute("IsHooked")==true
+if knocked==true or tostring(knocked):lower()=="true"or knocked==1 or hooked then
+survivorColor=getESPColor("SurvivorKnocked")
+else
+local currentHealth, maxHealth=getPlayerHealthPercent(radarPlayer)
+if currentHealth<maxHealth then
+survivorColor=getESPColor("SurvivorInjured")
 end
-for index, instance in ipairs(cachedGenerators)do
-if not instance or not instance["Parent"]then
+end
+plotRadarMarker(rootPart["Position"], survivorColor, "Survivor")
+end
+end
+
+for _, generator in ipairs(cachedGenerators)do
+if not generator or not generator["Parent"]or isGeneratorCompleted(generator)then
 continue
 end
-if isGeneratorCompleted(instance)then
+local part=generator["PrimaryPart"]or generator:FindFirstChildWhichIsA("BasePart")
+if part then
+plotRadarMarker(part["Position"], Color3["fromRGB"](62, 190, 220), "Generator")
+end
+end
+
+for _, hook in ipairs(cachedHooks)do
+if not hook or not hook["Parent"]then
 continue
 end
-local child=instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart")
-if child then
-getDistance2(child["Position"], Color3["fromRGB"](0, 200, 255))
+local hookPosition=hook:IsA("BasePart")and hook["Position"]or nil
+if hookPosition then
+plotRadarMarker(hookPosition, Color3["fromRGB"](224, 151, 71), "Hook")
 end
 end
-for index, instance in ipairs(cachedHooks)do
-if not instance or not instance["Parent"]then
+
+for _, pallet in ipairs(cachedPallets)do
+if not pallet or not pallet["Parent"]then
 continue
 end
-local currentValue8=instance:IsA("BasePart")and instance["Position"]or nil
-if currentValue8 then
-getDistance2(currentValue8, Color3["fromRGB"](255, 150, 0))
-end
-end
-for index, instance in ipairs(cachedPallets)do
-if not instance or not instance["Parent"]then
-continue
-end
-local child=instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart")
-if child then
-getDistance2(child["Position"], Color3["fromRGB"](180, 130, 70))
+local part=pallet["PrimaryPart"]or pallet:FindFirstChildWhichIsA("BasePart")
+if part then
+plotRadarMarker(part["Position"], Color3["fromRGB"](169, 126, 77), "Pallet")
 end
 end
 end
@@ -10272,7 +10573,7 @@ pcall(function()controlRegistry["InstantSkillCheck"]["setValue"](true)
 end
 )
 end
-pcall(saveSettings)showNotification("Skill Check", "Generator completed! Instant Skill Check re-enabled.", "success")
+pcall(saveSettings)showNotification("技能检定", "发电机已完成！已重新启用瞬时技能检定。", "success")
 else
 local progress2=getGeneratorProgress(instance2)
 local conditionMet11=progress2>=100 or isGeneratorCompleted(instance2)
@@ -10301,7 +10602,7 @@ pcall(function()controlRegistry["InstantSkillCheck"]["setValue"](true)
 end
 )
 end
-pcall(saveSettings)showNotification("Skill Check", "Walked away from generator! Instant Skill Check re-enabled.", "success")
+pcall(saveSettings)showNotification("技能检定", "已离开发电机！已重新启用瞬时技能检定。", "success")
 elseif conditionMet11 then
 local currentValue8=instance2 items12[currentValue8]=true cachedValue6=nil task["spawn"](function()task["wait"](1)settings["InstantSkillCheck"]=true
 if controlRegistry["InstantSkillCheck"]and controlRegistry["InstantSkillCheck"]["setValue"]then
@@ -10309,7 +10610,7 @@ pcall(function()controlRegistry["InstantSkillCheck"]["setValue"](true)
 end
 )
 end
-pcall(saveSettings)showNotification("Skill Check", "Generator completed! Instant Skill Check re-enabled.", "success")
+pcall(saveSettings)showNotification("技能检定", "发电机已完成！已重新启用瞬时技能检定。", "success")
 end
 )
 end
@@ -10353,7 +10654,7 @@ pcall(function()controlRegistry["InstantSkillCheck"]["setValue"](false)
 end
 )
 end
-pcall(saveSettings)cachedValue6=progress2 showNotification("Skill Check", "King's Scourge & Progress >= 85%! Disabled Instant Skill Check.", "warning")
+pcall(saveSettings)cachedValue6=progress2 showNotification("技能检定", "国王之灾且进度 ≥ 85%！已禁用瞬时技能检定。", "warning")
 return
 end
 end
@@ -10943,7 +11244,7 @@ return
 end
 numericValue4=timestamp print(string["format"]("[Auto Parry Detected] Attack intercepted! Reason: %s | Distance: %.1f studs | Delay: %.2fs", value, contextValue, settings["ParryDelay"]))
 if conditionMet11 then
-showNotification("Parry Detected", value, "info")
+showNotification("检测到格挡", value, "info")
 end
 task["spawn"](function()
 local conditionMet17=false
@@ -11942,7 +12243,7 @@ if progress2 and tonumber(progress2)then
 local currentValue6=tonumber(progress2)
 if currentValue6<=3 and currentValue6>0 then
 if settings["RevolverAutofarm"]and(isFeatureAvailable()and(featureAvailability and featureAvailability["RevolverAutofarm"]))then
-setRevolverAutofarm(false)showNotification("Revolver Autofarm", "Disabled revolver autofarm: HookedProgress reached <= 3.0", "info")
+setRevolverAutofarm(false)showNotification("左轮自动农场", "已关闭左轮自动农场：上钩进度已降至 ≤ 3.0", "info")
 if tick()-timeValue4>3 then
 timeValue4=tick()
 if activeFarmThread then
@@ -12861,7 +13162,7 @@ end
 if cachedValue15 then
 local part2=processValue14(cachedValue15)
 if part2 then
-showNotification("Auto Flee", "Killer too close! Teleported to furthest generator.", "warning")findRootPart7()character6(part2["CFrame"]+Vector3["new"](0, 1.5, 0))cachedValue6=cachedValue15 part=part2 currentValue6="Repairing"findRootPart8("REPAIRING")
+showNotification("自动逃离", "杀手距离过近！已传送至最远发电机。", "warning")findRootPart7()character6(part2["CFrame"]+Vector3["new"](0, 1.5, 0))cachedValue6=cachedValue15 part=part2 currentValue6="Repairing"findRootPart8("REPAIRING")
 if not cachedValue9 then
 processValue11()
 end
@@ -13189,7 +13490,7 @@ while activeLoop and(localPlayer["Team"]and localPlayer["Team"]["Name"]=="Surviv
 findRootPart8("ESCAPED")task["wait"](.5)
 end
 end
-showNotification("Escape Triggered", "Teleported to finish line successfully!", "success")
+showNotification("已触发逃脱", "已成功传送至终点线！", "success")
 else
 local part3=nil
 for index, instance in ipairs(cachedGates)do
@@ -13216,7 +13517,7 @@ while activeLoop and(localPlayer["Team"]and localPlayer["Team"]["Name"]=="Surviv
 findRootPart8("ESCAPED")task["wait"](.5)
 end
 end
-showNotification("Escape Triggered", "Teleported to gate fallback successfully!", "success")
+showNotification("已触发逃脱", "已成功传送至备用大门位置！", "success")
 else
 currentValue6="Idle"findRootPart8("IDLE")
 end
@@ -13354,7 +13655,7 @@ part=instance:FindFirstChildWhichIsA("BasePart")
 end
 end
 if part then
-showNotification("Auto Flee", "Killer too close! Teleporting to furthest generator.", "warning")
+showNotification("自动逃离", "杀手距离过近！正在传送至最远发电机。", "warning")
 local vector2=part["CFrame"]+Vector3["new"](0, 1.5, 0)
 if safeTeleport then
 safeTeleport(vector2)
@@ -13548,7 +13849,7 @@ local stroke3=Instance["new"]("UIStroke", label4)stroke3["Color"]=Color3["fromRG
 end
 )label4["MouseLeave"]:Connect(function()label4["BackgroundTransparency"]=.8 stroke3["Color"]=Color3["fromRGB"](255, 60, 60)
 end
-)label4["Parent"]=screenGui label4["MouseButton1Click"]:Connect(function()settings["AutoServerHopEscape"]=false accentgreenColor(false)pcall(saveSettings)getFeatureState3("OFF")showNotification("Auto Hop Disabled", "Server Hop Escape has been disabled.", "info")label4:Destroy()
+)label4["Parent"]=screenGui label4["MouseButton1Click"]:Connect(function()settings["AutoServerHopEscape"]=false accentgreenColor(false)pcall(saveSettings)getFeatureState3("OFF")showNotification("自动换服已关闭", "自动换服逃脱已关闭。", "info")label4:Destroy()
 end
 )
 end
@@ -13560,7 +13861,7 @@ end
 end
 )
 if success2 then
-settings["AutoServerHopEscape"]=false accentgreenColor(false)pcall(saveSettings)getFeatureState3("OFF")showNotification("Auto Hop Disabled", "Disabled via cancel key.", "info")
+settings["AutoServerHopEscape"]=false accentgreenColor(false)pcall(saveSettings)getFeatureState3("OFF")showNotification("自动换服已关闭", "已通过取消按键关闭。", "info")
 if label4 then
 pcall(function()label4:Destroy()
 end
@@ -13650,9 +13951,9 @@ if part then
 if _G["VD_StopAllInteractions"]then
 pcall(_G["VD_StopAllInteractions"])task["wait"](.15)
 end
-rootPart3["CFrame"]=part["CFrame"]showNotification("Auto Hop Escape", "Teleported to escape line!", "success")conditionMet8=true getFeatureState3("ESCAPED")
+rootPart3["CFrame"]=part["CFrame"]showNotification("自动换服逃脱", "已传送至逃脱线！", "success")conditionMet8=true getFeatureState3("ESCAPED")
 else
-showNotification("Auto Hop Escape", "Finish Line not found!", "error")getFeatureState3("ESCAPE FAILED")
+showNotification("自动换服逃脱", "未找到终点线！", "error")getFeatureState3("ESCAPE FAILED")
 end
 end
 if conditionMet8 then
@@ -13702,7 +14003,7 @@ local remainingcarrytime=player:GetAttribute("RemainingCarryTime")or(instance an
 if remainingcarrytime and(type(remainingcarrytime)=="number"and remainingcarrytime<=1)then
 local remotes=(((game:GetService("ReplicatedStorage")):WaitForChild("Remotes")):WaitForChild("Carry")):WaitForChild("DropSurvivorEvent")
 if remotes then
-remotes:FireServer()showNotification("Anti Wiggle", "Auto-dropped survivor to reset wiggle!", "success")
+remotes:FireServer()showNotification("防挣扎", "已自动放下幸存者以重置挣扎进度！", "success")
 end
 end
 end
@@ -14524,7 +14825,7 @@ elseif((input["UserInputType"]==Enum["UserInputType"]["Keyboard"]or input["UserI
 conditionMet11=true
 end
 if conditionMet11 then
-conditionMet8=not conditionMet8 showNotification("Aim Assist", conditionMet8 and"Aim Assist ACTIVATED"or"Aim Assist DEACTIVATED", conditionMet8 and"success"or"info")
+conditionMet8=not conditionMet8 showNotification("瞄准辅助", conditionMet8 and"瞄准辅助已启用"or"瞄准辅助已停用", conditionMet8 and"success"or"info")
 end
 end
 end
@@ -15803,7 +16104,7 @@ local currentValue8=newcclosure or function(value)
 return value
 end
 if hasExecutorRestriction or not hookmetamethod or not getnamecallmethod then
-task["spawn"](function()task["wait"](1)showNotification("Compatibility Mode", "Network hooks disabled for "..(getExecutorName().." compatibility."), "warning")
+task["spawn"](function()task["wait"](1)showNotification("兼容模式", "已为 "..(getExecutorName().." 的兼容性禁用网络拦截。"), "warning")
 end
 )
 return
@@ -15903,9 +16204,9 @@ cachedValue11=timestamp2 _G["VD_LastDodgeTime"]=timestamp2
 if _G["VD_TriggerDodgeChangeGen"]then
 local success2, result=pcall(_G["VD_TriggerDodgeChangeGen"])
 if success2 and result then
-showNotification("Spear Dodge", "Veil threw a spear! Switched to another generator.", "warning")
+showNotification("长矛躲避", "维尔投掷了长矛！已切换到另一台发电机。", "warning")
 else
-showNotification("Spear Dodge", "Veil threw a spear! Fleeing to safe location.", "warning")
+showNotification("长矛躲避", "维尔投掷了长矛！正在逃往安全位置。", "warning")
 end
 end
 end
@@ -17397,7 +17698,6 @@ pcall(function()
 end)
 
 
---// 功能层：清理、导出与公共接口
 
 _G["VD_GameFeatures"]={
  Settings=settings,
