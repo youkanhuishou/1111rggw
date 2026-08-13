@@ -1,4 +1,3 @@
---// 功能
 
 local translateText=function(text) return text end
 
@@ -149,6 +148,8 @@ local silentAimTarget=nil
 local silentAimConnection=nil
 local parryTarget=nil
 local parryConnection=nil
+local destroyDesyncGhost=function() end
+local updateDesyncGhostAppearance=function() end
 local mobileAimbotGui=nil
 local mobileAimbotActive=false
 local spearTarget=nil
@@ -819,6 +820,18 @@ end
 end
 normalizeSettings()
 ActiveESP={["Players"]={}, ["Generators"]={}, ["Hooks"]={}, ["Pallets"]={}, ["Vaults"]={}, ["BloodEffects"]={}, ["Gates"]={}, ["SCPs"]={}}
+local function getSafeBasePart(instance, recursive)
+if not instance then
+return nil
+end
+if instance:IsA("BasePart")then
+return instance
+end
+if instance:IsA("Model")then
+return instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart", recursive==true)
+end
+return instance:FindFirstChildWhichIsA("BasePart", recursive==true)
+end
 function getDistance(player, contextValue)
 local player2=cachedRootPart
 if not player2 then
@@ -831,8 +844,8 @@ local distance=contextValue
 if not distance then
 if player:IsA("Player")then
 local rootPart=player["Character"]distance=rootPart and rootPart:FindFirstChild("HumanoidRootPart")
-elseif player:IsA("Model")then
-distance=player["PrimaryPart"]or player:FindFirstChildWhichIsA("BasePart")
+elseif player:IsA("Model")or player:IsA("Folder")then
+distance=getSafeBasePart(player)
 elseif player:IsA("BasePart")then
 distance=player
 end
@@ -1068,7 +1081,7 @@ if selectedkiller~=nil then
 return tostring(selectedkiller)
 end
 local instance=players:FindFirstChild("SelectedKiller")
-if instance and((instance:IsA("StringValue")or instance:IsA("ValueObject")))then
+if instance and((instance:IsA("StringValue")or instance:IsA("ValueBase")))then
 return tostring(instance["Value"])
 end
 if players["Character"]then
@@ -1093,7 +1106,7 @@ function getGeneratorProgress(generator)
 local repairprogress=generator:GetAttribute("RepairProgress")
 if repairprogress==nil then
 local instance=generator:FindFirstChild("RepairProgress")
-if instance and instance:IsA("ValueObject")then
+if instance and instance:IsA("ValueBase")then
 repairprogress=instance["Value"]
 end
 end
@@ -1315,7 +1328,7 @@ end
 local activationprogress=instance:GetAttribute("ActivationProgress")or instance:GetAttribute("Progress")or instance:GetAttribute("RepairProgress")
 if activationprogress==nil then
 local instance2=instance:FindFirstChild("ActivationProgress")or instance:FindFirstChild("Progress")
-if instance2 and instance2:IsA("ValueObject")then
+if instance2 and instance2:IsA("ValueBase")then
 activationprogress=instance2["Value"]
 end
 end
@@ -1589,8 +1602,10 @@ if not conditionMet2 then
 local cachedValue=nil
 if instance:IsA("BasePart")then
 cachedValue=instance
-elseif instance:IsA("Model")or instance:IsA("Folder")then
+elseif instance:IsA("Model")then
 cachedValue=instance:FindFirstChild("HookPoint")or instance["PrimaryPart"]or instance:FindFirstChild("Handle")or instance:FindFirstChildWhichIsA("BasePart")
+elseif instance:IsA("Folder")then
+cachedValue=instance:FindFirstChild("HookPoint")or instance:FindFirstChild("Handle")or instance:FindFirstChildWhichIsA("BasePart")
 end
 if cachedValue then
 if not table["find"](cachedHooks, cachedValue)then
@@ -1973,8 +1988,10 @@ if not conditionMet2 then
 local cachedValue2=nil
 if instance:IsA("BasePart")then
 cachedValue2=instance
-elseif instance:IsA("Model")or instance:IsA("Folder")then
+elseif instance:IsA("Model")then
 cachedValue2=instance:FindFirstChild("HookPoint")or instance["PrimaryPart"]or instance:FindFirstChild("Handle")or instance:FindFirstChildWhichIsA("BasePart")
+elseif instance:IsA("Folder")then
+cachedValue2=instance:FindFirstChild("HookPoint")or instance:FindFirstChild("Handle")or instance:FindFirstChildWhichIsA("BasePart")
 end
 if cachedValue2 and not success[cachedValue2]then
 success[cachedValue2]=true table["insert"](currentValue2, cachedValue2)
@@ -1987,14 +2004,23 @@ end
 cachedGenerators=currentValue cachedHooks=currentValue2 cachedPallets=items7 cachedVaults=items8 cachedBloodEffects=items9 cachedGates=items10
 end
 invalidateEspStyles=function()
-for key, item in pairs(ActiveESP["Players"])do
+local playerEspTable=ActiveESP and ActiveESP["Players"]
+if type(playerEspTable)=="table"then
+for key, item in pairs(playerEspTable)do
+if type(item)=="table"then
 item["LastESPStyle"]=nil
 end
-for key, item in pairs({ActiveESP["Generators"], ActiveESP["Hooks"];
-ActiveESP["Pallets"], ActiveESP["Vaults"], ActiveESP["BloodEffects"], ActiveESP["Gates"];
-ActiveESP["SCPs"]})do
+end
+end
+for key, item in pairs({ActiveESP and ActiveESP["Generators"], ActiveESP and ActiveESP["Hooks"];
+ActiveESP and ActiveESP["Pallets"], ActiveESP and ActiveESP["Vaults"], ActiveESP and ActiveESP["BloodEffects"], ActiveESP and ActiveESP["Gates"];
+ActiveESP and ActiveESP["SCPs"]})do
+if type(item)=="table"then
 for key2, item2 in pairs(item)do
+if type(item2)=="table"then
 item2["LastESPStyle"]=nil
+end
+end
 end
 end
 end
@@ -2497,7 +2523,7 @@ if hookcount~=nil then
 numericValue=tonumber(hookcount)or 0
 else
 local instance3=instance:FindFirstChild("HookCount")
-if instance3 and((instance3:IsA("ValueObject")or instance3:IsA("NumberValue")or instance3:IsA("IntValue")))then
+if instance3 and((instance3:IsA("ValueBase")or instance3:IsA("NumberValue")or instance3:IsA("IntValue")))then
 numericValue=tonumber(instance3["Value"])or 0
 end
 end
@@ -2618,6 +2644,10 @@ local esptracers=settings["ESPTracers"]and(conditionMet4 and(rootPart and(instan
 local currentValue=progress["Tracer"]
 if esptracers then
 local camera=workspace["CurrentCamera"]
+if not camera then
+cleanupResources(progress, false)
+continue
+end
 local screenPosition, onScreen=camera:WorldToViewportPoint(rootPart["Position"])
 if onScreen then
 local distance2=Vector2["new"](camera["ViewportSize"]["X"]/2, camera["ViewportSize"]["Y"])
@@ -2689,8 +2719,10 @@ container["Color"]=currentValue3 container["Transparency"]=distance4 container["
 end
 if isVisible then
 if settings["TracerStyle"]=="Arrow"then
-local distance5=((currentValue2-distance2))["Unit"]
-if distance5["Magnitude"]>0 then
+local arrowDelta=currentValue2-distance2
+local arrowMagnitude=arrowDelta["Magnitude"]
+if arrowMagnitude>.001 then
+local distance5=arrowDelta/arrowMagnitude
 local currentValue4=Vector2["new"](-distance5["Y"], distance5["X"])
 local numericValue2=10
 local currentValue5=currentValue2-distance5*numericValue2
@@ -8217,7 +8249,7 @@ end
 local part=nil
 local currentValue4=contextValue and-1 or math["huge"]
 for index, instance in ipairs(items10)do
-local child=instance:IsA("BasePart")and instance or instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart")
+local child=getSafeBasePart(instance)
 if child then
 local currentValue5=((child["Position"]-rootPart["Position"]))["Magnitude"]
 if contextValue then
@@ -9490,8 +9522,12 @@ if settings["Minimap"]["Enabled"]then
 pcall(function()
 minimapFrame["Visible"]=true
 local camera=workspace["CurrentCamera"]
+if not camera then
+return
+end
 local cameraCFrame=camera["CFrame"]
-local playerPosition=cachedRootPart and cachedRootPart["Position"]or(localPlayer["Character"]and(localPlayer["Character"]:FindFirstChild("HumanoidRootPart")and localPlayer["Character"]["HumanoidRootPart"]["Position"]))
+local playerRoot=cachedRootPart or(localPlayer["Character"]and localPlayer["Character"]:FindFirstChild("HumanoidRootPart"))
+local playerPosition=playerRoot and playerRoot["Position"]
 if not playerPosition then
 return
 end
@@ -9500,8 +9536,16 @@ local radarRange=130
 local radarSize=148
 local radarCenter=radarSize/2
 local radarUsableRadius=radarCenter-9
-local cameraForward=(Vector3["new"](cameraCFrame["LookVector"]["X"], 0, cameraCFrame["LookVector"]["Z"]))["Unit"]
-local cameraRight=(Vector3["new"](cameraCFrame["RightVector"]["X"], 0, cameraCFrame["RightVector"]["Z"]))["Unit"]
+local cameraForwardFlat=Vector3["new"](cameraCFrame["LookVector"]["X"], 0, cameraCFrame["LookVector"]["Z"])
+if cameraForwardFlat["Magnitude"]<.001 and playerRoot then
+local rootLookVector=playerRoot["CFrame"]["LookVector"]
+cameraForwardFlat=Vector3["new"](rootLookVector["X"], 0, rootLookVector["Z"])
+end
+if cameraForwardFlat["Magnitude"]<.001 then
+cameraForwardFlat=Vector3["new"](0, 0, -1)
+end
+local cameraForward=cameraForwardFlat["Unit"]
+local cameraRight=Vector3["new"](-cameraForward["Z"], 0, cameraForward["X"])
 
 for _, marker in ipairs(minimapFrame:GetChildren())do
 if marker["Name"]=="RadarMarker"then
@@ -9530,6 +9574,11 @@ end
 
 local function styleRadarMarker(marker, markerType, color)
 local markerCorner=marker:FindFirstChild("MarkerCorner")
+if not markerCorner then
+markerCorner=Instance["new"]("UICorner")
+markerCorner["Name"]="MarkerCorner"
+markerCorner["Parent"]=marker
+end
 marker["Rotation"]=0
 marker["BackgroundColor3"]=color
 if markerType=="Killer"then
@@ -9606,7 +9655,7 @@ for _, generator in ipairs(cachedGenerators)do
 if not generator or not generator["Parent"]or isGeneratorCompleted(generator)then
 continue
 end
-local part=generator["PrimaryPart"]or generator:FindFirstChildWhichIsA("BasePart")
+local part=getSafeBasePart(generator)
 if part then
 plotRadarMarker(part["Position"], Color3["fromRGB"](62, 190, 220), "Generator")
 end
@@ -9626,7 +9675,7 @@ for _, pallet in ipairs(cachedPallets)do
 if not pallet or not pallet["Parent"]then
 continue
 end
-local part=pallet["PrimaryPart"]or pallet:FindFirstChildWhichIsA("BasePart")
+local part=getSafeBasePart(pallet)
 if part then
 plotRadarMarker(part["Position"], Color3["fromRGB"](169, 126, 77), "Pallet")
 end
@@ -9821,7 +9870,7 @@ for index, instance in ipairs(cachedVaults)do
 if instance and instance["Parent"]then
 local currentValue7=characterStateCache[instance]
 if currentValue7==nil then
-currentValue7=instance:IsA("BasePart")and instance or(instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart")or false)characterStateCache[instance]=currentValue7
+currentValue7=getSafeBasePart(instance)or false characterStateCache[instance]=currentValue7
 end
 if currentValue7 then
 local distance=((currentValue7["Position"]-rootPart["Position"]))["Magnitude"]
@@ -10136,7 +10185,9 @@ local vector2=Vector3["new"](currentValue7["X"], 0, currentValue7["Z"])
 if vector2["Magnitude"]>.05 then
 vector2=vector2["Unit"]
 else
-local vector3=rootPart["CFrame"]["LookVector"]vector2=(Vector3["new"](vector3["X"], 0, vector3["Z"]))["Unit"]
+local vector3=rootPart["CFrame"]["LookVector"]
+local horizontalLook=Vector3["new"](vector3["X"], 0, vector3["Z"])
+vector2=horizontalLook["Magnitude"]>.001 and horizontalLook["Unit"]or Vector3["new"](0, 0, -1)
 end
 local distance=rootPart["AssemblyLinearVelocity"]["Magnitude"]
 local transform=rootPart["CFrame"]["LookVector"]:Dot(vector2)
@@ -11140,7 +11191,11 @@ end
 return success2 and result or Vector3["new"](0, 0, 0)
 end
 character2=function(part, position)
-local currentValue9=((position["Position"]-part["Position"]))["Unit"]
+local facingDelta=position["Position"]-part["Position"]
+if facingDelta["Magnitude"]<=.001 then
+return true
+end
+local currentValue9=facingDelta["Unit"]
 local transform=part["CFrame"]["LookVector"]
 local currentValue10=transform:Dot(currentValue9)
 if currentValue10>-0.1 then
@@ -11860,7 +11915,11 @@ end
 if distance<=9 then
 local distance2=processValue9(rootPart2)
 if distance2["Magnitude"]>=12 then
-local currentValue10=((rootPart["Position"]-rootPart2["Position"]))["Unit"]
+local positionDelta=rootPart["Position"]-rootPart2["Position"]
+if positionDelta["Magnitude"]<=.001 then
+return
+end
+local currentValue10=positionDelta["Unit"]
 local currentValue11=distance2["Unit"]:Dot(currentValue10)
 if currentValue11>.75 then
 character3("Rincorsa Veloce Killer (Distanza: "..(string["format"]("%.1f", distance)..")"), distance, instance)
@@ -12268,6 +12327,9 @@ local items12={}
 local items13={}
 local items14={}
 local items15={}
+local isRepairingRemoteActive=false
+local isGateRemoteActive=false
+local lastPreTeleportCFrame=nil
 local function processValue5(value, contextValue)items15[value]=tick()+((contextValue or 25))
 end
 local function conditionMet8(value)
@@ -12379,7 +12441,7 @@ end
 end
 for index, item in ipairs(items18)do
 for index2, instance in ipairs(items16)do
-local child=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]
+local child=getSafeBasePart(instance)
 if item:IsDescendantOf(instance)or item:IsDescendantOf(instance["Parent"])or(child and((item["Position"]-child["Position"]))["Magnitude"]<150)then
 table["insert"](items17, {["finishLine"]=item, ["gate"]=instance})
 break
@@ -12394,7 +12456,7 @@ local currentValue7=-math["huge"]
 for index, item in ipairs(items17)do
 local currentValue8=item["finishLine"]
 local instance=item["gate"]
-local child=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]or currentValue8
+local child=getSafeBasePart(instance)or currentValue8
 local numericValue7=0
 if position and child then
 local distance=((child["Position"]-position))["Magnitude"]
@@ -12510,10 +12572,11 @@ local function processValue8(instance)
 if not instance then
 return false
 end
-local child=instance:FindFirstChildOfClass("ProximityPrompt")or instance["Parent"]:FindFirstChildOfClass("ProximityPrompt")
-if not child then
+local parent=instance["Parent"]
+local child=instance:FindFirstChildOfClass("ProximityPrompt")or(parent and parent:FindFirstChildOfClass("ProximityPrompt"))
+if not child and parent then
 pcall(function()
-for index, instance2 in ipairs(instance["Parent"]:GetDescendants())do
+for index, instance2 in ipairs(parent:GetDescendants())do
 if instance2:IsA("ProximityPrompt")then
 child=instance2
 break
@@ -12525,7 +12588,7 @@ end
 if child then
 return child["Enabled"]
 end
-local child2=instance:FindFirstChildOfClass("ClickDetector")or instance["Parent"]:FindFirstChildOfClass("ClickDetector")
+local child2=instance:FindFirstChildOfClass("ClickDetector")or(parent and parent:FindFirstChildOfClass("ClickDetector"))
 if child2 then
 return true
 end
@@ -12619,6 +12682,9 @@ local conditionMet10=(count>=7)and 2 or 1
 return(currentValue7<=conditionMet10)
 end
 return false
+end
+local getNearestKillerInfo=function()
+return math.huge, nil
 end
 local function processValue10(value)
 local currentValue7, currentValue8=getNearestKillerInfo()
@@ -12771,6 +12837,7 @@ end
 end
 return distance, startPosition4
 end
+getNearestKillerInfo=findRootPart4
 local function findRootPart5(position)
 if not position then
 return false
@@ -12816,10 +12883,7 @@ end
 return nil
 end
 local function getDistance3(instance)
-if instance:IsA("Model")then
-return instance["PrimaryPart"]or instance:FindFirstChildWhichIsA("BasePart")
-end
-return instance:FindFirstChildWhichIsA("BasePart")
+return getSafeBasePart(instance)
 end
 local function getDistance4(value, position)
 local currentValue7=getDistance3(value)
@@ -13204,7 +13268,7 @@ local distance2=-1
 if distance then
 for index, instance in ipairs(cachedGates)do
 if instance and(instance["Parent"]and(processValue6(instance)and not getDistance2(instance)))then
-local child=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]
+local child=getSafeBasePart(instance)
 if child and distance then
 local distance3=((child["Position"]-distance))["Magnitude"]
 if distance3>distance2 then
@@ -13341,7 +13405,7 @@ if currentValue10 then
 local currentValue11, distance2=nil, math["huge"]
 for index, instance in ipairs(cachedGates)do
 if instance and(instance["Parent"]and(processValue6(instance)and(not getDistance2(instance)and not conditionMet8(instance))))then
-local child=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]
+local child=getSafeBasePart(instance)
 if child then
 local distance3=((child["Position"]-character7["Position"]))["Magnitude"]
 if distance3<distance2 then
@@ -13354,7 +13418,7 @@ if not currentValue11 then
 distance2=math["huge"]
 for index, instance in ipairs(cachedGates)do
 if instance and(instance["Parent"]and(processValue6(instance)and not getDistance2(instance)))then
-local child=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]
+local child=getSafeBasePart(instance)
 if child then
 local distance3=((child["Position"]-character7["Position"]))["Magnitude"]
 if distance3<distance2 then
@@ -13495,7 +13559,7 @@ else
 local part3=nil
 for index, instance in ipairs(cachedGates)do
 if instance and(instance["Parent"]and getDistance2(instance))then
-part3=instance:FindFirstChildWhichIsA("BasePart")or instance["PrimaryPart"]
+part3=getSafeBasePart(instance)
 if part3 then
 break
 end
@@ -14088,7 +14152,7 @@ local function getDistance2(position, contextValue)
 local cachedValue6=nil
 local distance=math["huge"]
 for index, instance in ipairs(cachedHooks)do
-local hookpoint=instance:IsA("BasePart")and instance or instance["PrimaryPart"]or instance:FindFirstChild("HookPoint", true)or instance:FindFirstChild("Handle", true)or instance:FindFirstChildWhichIsA("BasePart", true)
+local hookpoint=instance:IsA("BasePart")and instance or instance:FindFirstChild("HookPoint", true)or instance:FindFirstChild("Handle", true)or getSafeBasePart(instance, true)
 if hookpoint and not readStateValue2(hookpoint, contextValue)then
 local distance2=((hookpoint["Position"]-position))["Magnitude"]
 if distance2<distance then
@@ -14250,7 +14314,8 @@ if not isKnocked then
 findRootPart("HUNTING")
 local frame4=rootPart3["Position"]
 local transform=rootPart3["CFrame"]["LookVector"]
-local vector2=(Vector3["new"](transform["X"], 0, transform["Z"]))["Unit"]
+local horizontalLook=Vector3["new"](transform["X"], 0, transform["Z"])
+local vector2=horizontalLook["Magnitude"]>.001 and horizontalLook["Unit"]or Vector3["new"](0, 0, -1)
 local success3=frame4-vector2*1.2 rootPart2["CFrame"]=CFrame["new"](success3, frame4)pcall(function()workspace["CurrentCamera"]["CFrame"]=CFrame["new"](workspace["CurrentCamera"]["CFrame"]["Position"], frame4)
 end
 )
@@ -14981,6 +15046,9 @@ end
 local currentValue6=distance2-value
 local vector2=Vector3["new"](0, -contextValue5, 0)
 local currentValue7=((currentValue6-(.5*vector2)*(distance^2)))/distance
+if currentValue7["Magnitude"]<=.001 then
+return nil, distance2
+end
 return currentValue7["Unit"], distance2
 end
 _G["VD_SolveProjectileAim"]=calculateValue _G["VD_GetSmoothedVelocity"]=getDistance2 task["spawn"](function()RunService["Heartbeat"]:Connect(function()
@@ -15919,19 +15987,19 @@ end
 end
 )
 local instance2=nil
-local function cleanupResources3()
+destroyDesyncGhost=function()
 if instance2 then
 pcall(function()instance2:Destroy()
 end
 )instance2=nil
 end
 end
-local function getFeatureState6()
+updateDesyncGhostAppearance=function()
 if not instance2 then
 return
 end
 if not settings["EnableDesyncGhost"]then
-cleanupResources3()
+destroyDesyncGhost()
 return
 end
 pcall(function()
@@ -15953,7 +16021,7 @@ end
 end
 local function findRootPart(instance3, position)
 if not settings["EnableDesyncGhost"]then
-cleanupResources3()
+destroyDesyncGhost()
 return
 end
 pcall(function()
@@ -15986,7 +16054,7 @@ end
 end
 return
 end
-cleanupResources3()
+destroyDesyncGhost()
 local model=Instance["new"]("Model")model["Name"]="DesyncGhost"
 local humanoid=Instance["new"]("Humanoid")humanoid["DisplayDistanceType"]=Enum["HumanoidDisplayDistanceType"]["None"]humanoid["Parent"]=model
 local transform=rootPart["CFrame"]
@@ -16034,13 +16102,16 @@ local rootPart=character2 and character2:FindFirstChild("HumanoidRootPart")
 local humanoid=character2 and character2:FindFirstChildOfClass("Humanoid")
 if not rootPart or not humanoid or humanoid["Health"]<=0 then
 if conditionMet11 or conditionMet12 then
-rootPart["Anchored"]=false conditionMet11=false conditionMet12=false
+if rootPart then
+rootPart["Anchored"]=false
+end
+destroyDesyncGhost()conditionMet11=false conditionMet12=false
 end
 return
 end
 if settings["Desync"]then
 if conditionMet11 then
-conditionMet11=false cleanupResources3()
+conditionMet11=false destroyDesyncGhost()
 end
 if not conditionMet12 then
 conditionMet12=true rootPart["Anchored"]=true findRootPart(character2, rootPart["CFrame"])
@@ -16053,7 +16124,7 @@ end
 end
 elseif settings["FakeLag"]then
 if conditionMet12 then
-conditionMet12=false cleanupResources3()
+conditionMet12=false destroyDesyncGhost()
 end
 local fakelagms=math["clamp"](settings["FakeLagMs"]or 200, 50, 1000)
 local currentValue8=fakelagms/1000
@@ -16067,7 +16138,7 @@ local transform=humanoid["WalkSpeed"]rootPart["CFrame"]=rootPart["CFrame"]+(dist
 end
 end
 if tick()-timestamp>=currentValue8 then
-rootPart["Anchored"]=false cleanupResources3()task["wait"](.08)rootPart["Anchored"]=true findRootPart(character2, rootPart["CFrame"])timestamp=tick()
+rootPart["Anchored"]=false destroyDesyncGhost()task["wait"](.08)rootPart["Anchored"]=true findRootPart(character2, rootPart["CFrame"])timestamp=tick()
 end
 end
 end
@@ -16081,7 +16152,7 @@ if rootPart then
 rootPart["Anchored"]=false
 end
 end
-)cleanupResources3()conditionMet11=false conditionMet12=false
+)destroyDesyncGhost()conditionMet11=false conditionMet12=false
 end
 end
 end
@@ -16092,7 +16163,7 @@ if rootPart then
 rootPart["Anchored"]=false
 end
 end
-)cleanupResources3()
+)destroyDesyncGhost()
 end
 )pcall(function()
 local remoteEvent=(Instance["new"]("RemoteEvent"))["FireServer"]
@@ -16288,7 +16359,7 @@ end
 local currentValue7=instance3:IsA("Model")and(instance3:GetPivot())["Position"]or instance3["Position"]
 local currentValue8=((currentValue7-frame4))/.015
 local camera=workspace["CurrentCamera"]
-if camera then
+if camera and currentValue8["Magnitude"]>.001 then
 local transform2=math["acos"](math["clamp"](currentValue8["Unit"]:Dot(camera["CFrame"]["LookVector"]), -1, 1))*((180/math["pi"]))
 end
 end
@@ -16688,7 +16759,11 @@ if getFeatureState7(currentValue10)then
 table["insert"](items16, raycastResult["Position"])startPosition4=raycastResult
 break
 else
-local currentValue11=raycastParams["FilterDescendantsInstances"]table["insert"](currentValue11, currentValue10)raycastParams["FilterDescendantsInstances"]=currentValue11 distance3=raycastResult["Position"]+distance4["Unit"]*.01 distance4=distance-distance3
+local currentValue11=raycastParams["FilterDescendantsInstances"]table["insert"](currentValue11, currentValue10)raycastParams["FilterDescendantsInstances"]=currentValue11
+if distance4["Magnitude"]<=.001 then
+break
+end
+distance3=raycastResult["Position"]+distance4["Unit"]*.01 distance4=distance-distance3
 if distance4["Magnitude"]<=.05 then
 break
 end
@@ -17072,7 +17147,7 @@ pcall(function()
 for index, instance4 in ipairs(contextValue:GetDescendants())do
 if not((instance4:IsA("BasePart")or instance4:IsA("JointInstance")or instance4:IsA("Attachment")or instance4:IsA("Constraint")or instance4:IsA("SpecialMesh")or instance4:IsA("WrapTarget")or instance4:IsA("WrapLayer")))then
 conditionMet13(instance4["Name"])
-if instance4:IsA("ValueObject")and type(instance4["Value"])=="string"then
+if instance4:IsA("ValueBase")and type(instance4["Value"])=="string"then
 conditionMet13(instance4["Value"])
 end
 end
@@ -17092,7 +17167,7 @@ local equippedperks=instance3:FindFirstChild("EquippedPerks")or instance3:FindFi
 if equippedperks then
 for index, instance4 in ipairs(equippedperks:GetChildren())do
 conditionMet13(instance4["Name"])
-if instance4:IsA("ValueObject")and type(instance4["Value"])=="string"then
+if instance4:IsA("ValueBase")and type(instance4["Value"])=="string"then
 conditionMet13(instance4["Value"])
 end
 end
